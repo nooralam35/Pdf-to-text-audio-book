@@ -1,0 +1,95 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --font-display: "Fraunces", Georgia, serif;
+    --font-sans: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+    --font-indic-hi: "Noto Sans Devanagari", "Plus Jakarta Sans", sans-serif;
+    --font-indic-bn: "Noto Sans Bengali", "Plus Jakarta Sans", sans-serif;
+    --font-indic-ta: "Noto Sans Tamil", "Plus Jakarta Sans", sans-serif;
+    --font-indic-te: "Noto Sans Telugu", "Plus Jakarta Sans", sans-serif;
+    --font-indic-ur: "Noto Nastaliq Urdu", "Plus Jakarta Sans", serif;
+  }
+
+  body {
+    font-family: var(--font-sans);
+  }
+
+  h1, h2, .font-editorial {
+    font-family: var(--font-display);
+    text-wrap: balance;
+  }
+
+  .font-mono-num {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+.lang-hi,
+.lang-mr {
+  font-family: var(--font-indic-hi);
+  line-height: 1.9;
+}
+
+.lang-bn {
+  font-family: var(--font-indic-bn);
+  line-height: 1.9;
+}
+
+.lang-ta {
+  font-family: var(--font-indic-ta);
+  line-height: 1.9;
+}
+
+.lang-te {
+  font-family: var(--font-indic-te);
+  line-height: 1.9;
+}
+
+.lang-ur,
+.lang-ar {
+  font-family: var(--font-indic-ur);
+  line-height: 2.2;
+  direction: rtl;
+  text-align: right;
+}
+
+/* Subtle archival scrollbar */
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(120, 113, 108, 0.28);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(120, 113, 108, 0.45);
+}
+
+/* Clean Print / Selectable Unicode PDF Styles */
+@media print {
+  body {
+    background: #ffffff !important;
+    color: #1c1917 !important;
+  }
+  .no-print {
+    display: none !important;
+  }
+  .print-only {
+    display: block !important;
+  }
+  .print-page-break {
+    page-break-after: always;
+    break-after: page;
+  }
+}

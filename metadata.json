@@ -1,0 +1,6 @@
+{
+  "name": "BhashaBook — Multilingual PDF Translator & Audiobook Studio",
+  "description": "Translate illustrated technical books and multi-page PDFs into Hindi, Hinglish, and Indian or global languages with synchronized audiobook playback and cover-preserved PDF export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
