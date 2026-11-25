@@ -1633,69 +1633,81 @@ Follow these exact rules:
         return items;
       };
 
-      // 2. Open Library Search API (Rich metadata, ratings, page counts, high-res covers & public IA links)
+      // 2. Open Library Search API (Public-domain & open-access full-text editions with high-res covers & IA PDF links)
       const queryOpenLibrary = async (): Promise<SearchBookItem[]> => {
-        const params = new URLSearchParams();
-        params.set('q', rawQuery || catCfg.queryHint || 'programming');
-        if (catCfg.olSubject) {
-          params.set('subject', catCfg.olSubject);
-        }
-        if (lang !== 'all' && LANG_TO_IA[lang]) {
-          params.set('language', LANG_TO_IA[lang]);
-        }
-        if (sort === 'rating') params.set('sort', 'rating');
-        else if (sort === 'latest') params.set('sort', 'new');
-        params.set('limit', '12');
-        params.set('page', String(pageNum));
-        params.set(
-          'fields',
-          'key,title,author_name,first_publish_year,cover_i,ia,number_of_pages_median,ratings_average,subject,language,isbn,ebook_access,edition_count'
-        );
+        const baseQuery = rawQuery || catCfg.queryHint || 'programming';
 
-        const data = (await fetchJsonWithTimeout(
-          `https://openlibrary.org/search.json?${params.toString()}`,
-          11000
-        )) as {
-          docs?: Array<{
-            key?: string;
-            title?: string;
-            author_name?: string[];
-            first_publish_year?: number;
-            cover_i?: number;
-            ia?: string[];
-            number_of_pages_median?: number;
-            ratings_average?: number;
-            subject?: string[];
-            language?: string[];
-            isbn?: string[];
-            ebook_access?: string;
-            edition_count?: number;
-          }>;
-        } | null;
+        const fetchOlDocs = async (publicOnly: boolean) => {
+          const params = new URLSearchParams();
+          params.set('q', publicOnly ? `${baseQuery} ebook_access:public` : baseQuery);
+          if (publicOnly) {
+            params.set('has_fulltext', 'true');
+          }
+          if (catCfg.olSubject) {
+            params.set('subject', catCfg.olSubject);
+          }
+          if (lang !== 'all' && LANG_TO_IA[lang]) {
+            params.set('language', LANG_TO_IA[lang]);
+          }
+          if (sort === 'rating') params.set('sort', 'rating');
+          else if (sort === 'latest') params.set('sort', 'new');
+          params.set('limit', publicOnly ? '18' : '8');
+          params.set('page', String(pageNum));
+          params.set(
+            'fields',
+            'key,title,author_name,first_publish_year,cover_i,ia,number_of_pages_median,ratings_average,subject,language,isbn,ebook_access,edition_count'
+          );
 
-        const docs = data?.docs ?? [];
+          const data = (await fetchJsonWithTimeout(
+            `https://openlibrary.org/search.json?${params.toString()}`,
+            11000
+          )) as {
+            docs?: Array<{
+              key?: string;
+              title?: string;
+              author_name?: string[];
+              first_publish_year?: number;
+              cover_i?: number;
+              ia?: string[];
+              number_of_pages_median?: number;
+              ratings_average?: number;
+              subject?: string[];
+              language?: string[];
+              isbn?: string[];
+              ebook_access?: string;
+              edition_count?: number;
+            }>;
+          } | null;
+
+          return data?.docs ?? [];
+        };
+
+        const publicDocs = await fetchOlDocs(true);
         const items: SearchBookItem[] = [];
-        for (const d of docs) {
+
+        for (const d of publicDocs) {
           if (!d.key || !d.title) continue;
-          const isPublicIa = d.ebook_access === 'public' && Array.isArray(d.ia) && d.ia.length > 0;
-          const iaId = isPublicIa ? d.ia![0] : undefined;
+          const isPublicIa =
+            d.ebook_access === 'public' && Array.isArray(d.ia) && d.ia.length > 0;
+          if (!isPublicIa) continue;
+          const iaId = d.ia![0];
           const coverUrl = d.cover_i
             ? `https://covers.openlibrary.org/b/id/${d.cover_i}-L.jpg`
-            : iaId
-            ? `https://archive.org/services/img/${encodeURIComponent(iaId)}`
-            : undefined;
+            : `https://archive.org/services/img/${encodeURIComponent(iaId)}`;
 
           items.push({
             id: `ol:${d.key}`,
             source: 'open_library',
-            identifier: iaId || d.key,
+            identifier: iaId,
             title: String(d.title).trim(),
-            author: Array.isArray(d.author_name) && d.author_name.length > 0
-              ? d.author_name.slice(0, 2).join(', ')
-              : 'Unknown Author',
+            author:
+              Array.isArray(d.author_name) && d.author_name.length > 0
+                ? d.author_name.slice(0, 2).join(', ')
+                : 'Unknown Author',
             year: typeof d.first_publish_year === 'number' ? d.first_publish_year : undefined,
             language: normalizeLangLabel(d.language),
-            pageCount: typeof d.number_of_pages_median === 'number' ? d.number_of_pages_median : undefined,
+            pageCount:
+              typeof d.number_of_pages_median === 'number' ? d.number_of_pages_median : undefined,
             downloads: typeof d.edition_count === 'number' ? d.edition_count * 120 : undefined,
             rating:
               typeof d.ratings_average === 'number' && d.ratings_average > 0
@@ -1703,16 +1715,62 @@ Follow these exact rules:
                 : undefined,
             subjects: Array.isArray(d.subject) ? d.subject.slice(0, 5) : [],
             coverUrl,
-            pdfUrl: iaId
-              ? `https://archive.org/download/${encodeURIComponent(iaId)}/${encodeURIComponent(iaId)}.pdf`
-              : undefined,
-            readOnlineUrl: iaId
-              ? `https://archive.org/details/${encodeURIComponent(iaId)}`
-              : `https://openlibrary.org${d.key}`,
-            format: iaId ? 'PDF' : 'Read Online',
+            pdfUrl: `https://archive.org/download/${encodeURIComponent(iaId)}/${encodeURIComponent(iaId)}.pdf`,
+            readOnlineUrl: `https://archive.org/details/${encodeURIComponent(iaId)}`,
+            format: 'PDF',
             isbn: Array.isArray(d.isbn) ? d.isbn[0] : undefined,
           });
+          if (items.length >= 12) break;
         }
+
+        // Only fall back to reference-only catalog records if user typed a specific query and 0 public IA editions exist
+        if (items.length === 0 && rawQuery) {
+          const fallbackDocs = await fetchOlDocs(false);
+          for (const d of fallbackDocs) {
+            if (!d.key || !d.title) continue;
+            const isPublicIa =
+              d.ebook_access === 'public' && Array.isArray(d.ia) && d.ia.length > 0;
+            const iaId = isPublicIa ? d.ia![0] : undefined;
+            const coverUrl = d.cover_i
+              ? `https://covers.openlibrary.org/b/id/${d.cover_i}-L.jpg`
+              : iaId
+              ? `https://archive.org/services/img/${encodeURIComponent(iaId)}`
+              : undefined;
+
+            items.push({
+              id: `ol:${d.key}`,
+              source: 'open_library',
+              identifier: iaId || d.key,
+              title: String(d.title).trim(),
+              author:
+                Array.isArray(d.author_name) && d.author_name.length > 0
+                  ? d.author_name.slice(0, 2).join(', ')
+                  : 'Unknown Author',
+              year: typeof d.first_publish_year === 'number' ? d.first_publish_year : undefined,
+              language: normalizeLangLabel(d.language),
+              pageCount:
+                typeof d.number_of_pages_median === 'number'
+                  ? d.number_of_pages_median
+                  : undefined,
+              downloads: typeof d.edition_count === 'number' ? d.edition_count * 120 : undefined,
+              rating:
+                typeof d.ratings_average === 'number' && d.ratings_average > 0
+                  ? Math.round(d.ratings_average * 10) / 10
+                  : undefined,
+              subjects: Array.isArray(d.subject) ? d.subject.slice(0, 5) : [],
+              coverUrl,
+              pdfUrl: iaId
+                ? `https://archive.org/download/${encodeURIComponent(iaId)}/${encodeURIComponent(iaId)}.pdf`
+                : undefined,
+              readOnlineUrl: iaId
+                ? `https://archive.org/details/${encodeURIComponent(iaId)}`
+                : `https://openlibrary.org${d.key}`,
+              format: iaId ? 'PDF' : 'Read Online',
+              isbn: Array.isArray(d.isbn) ? d.isbn[0] : undefined,
+            });
+          }
+        }
+
         return items;
       };
 

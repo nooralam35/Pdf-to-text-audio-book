@@ -229,7 +229,8 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
       return;
     }
     if (
-      selectedBook.source === 'internet_archive' &&
+      (selectedBook.source === 'internet_archive' ||
+        (selectedBook.source === 'open_library' && Boolean(selectedBook.pdfUrl))) &&
       (!selectedBook.description || !selectedBook.pageCount)
     ) {
       let cancelled = false;
@@ -636,63 +637,59 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
                   </div>
 
                   {/* 4-in-1 Quick-Action Buttons */}
-                  <div className="mt-4 pt-3.5 border-t border-stone-200/80 sepia:border-[#DFD4BC] dark:border-stone-800/80 grid grid-cols-2 gap-2">
-                    <button
-                      type="button"
-                      disabled={isBusyGlobal || !canImportInApp}
-                      onClick={() => onActionBook(book, 'read')}
-                      title={
-                        canImportInApp
-                          ? 'Open directly in BhashaBook Reader'
-                          : 'Reference-only entry — open on source library'
-                      }
-                      className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 bg-stone-900 text-stone-50 hover:bg-stone-800 dark:bg-stone-100 dark:text-stone-950 dark:hover:bg-stone-200 disabled:opacity-40 transition-colors cursor-pointer whitespace-nowrap"
-                    >
-                      {isThisBookLoading && loadingBookAction?.action === 'read' ? (
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      ) : (
-                        <BookOpen className="w-3.5 h-3.5" />
-                      )}
-                      <span>Read Online</span>
-                    </button>
+                  {canImportInApp ? (
+                    <div className="mt-4 pt-3.5 border-t border-stone-200/80 sepia:border-[#DFD4BC] dark:border-stone-800/80 grid grid-cols-2 gap-2">
+                      <button
+                        type="button"
+                        disabled={isBusyGlobal}
+                        onClick={() => onActionBook(book, 'read')}
+                        title="Open directly in BhashaBook Reader"
+                        className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 bg-stone-900 text-stone-50 hover:bg-stone-800 dark:bg-stone-100 dark:text-stone-950 dark:hover:bg-stone-200 disabled:opacity-50 transition-colors cursor-pointer whitespace-nowrap"
+                      >
+                        {isThisBookLoading && loadingBookAction?.action === 'read' ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <BookOpen className="w-3.5 h-3.5" />
+                        )}
+                        <span>Read Online</span>
+                      </button>
 
-                    <button
-                      type="button"
-                      disabled={isBusyGlobal || !canImportInApp}
-                      onClick={() => onActionBook(book, 'translate')}
-                      title={`Load & translate into ${targetLangOption.name}`}
-                      className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 bg-amber-700 hover:bg-amber-800 text-white disabled:opacity-40 transition-colors cursor-pointer whitespace-nowrap"
-                    >
-                      {isThisBookLoading && loadingBookAction?.action === 'translate' ? (
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      ) : (
-                        <Languages className="w-3.5 h-3.5" />
-                      )}
-                      <span>Translate &amp; Read</span>
-                    </button>
+                      <button
+                        type="button"
+                        disabled={isBusyGlobal}
+                        onClick={() => onActionBook(book, 'translate')}
+                        title={`Load & translate into ${targetLangOption.name}`}
+                        className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 bg-amber-700 hover:bg-amber-800 text-white disabled:opacity-50 transition-colors cursor-pointer whitespace-nowrap"
+                      >
+                        {isThisBookLoading && loadingBookAction?.action === 'translate' ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Languages className="w-3.5 h-3.5" />
+                        )}
+                        <span>Translate &amp; Read</span>
+                      </button>
 
-                    <button
-                      type="button"
-                      disabled={isBusyGlobal || !canImportInApp}
-                      onClick={() => onActionBook(book, 'listen')}
-                      title="Open & start synchronized audiobook narration"
-                      className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 border border-stone-300 sepia:border-[#D4C7AA] dark:border-stone-700 text-stone-800 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 disabled:opacity-40 transition-colors cursor-pointer whitespace-nowrap"
-                    >
-                      {isThisBookLoading && loadingBookAction?.action === 'listen' ? (
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      ) : (
-                        <Headphones className="w-3.5 h-3.5" />
-                      )}
-                      <span>Listen Now</span>
-                    </button>
+                      <button
+                        type="button"
+                        disabled={isBusyGlobal}
+                        onClick={() => onActionBook(book, 'listen')}
+                        title="Open & start synchronized audiobook narration"
+                        className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 border border-stone-300 sepia:border-[#D4C7AA] dark:border-stone-700 text-stone-800 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 disabled:opacity-50 transition-colors cursor-pointer whitespace-nowrap"
+                      >
+                        {isThisBookLoading && loadingBookAction?.action === 'listen' ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Headphones className="w-3.5 h-3.5" />
+                        )}
+                        <span>Listen Now</span>
+                      </button>
 
-                    {canImportInApp ? (
                       <button
                         type="button"
                         disabled={isBusyGlobal}
                         onClick={() => onActionBook(book, 'download')}
                         title="Download PDF to your device"
-                        className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 border border-stone-300 sepia:border-[#D4C7AA] dark:border-stone-700 text-stone-800 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 disabled:opacity-40 transition-colors cursor-pointer whitespace-nowrap"
+                        className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 border border-stone-300 sepia:border-[#D4C7AA] dark:border-stone-700 text-stone-800 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 disabled:opacity-50 transition-colors cursor-pointer whitespace-nowrap"
                       >
                         {isThisBookLoading && loadingBookAction?.action === 'download' ? (
                           <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -701,18 +698,30 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
                         )}
                         <span>Download PDF</span>
                       </button>
-                    ) : safeExternalUrl(book.readOnlineUrl) ? (
-                      <a
-                        href={safeExternalUrl(book.readOnlineUrl)}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 border border-stone-300 dark:border-stone-700 text-stone-700 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800 transition-colors whitespace-nowrap"
+                    </div>
+                  ) : (
+                    <div className="mt-4 pt-3.5 border-t border-stone-200/80 sepia:border-[#DFD4BC] dark:border-stone-800/80 grid grid-cols-2 gap-2">
+                      {safeExternalUrl(book.readOnlineUrl) && (
+                        <a
+                          href={safeExternalUrl(book.readOnlineUrl)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 bg-stone-900 text-stone-50 hover:bg-stone-800 dark:bg-stone-100 dark:text-stone-950 dark:hover:bg-stone-200 transition-colors whitespace-nowrap"
+                        >
+                          <ExternalLink className="w-3.5 h-3.5" />
+                          <span>Read on Source</span>
+                        </a>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => setSelectedBook(book)}
+                        className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 border border-stone-300 sepia:border-[#D4C7AA] dark:border-stone-700 text-stone-800 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 transition-colors cursor-pointer whitespace-nowrap"
                       >
-                        <ExternalLink className="w-3.5 h-3.5" />
-                        <span>View Source</span>
-                      </a>
-                    ) : null}
-                  </div>
+                        <BookOpen className="w-3.5 h-3.5" />
+                        <span>Book Details</span>
+                      </button>
+                    </div>
+                  )}
                 </article>
               );
             })}
