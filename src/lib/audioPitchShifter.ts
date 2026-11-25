@@ -23,9 +23,17 @@ export class ElementPitchShifter {
 
   private currentDirection: 'up' | 'down' | 'bypass' = 'bypass';
   private pitch = 1.0;
+  private active = false;
   private readonly windowSec = 0.065; // 65ms window ideal for speech clarity
 
   constructor(private readonly audioEl: HTMLAudioElement) {}
+
+  public setActive(isActive: boolean): void {
+    this.active = isActive;
+    if (isActive && this.ctx && this.ctx.state === 'suspended') {
+      this.ctx.resume().catch(() => {});
+    }
+  }
 
   private ensureGraph(): boolean {
     if (this.ctx) return true;
@@ -35,6 +43,11 @@ export class ElementPitchShifter {
     if (!AudioCtx) return false;
 
     const ctx = new AudioCtx();
+    ctx.onstatechange = () => {
+      if (this.active && ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+    };
     const source = ctx.createMediaElementSource(this.audioEl);
     const dryGain = ctx.createGain();
     const wetGain = ctx.createGain();

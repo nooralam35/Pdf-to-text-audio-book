@@ -16,6 +16,14 @@ import {
   Volume2,
 } from 'lucide-react';
 import { ElementPitchShifter } from '../lib/audioPitchShifter';
+import {
+  AudioWakeLock,
+  BackgroundAudioKeepAlive,
+  getCachedTtsAudioBlob,
+  putCachedTtsAudioBlob,
+  registerMediaSessionHandlers,
+  updateMediaSessionState,
+} from '../lib/backgroundAudio';
 import { getLanguageOption } from '../lib/languages';
 import {
   buildAudiobookText,
@@ -69,6 +77,9 @@ export interface AudiobookControlHandle {
 
 interface AudiobookBarProps {
   bookTitle: string;
+  bookAuthor?: string;
+  bookCoverUrl?: string;
+  isOnline?: boolean;
   pageNumber: number;
   numPages: number;
   currentChapter?: ChapterItem | null;
@@ -95,6 +106,9 @@ interface AudiobookBarProps {
 
 export const AudiobookBar: React.FC<AudiobookBarProps> = ({
   bookTitle,
+  bookAuthor = '',
+  bookCoverUrl,
+  isOnline = true,
   pageNumber,
   numPages,
   currentChapter = null,
@@ -165,9 +179,14 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     [aiVoiceProfileId]
   );
 
-  // Persistent HTML5 Audio element + independent Web Audio pitch shifter
+  // Persistent HTML5 Audio element + independent Web Audio pitch shifter + background continuity
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const pitchShifterRef = useRef<ElementPitchShifter | null>(null);
+  const keepAliveRef = useRef<BackgroundAudioKeepAlive | null>(null);
+  const wakeLockRef = useRef<AudioWakeLock | null>(null);
+  const speechKeepAliveIntervalRef = useRef<number | null>(null);
+  const speechWatchdogTimerRef = useRef<number | null>(null);
+  const unexpectedPauseTimerRef = useRef<number | null>(null);
   const objectUrlCacheRef = useRef<Map<string, { url: string; source: 'ai' | 'free' }>>(new Map());
   const inFlightFetchRef = useRef<Map<string, Promise<{ url: string; source: 'ai' | 'free' }>>>(
     new Map()
@@ -194,6 +213,12 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
   const sentencesRef = useRef(sentences);
   const engineModeRef = useRef(engineMode);
   const targetLangRef = useRef(effectiveAudioLang);
+  const isSpeakingRef = useRef(isSpeaking);
+  const isLoadingSentenceRef = useRef(isLoadingSentence);
+  const isOnlineRef = useRef(isOnline);
+  const activeSentenceIndexRef = useRef<number | null>(activeSentenceIndex);
+  const pageNumberRef = useRef(pageNumber);
+  const numPagesRef = useRef(numPages);
 
   rateRef.current = rate;
   pitchRef.current = pitch;
@@ -204,6 +229,46 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
   sentencesRef.current = sentences;
   engineModeRef.current = engineMode;
   targetLangRef.current = effectiveAudioLang;
+  isSpeakingRef.current = isSpeaking;
+  isLoadingSentenceRef.current = isLoadingSentence;
+  isOnlineRef.current = isOnline;
+  activeSentenceIndexRef.current = activeSentenceIndex;
+  pageNumberRef.current = pageNumber;
+  numPagesRef.current = numPages;
+
+  const isCurrentlyOnline = () =>
+    typeof navigator === 'undefined'
+      ? isOnlineRef.current
+      : navigator.onLine !== false && isOnlineRef.current;
+
+  const getKeepAlive = () => {
+    if (!keepAliveRef.current) {
+      keepAliveRef.current = new BackgroundAudioKeepAlive();
+    }
+    return keepAliveRef.current;
+  };
+
+  const getWakeLock = () => {
+    if (!wakeLockRef.current) {
+      wakeLockRef.current = new AudioWakeLock();
+    }
+    return wakeLockRef.current;
+  };
+
+  const clearSpeechTimers = () => {
+    if (speechKeepAliveIntervalRef.current !== null) {
+      window.clearInterval(speechKeepAliveIntervalRef.current);
+      speechKeepAliveIntervalRef.current = null;
+    }
+    if (speechWatchdogTimerRef.current !== null) {
+      window.clearTimeout(speechWatchdogTimerRef.current);
+      speechWatchdogTimerRef.current = null;
+    }
+    if (unexpectedPauseTimerRef.current !== null) {
+      window.clearTimeout(unexpectedPauseTimerRef.current);
+      unexpectedPauseTimerRef.current = null;
+    }
+  };
 
   useEffect(() => {
     try {
@@ -384,6 +449,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     playSessionRef.current++;
     pausedInPlaceRef.current = false;
     setIsLoadingSentence(false);
+    clearSpeechTimers();
 
     if (abortRef.current) {
       abortRef.current.abort();
@@ -394,6 +460,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     if (audio) {
       audio.onended = null;
       audio.onerror = null;
+      audio.onpause = null;
       audio.ontimeupdate = null;
       audio.pause();
       if (clearHighlight) {
@@ -417,6 +484,77 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     }
   };
 
+  // Keep silent background audio session, Web Audio active flag, and optional Wake Lock synced
+  useEffect(() => {
+    const keepRunning =
+      isSpeaking ||
+      waitingForTranslation ||
+      isLoadingSentence ||
+      pendingAutoContinueRef.current ||
+      Boolean(pendingChapterPlayRef.current);
+
+    pitchShifterRef.current?.setActive(isSpeaking);
+
+    if (keepRunning) {
+      getKeepAlive().start();
+      void getWakeLock().acquire();
+    } else {
+      keepAliveRef.current?.stop();
+      wakeLockRef.current?.release();
+    }
+  }, [isSpeaking, waitingForTranslation, isLoadingSentence, pageNumber]);
+
+  // Display-off / Screen-lock / Background tab continuity (Mobile & PC)
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (!isSpeakingRef.current && !pendingAutoContinueRef.current) return;
+
+      if (document.visibilityState === 'hidden') {
+        // Never pause when display turns off or app backgrounds — keep OS audio focus alive
+        keepAliveRef.current?.ensureRunning();
+        pitchShifterRef.current?.resume().catch(() => {});
+        if (engineModeRef.current === 'device' && speechSupported) {
+          try {
+            window.speechSynthesis.resume();
+          } catch {
+            // ignore
+          }
+        }
+      } else if (document.visibilityState === 'visible') {
+        keepAliveRef.current?.ensureRunning();
+        pitchShifterRef.current?.resume().catch(() => {});
+        void wakeLockRef.current?.reacquireIfWanted();
+      }
+    };
+
+    const handleOfflineDrop = () => {
+      // If network drops mid-fetch while waiting for an online HD clip, switch immediately to offline device voice
+      if (
+        isSpeakingRef.current &&
+        isLoadingSentenceRef.current &&
+        engineModeRef.current === 'hd' &&
+        speechSupported
+      ) {
+        const resumeIdx = activeSentenceIndexRef.current ?? 0;
+        const session = ++playSessionRef.current;
+        if (abortRef.current) {
+          abortRef.current.abort();
+          abortRef.current = null;
+        }
+        setIsLoadingSentence(false);
+        setAudioMessage('Offline detected — continuing seamlessly with offline device voice.');
+        speakWithDeviceVoice(resumeIdx, session);
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('offline', handleOfflineDrop);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('offline', handleOfflineDrop);
+    };
+  }, [speechSupported]);
+
   // Cleanup on unmount
   useEffect(() => {
     return () => {
@@ -427,6 +565,10 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
         previewAudioRef.current = null;
       }
       clearCachedObjectUrls();
+      keepAliveRef.current?.dispose();
+      keepAliveRef.current = null;
+      wakeLockRef.current?.release();
+      wakeLockRef.current = null;
       pitchShifterRef.current?.dispose();
       pitchShifterRef.current = null;
     };
@@ -485,15 +627,50 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     if (sentences.length > 0) {
       pendingAutoContinueRef.current = false;
       speakFromIndex(0);
-    } else if (parsedPage && !parsedPage.isBlank && !translatedPage) {
+      return;
+    }
+
+    if (!parsedPage || parsedPage.pageNumber !== pageNumber) return;
+
+    if (parsedPage.isBlank) {
+      // Automatically skip blank / cover-only pages so listening never stops mid-book
+      if (pageNumber < numPages) {
+        onAdvancePage();
+      } else {
+        pendingAutoContinueRef.current = false;
+      }
+      return;
+    }
+
+    if (!translatedPage) {
+      if (!isCurrentlyOnline()) {
+        // Offline on an untranslated page: switch to original text so playback continues without stopping
+        if (narrationSource === 'translated') {
+          setAudioMessage(
+            `Offline mode — reading Page ${pageNumber} original text so playback continues.`
+          );
+          onNarrationSourceChange('original');
+        } else {
+          pendingAutoContinueRef.current = false;
+        }
+        return;
+      }
       // Fallback: if next page wasn't pre-saved yet, request translation and auto-start when ready
       pendingAutoContinueRef.current = false;
       setWaitingForTranslation(true);
       onRequestTranslatePage();
-    } else if (parsedPage && parsedPage.isBlank) {
-      pendingAutoContinueRef.current = false;
     }
-  }, [pageNumber, targetLang, sentences.length, isTranslatingPage, parsedPage, translatedPage]);
+  }, [
+    pageNumber,
+    numPages,
+    targetLang,
+    narrationSource,
+    sentences.length,
+    isTranslatingPage,
+    parsedPage,
+    translatedPage,
+    isOnline,
+  ]);
 
   // Complete a cross-page seek once the destination page inside the chapter has loaded
   useEffect(() => {
@@ -516,13 +693,22 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     }
 
     if (parsedPage && parsedPage.pageNumber === pageNumber && !parsedPage.isBlank && !translatedPage) {
+      if (!isCurrentlyOnline()) {
+        if (narrationSource === 'translated') {
+          setAudioMessage('Offline mode — reading original text.');
+          onNarrationSourceChange('original');
+        } else {
+          pendingSeekRef.current = null;
+        }
+        return;
+      }
       // Auto-translate the sought page so playback resumes smoothly
       setWaitingForTranslation(true);
       onRequestTranslatePage();
     } else if (parsedPage && parsedPage.pageNumber === pageNumber && parsedPage.isBlank) {
       pendingSeekRef.current = null;
     }
-  }, [pageNumber, sentences, isTranslatingPage, parsedPage, translatedPage]);
+  }, [pageNumber, sentences, isTranslatingPage, parsedPage, translatedPage, narrationSource, isOnline]);
 
   // Handle chapter audio start queued from the Chapter List Play button
   useEffect(() => {
@@ -534,8 +720,8 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     // Wait until parsedPage for this exact page has loaded from IndexedDB / PDF.js
     if (!parsedPage || parsedPage.pageNumber !== pageNumber) return;
 
-    // If translatedPage is already loaded for this exact page and has sentences, play immediately
-    if (translatedPage && translatedPage.pageNumber === pageNumber && sentences.length > 0) {
+    // If sentences are already ready for this exact page, play immediately
+    if (sentences.length > 0 && (narrationSource === 'original' || (translatedPage && translatedPage.pageNumber === pageNumber))) {
       pendingChapterPlayRef.current = null;
       speakFromIndex(0);
       return;
@@ -556,6 +742,16 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
       return;
     }
 
+    if (!isCurrentlyOnline()) {
+      if (narrationSource === 'translated') {
+        setAudioMessage(`Offline mode — playing "${pending.title}" original text.`);
+        onNarrationSourceChange('original');
+      } else {
+        pendingChapterPlayRef.current = null;
+      }
+      return;
+    }
+
     // Otherwise, auto-translate this chapter page and start audio immediately once translation completes
     pendingChapterPlayRef.current = null;
     setWaitingForTranslation(true);
@@ -565,10 +761,12 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     pageNumber,
     numPages,
     targetLang,
+    narrationSource,
     parsedPage,
     translatedPage,
     sentences.length,
     isTranslatingPage,
+    isOnline,
   ]);
 
   // Notify parent when audio is preparing (translating or loading sentence audio)
@@ -591,6 +789,28 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     if (pending) return pending;
 
     const fetchClip = async (): Promise<{ url: string; source: 'ai' | 'free' }> => {
+      // 1. Check persistent offline Cache Storage first so previously heard / prefetched clips play offline instantly
+      const cached = await getCachedTtsAudioBlob(cacheKey);
+      if (cached) {
+        return { url: URL.createObjectURL(cached.blob), source: cached.source };
+      }
+
+      if (!isCurrentlyOnline()) {
+        // Also check alternate free/AI key in persistent Cache Storage before falling back to local device voice
+        const fallbackKey = `${lang}::free::${text}`;
+        if (fallbackKey !== cacheKey) {
+          const fallbackCached = await getCachedTtsAudioBlob(fallbackKey);
+          if (fallbackCached) {
+            return {
+              url: URL.createObjectURL(fallbackCached.blob),
+              source: fallbackCached.source,
+            };
+          }
+        }
+        throw new Error('OFFLINE_UNCACHED');
+      }
+
+      // 2. Online synthesis + persistent offline caching
       if (useAi) {
         try {
           const profile = getAiVoiceProfile(voiceProfileId);
@@ -603,8 +823,9 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
             targetLang: lang,
             signal,
           });
-          const url = URL.createObjectURL(res.blob);
           const clipSource: 'ai' | 'free' = res.ext === 'wav' ? 'ai' : 'free';
+          putCachedTtsAudioBlob(cacheKey, res.blob, clipSource).catch(() => {});
+          const url = URL.createObjectURL(res.blob);
           return { url, source: clipSource };
         } catch (err) {
           if (err instanceof DOMException && err.name === 'AbortError') throw err;
@@ -612,6 +833,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
         }
       }
       const blob = await fetchFreeTtsBlob(text, lang, signal);
+      putCachedTtsAudioBlob(cacheKey, blob, 'free').catch(() => {});
       return { url: URL.createObjectURL(blob), source: 'free' };
     };
 
@@ -630,7 +852,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     return promise;
   };
 
-  // Offline Device Voice playback with native speed + pitch support
+  // Offline & Screen-Off Resilient Device Voice playback with local-voice preference + keep-alive + stall watchdog
   const speakWithDeviceVoice = (startIndex: number, session: number) => {
     if (!speechSupported) {
       setAudioMessage('Audio playback is unavailable in this browser.');
@@ -638,13 +860,69 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
       return;
     }
 
-    const runDeviceStep = (idx: number) => {
+    getKeepAlive().start();
+
+    // Pick best Web Speech voice — strictly preferring offline localService voices when offline
+    const pickDeviceVoice = (preferLocalOnly: boolean): SpeechSynthesisVoice | null => {
+      const liveList =
+        sortedVoices.length > 0
+          ? sortedVoices
+          : (() => {
+              try {
+                const raw = window.speechSynthesis.getVoices();
+                const prefix = langOption.speechLang.split('-')[0].toLowerCase();
+                return raw.map((v) => ({
+                  id: `${v.voiceURI || v.name}::${v.lang}`,
+                  voice: v,
+                  matchesLang: v.lang.toLowerCase().startsWith(prefix),
+                }));
+              } catch {
+                return [];
+              }
+            })();
+
+      const chosen = liveList.find((e) => e.id === voiceIdRef.current);
+      if (preferLocalOnly) {
+        if (chosen && chosen.voice.localService) return chosen.voice;
+        const localMatching = liveList.find((e) => e.matchesLang && e.voice.localService);
+        if (localMatching) return localMatching.voice;
+        const anyLocal = liveList.find((e) => e.voice.localService);
+        if (anyLocal) return anyLocal.voice;
+        return chosen?.voice ?? liveList[0]?.voice ?? null;
+      }
+
+      if (chosen) return chosen.voice;
+      const matching = liveList.find((e) => e.matchesLang);
+      return matching?.voice ?? null;
+    };
+
+    // Periodic speechSynthesis.resume() prevents Chromium/Android from silently pausing long utterances when screen locks
+    if (speechKeepAliveIntervalRef.current !== null) {
+      window.clearInterval(speechKeepAliveIntervalRef.current);
+    }
+    speechKeepAliveIntervalRef.current = window.setInterval(() => {
+      if (playSessionRef.current !== session) {
+        clearSpeechTimers();
+        return;
+      }
+      getKeepAlive().ensureRunning();
+      try {
+        if (window.speechSynthesis.paused || window.speechSynthesis.speaking) {
+          window.speechSynthesis.resume();
+        }
+      } catch {
+        // ignore
+      }
+    }, 8000);
+
+    const runDeviceStep = (idx: number, forceLocalVoice = !isCurrentlyOnline()) => {
       if (playSessionRef.current !== session) return;
       const list = sentencesRef.current;
       if (idx >= list.length) {
+        clearSpeechTimers();
         onSpeakingChange(false);
         onActiveSentenceChange(null);
-        if (autoAdvanceRef.current && pageNumber < numPages) {
+        if (autoAdvanceRef.current && pageNumberRef.current < numPagesRef.current) {
           pendingAutoContinueRef.current = true;
           onAdvancePage();
         }
@@ -653,6 +931,12 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
 
       const span = list[idx];
       onActiveSentenceChange(span.globalIndex);
+      getKeepAlive().ensureRunning();
+
+      if (speechWatchdogTimerRef.current !== null) {
+        window.clearTimeout(speechWatchdogTimerRef.current);
+        speechWatchdogTimerRef.current = null;
+      }
 
       try {
         window.speechSynthesis.cancel();
@@ -668,28 +952,70 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
       utter.rate = rateRef.current;
       utter.pitch = pitchRef.current;
 
-      const chosenEntry = sortedVoices.find((entry) => entry.id === voiceIdRef.current);
-      if (chosenEntry) {
-        utter.voice = chosenEntry.voice;
-        if (chosenEntry.voice.lang) {
-          utter.lang = chosenEntry.voice.lang;
+      const selectedVoice = pickDeviceVoice(forceLocalVoice);
+      if (selectedVoice) {
+        utter.voice = selectedVoice;
+        if (selectedVoice.lang) {
+          utter.lang = selectedVoice.lang;
         }
       }
 
       currentUtteranceRef.current = utter;
+      let settled = false;
+
+      const advanceNext = () => {
+        if (settled || playSessionRef.current !== session) return;
+        settled = true;
+        if (speechWatchdogTimerRef.current !== null) {
+          window.clearTimeout(speechWatchdogTimerRef.current);
+          speechWatchdogTimerRef.current = null;
+        }
+        currentUtteranceRef.current = null;
+        runDeviceStep(idx + 1, !isCurrentlyOnline());
+      };
+
+      // Stall watchdog: if mobile OS drops onend while display is off, automatically move to next sentence
+      const estMs = (estimateSentenceBaseSeconds(span.text) / Math.max(0.5, rateRef.current)) * 1000;
+      const watchdogMs = Math.max(15000, Math.min(90000, Math.round(estMs * 2.6 + 6000)));
+      speechWatchdogTimerRef.current = window.setTimeout(() => {
+        if (settled || playSessionRef.current !== session) return;
+        try {
+          window.speechSynthesis.cancel();
+        } catch {
+          // ignore
+        }
+        advanceNext();
+      }, watchdogMs);
 
       utter.onend = () => {
-        if (playSessionRef.current !== session) return;
-        currentUtteranceRef.current = null;
-        runDeviceStep(idx + 1);
+        advanceNext();
       };
 
       utter.onerror = (ev) => {
-        if (playSessionRef.current !== session) return;
-        currentUtteranceRef.current = null;
+        if (settled || playSessionRef.current !== session) return;
         if (ev.error === 'interrupted' || ev.error === 'canceled') return;
+        settled = true;
+        if (speechWatchdogTimerRef.current !== null) {
+          window.clearTimeout(speechWatchdogTimerRef.current);
+          speechWatchdogTimerRef.current = null;
+        }
+        currentUtteranceRef.current = null;
+
+        // If a cloud system voice failed (e.g. went offline), retry this same sentence with a local offline voice
+        if (!forceLocalVoice) {
+          runDeviceStep(idx, true);
+          return;
+        }
+
+        // Skip bad sentence instead of halting the whole audiobook if more sentences follow
+        if (idx + 1 < list.length) {
+          runDeviceStep(idx + 1, true);
+          return;
+        }
+
+        clearSpeechTimers();
         setAudioMessage(
-          'Device voice failed for this language. Switch to HD Voice for reliable playback.'
+          'Offline device voice could not speak this page. Install a local voice pack in device settings for best offline narration.'
         );
         onSpeakingChange(false);
       };
@@ -697,7 +1023,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
       window.speechSynthesis.speak(utter);
     };
 
-    runDeviceStep(startIndex);
+    runDeviceStep(startIndex, !isCurrentlyOnline());
   };
 
   const speakFromIndex = (startIndex: number) => {
@@ -707,6 +1033,8 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     const clamped = Math.max(0, Math.min(list.length - 1, startIndex));
     const session = ++playSessionRef.current;
     pausedInPlaceRef.current = false;
+    clearSpeechTimers();
+    getKeepAlive().start();
 
     if (abortRef.current) {
       abortRef.current.abort();
@@ -737,7 +1065,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
         setIsLoadingSentence(false);
         onSpeakingChange(false);
         onActiveSentenceChange(null);
-        if (autoAdvanceRef.current && pageNumber < numPages) {
+        if (autoAdvanceRef.current && pageNumberRef.current < numPagesRef.current) {
           pendingAutoContinueRef.current = true;
           onAdvancePage();
         }
@@ -747,14 +1075,19 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
       const span = currentList[idx];
       onActiveSentenceChange(span.globalIndex);
       setIsLoadingSentence(true);
+      getKeepAlive().ensureRunning();
 
-      const nextSpan = currentList[idx + 1];
-      if (nextSpan) {
-        getSentenceAudioUrl(
-          nextSpan.text,
-          targetLangRef.current,
-          aiVoiceProfileIdRef.current
-        ).catch(() => {});
+      // Prefetch up to 4 upcoming sentences into persistent offline Cache Storage while online
+      if (isCurrentlyOnline()) {
+        for (let ahead = 1; ahead <= 4; ahead++) {
+          const nextSpan = currentList[idx + ahead];
+          if (!nextSpan) break;
+          getSentenceAudioUrl(
+            nextSpan.text,
+            targetLangRef.current,
+            aiVoiceProfileIdRef.current
+          ).catch(() => {});
+        }
       }
 
       try {
@@ -776,6 +1109,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
 
         audio.onended = null;
         audio.onerror = null;
+        audio.onpause = null;
         audio.ontimeupdate = null;
         audio.src = audioUrl;
         // Preserve pitch on HTMLAudioElement so Web Audio shifter controls pitch independently
@@ -783,6 +1117,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
         audio.playbackRate = effectiveRate;
 
         const shifter = getPitchShifter();
+        shifter?.setActive(true);
         shifter?.setPitch(effectivePitch);
         await shifter?.resume();
 
@@ -794,8 +1129,44 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
           }
         };
 
+        audio.onpause = () => {
+          if (
+            playSessionRef.current !== session ||
+            pausedInPlaceRef.current ||
+            audio.ended
+          ) {
+            return;
+          }
+          // Auto-recover if mobile/desktop OS momentarily pauses playback when screen turns off
+          if (unexpectedPauseTimerRef.current !== null) {
+            window.clearTimeout(unexpectedPauseTimerRef.current);
+          }
+          unexpectedPauseTimerRef.current = window.setTimeout(() => {
+            unexpectedPauseTimerRef.current = null;
+            if (
+              playSessionRef.current === session &&
+              !pausedInPlaceRef.current &&
+              audioRef.current === audio &&
+              audio.paused &&
+              !audio.ended
+            ) {
+              getKeepAlive().ensureRunning();
+              pitchShifterRef.current?.resume().catch(() => {});
+              audio.play().catch(() => {
+                if (playSessionRef.current === session && speechSupported) {
+                  speakWithDeviceVoice(idx, session);
+                }
+              });
+            }
+          }, 250);
+        };
+
         audio.onended = () => {
           if (playSessionRef.current !== session) return;
+          if (unexpectedPauseTimerRef.current !== null) {
+            window.clearTimeout(unexpectedPauseTimerRef.current);
+            unexpectedPauseTimerRef.current = null;
+          }
           setSentenceProgress(1);
           runHdStep(idx + 1);
         };
@@ -822,6 +1193,9 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
         }
 
         if (speechSupported) {
+          if (!isCurrentlyOnline()) {
+            setAudioMessage('Offline mode — continuing seamlessly with offline device voice.');
+          }
           speakWithDeviceVoice(idx, session);
         } else {
           setAudioMessage(
@@ -852,8 +1226,14 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
       }
     } else if (waitingForTranslation && !isTranslatingPage && sentences.length === 0) {
       setWaitingForTranslation(false);
+      // If translation failed because device went offline, immediately fall back to original text so playback continues
+      if (!isCurrentlyOnline() && parsedPage && !parsedPage.isBlank && narrationSource === 'translated') {
+        pendingAutoContinueRef.current = true;
+        setAudioMessage('Offline mode — reading original text with offline voice.');
+        onNarrationSourceChange('original');
+      }
     }
-  }, [waitingForTranslation, isTranslatingPage, sentences.length, pageNumber]);
+  }, [waitingForTranslation, isTranslatingPage, sentences.length, pageNumber, parsedPage, narrationSource]);
 
   useEffect(() => {
     if (jumpRequest && sentences.length > 0) {
@@ -862,6 +1242,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
   }, [jumpRequest]);
 
   const unlockAudioElement = () => {
+    getKeepAlive().unlock();
     const audio = audioRef.current;
     pitchShifterRef.current?.resume().catch(() => {});
     if (!audio || audioUnlockedRef.current) return;
@@ -885,6 +1266,12 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
 
     if (sentences.length === 0) {
       if (parsedPage && !parsedPage.isBlank && !isTranslatingPage) {
+        if (!isCurrentlyOnline() && narrationSource === 'translated') {
+          pendingAutoContinueRef.current = true;
+          setAudioMessage('Offline mode — reading original text with offline voice.');
+          onNarrationSourceChange('original');
+          return;
+        }
         setWaitingForTranslation(true);
         setAudioMessage(
           `Translating Page ${pageNumber} into ${langOption.name} to start listening…`
@@ -898,8 +1285,8 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
 
     if (isSpeaking) {
       if (engineMode === 'hd' && audioRef.current && !isLoadingSentence) {
-        audioRef.current.pause();
         pausedInPlaceRef.current = true;
+        audioRef.current.pause();
         onSpeakingChange(false);
       } else {
         stopPlayback(false);
@@ -915,12 +1302,14 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
       activeSentenceIndex !== null
     ) {
       pausedInPlaceRef.current = false;
+      getKeepAlive().start();
       const { effectiveRate, effectivePitch } = computeEffectiveTone(
         currentClipSourceRef.current
       );
       audioRef.current.preservesPitch = true;
       audioRef.current.playbackRate = effectiveRate;
       const shifter = getPitchShifter();
+      shifter?.setActive(true);
       shifter?.setPitch(effectivePitch);
       shifter?.resume().catch(() => {});
       onSpeakingChange(true);
@@ -945,8 +1334,8 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
         pendingAutoContinueRef.current = false;
         setWaitingForTranslation(false);
         if (engineModeRef.current === 'hd' && audioRef.current && !isLoadingSentence) {
-          audioRef.current.pause();
           pausedInPlaceRef.current = true;
+          audioRef.current.pause();
           onSpeakingChange(false);
         } else {
           stopPlayback(false);
@@ -1416,6 +1805,104 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     sleepSecondsLeft > 0
       ? `${Math.floor(sleepSecondsLeft / 60)}:${String(sleepSecondsLeft % 60).padStart(2, '0')}`
       : null;
+
+  // Keep Media Session metadata, position state & lock-screen / Bluetooth controls in sync
+  const mediaHandlersRef = useRef({
+    onPlay: () => {},
+    onPause: () => {},
+    onStop: () => {},
+    onPreviousTrack: () => {},
+    onNextTrack: () => {},
+    onSeekBackward: () => {},
+    onSeekForward: () => {},
+  });
+
+  mediaHandlersRef.current = {
+    onPlay: () => {
+      if (!isSpeakingRef.current) {
+        handlePlayPause();
+      }
+    },
+    onPause: () => {
+      if (isSpeakingRef.current) {
+        handlePlayPause();
+      }
+    },
+    onStop: () => {
+      pendingAutoContinueRef.current = false;
+      pendingChapterPlayRef.current = null;
+      stopPlayback(true);
+    },
+    onPreviousTrack: () => {
+      const idx = activeSentenceIndexRef.current ?? 0;
+      if (idx > 0 && sentencesRef.current.length > 0) {
+        speakFromIndex(idx - 1);
+      } else if (pageNumberRef.current > 1 && onSeekToPage) {
+        pendingSeekRef.current = {
+          targetPage: pageNumberRef.current - 1,
+          fraction: 0,
+          autoPlay: true,
+        };
+        onSeekToPage(pageNumberRef.current - 1);
+      }
+    },
+    onNextTrack: () => {
+      const idx = activeSentenceIndexRef.current ?? -1;
+      if (idx + 1 < sentencesRef.current.length) {
+        speakFromIndex(idx + 1);
+      } else if (pageNumberRef.current < numPagesRef.current) {
+        pendingAutoContinueRef.current = true;
+        onAdvancePage();
+      }
+    },
+    onSeekBackward: () => {
+      commitSeek(Math.max(0, chapterTimeline.elapsedSec - 15));
+    },
+    onSeekForward: () => {
+      commitSeek(Math.min(chapterTimeline.totalSec, chapterTimeline.elapsedSec + 15));
+    },
+  };
+
+  useEffect(() => {
+    return registerMediaSessionHandlers({
+      onPlay: () => mediaHandlersRef.current.onPlay(),
+      onPause: () => mediaHandlersRef.current.onPause(),
+      onStop: () => mediaHandlersRef.current.onStop(),
+      onPreviousTrack: () => mediaHandlersRef.current.onPreviousTrack(),
+      onNextTrack: () => mediaHandlersRef.current.onNextTrack(),
+      onSeekBackward: () => mediaHandlersRef.current.onSeekBackward(),
+      onSeekForward: () => mediaHandlersRef.current.onSeekForward(),
+    });
+  }, []);
+
+  useEffect(() => {
+    const state: 'playing' | 'paused' | 'none' = isSpeaking
+      ? 'playing'
+      : activeSentenceIndex !== null
+      ? 'paused'
+      : 'none';
+    updateMediaSessionState({
+      title: `${bookTitle} · Page ${pageNumber}`,
+      artist: bookAuthor || 'BhashaBook Audiobook',
+      album: chapterTimeline.chapterLabel,
+      artworkUrl: bookCoverUrl,
+      playbackState: state,
+      durationSec: chapterTimeline.totalSec,
+      positionSec: chapterTimeline.elapsedSec,
+      playbackRate: rate,
+    });
+  }, [
+    bookTitle,
+    bookAuthor,
+    bookCoverUrl,
+    pageNumber,
+    chapterTimeline.chapterLabel,
+    chapterTimeline.totalSec,
+    Math.floor(chapterTimeline.elapsedSec),
+    isSpeaking,
+    activeSentenceIndex,
+    rate,
+  ]);
 
   return (
     <div className="no-print sticky bottom-0 z-20 border-t border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#FAF9F5]/95 sepia:bg-[#F4ECD8]/95 dark:bg-[#141312]/95 backdrop-blur-sm">

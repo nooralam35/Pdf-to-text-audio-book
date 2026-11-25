@@ -39,7 +39,7 @@ export const AI_VOICE_PROFILES: AiVoiceProfile[] = [
     tagline: 'Female · Natural',
     description: 'Balanced, clear studio narrator ideal for books and technical guides',
     style: 'Natural, clear, warm female audiobook narrator with steady pacing',
-    fallbackPitch: 1.04,
+    fallbackPitch: 1.0,
     fallbackRate: 1.0,
   },
   {

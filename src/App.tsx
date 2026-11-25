@@ -2461,6 +2461,9 @@ export default function App() {
       {activeTab === 'reader' && activeBook && (
         <AudiobookBar
           bookTitle={activeBook.title}
+          bookAuthor={activeBook.author}
+          bookCoverUrl={activeBook.coverDataUrl}
+          isOnline={isOnline}
           pageNumber={currentPage}
           numPages={activeBook.numPages}
           currentChapter={currentChapter}
