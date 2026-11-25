@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Bookmark,
   BookOpen,
+  FileText,
   Languages,
   Loader2,
   Moon,
@@ -13,6 +15,7 @@ import {
   Zap,
 } from 'lucide-react';
 import { TopBar, type ActiveTab } from './components/TopBar';
+import { DiscoverView, type DiscoverBookAction } from './components/DiscoverView';
 import { ChapterSidebar } from './components/ChapterSidebar';
 import { PdfViewerPane } from './components/PdfViewerPane';
 import {
@@ -25,6 +28,11 @@ import {
 } from './components/AudiobookBar';
 import { LibraryView } from './components/LibraryView';
 import { ExportView } from './components/ExportView';
+import {
+  exportHighlightsSummarySheet,
+  fetchExternalBookAsPdfBuffer,
+  summarizeChapterApi,
+} from './lib/bookDiscovery';
 import {
   getLanguageOption,
   LANGUAGES,
@@ -51,10 +59,12 @@ import {
   saveBook,
   saveParsedPage,
   saveTranslation,
+  toggleBookBookmark,
   updateBookLastPage,
 } from './lib/storage';
 import {
   checkServerCapabilities,
+  downloadBlob,
   splitBlocksIntoSentences,
   translatePageBlocks,
   translatePagesBatchFast,
@@ -62,8 +72,11 @@ import {
 import type {
   BatchTranslationProgress,
   ChapterItem,
+  ChapterSummaryResult,
+  DiscoveredBook,
   LanguageCode,
   ParsedPage,
+  ReadingTheme,
   StoredBook,
   TextHighlight,
   TranslatedPageRecord,
@@ -73,14 +86,26 @@ import type {
 type MobilePane = 'pdf' | 'translated' | 'chapters';
 
 export default function App() {
-  // Navigation & Theme
-  const [activeTab, setActiveTab] = useState<ActiveTab>('reader');
+  // Navigation & Reading Themes (Light Paper, Sepia, OLED Dark)
+  const [activeTab, setActiveTab] = useState<ActiveTab>('discover');
   const [mobilePane, setMobilePane] = useState<MobilePane>('translated');
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [mobileChaptersOpen, setMobileChaptersOpen] = useState(false);
-  const [darkMode, setDarkMode] = useState<boolean>(() => {
-    if (typeof window === 'undefined') return false;
-    return localStorage.getItem('bhashabook-theme') === 'dark';
+  const [readingTheme, setReadingTheme] = useState<ReadingTheme>(() => {
+    if (typeof window === 'undefined') return 'light';
+    const saved = localStorage.getItem('bhashabook-theme');
+    if (saved === 'dark' || saved === 'sepia' || saved === 'light') return saved;
+    return 'light';
+  });
+  const [readerFontSize, setReaderFontSize] = useState<number>(() => {
+    if (typeof window === 'undefined') return 16;
+    const n = parseInt(localStorage.getItem('bhashabook-font-size') ?? '16', 10);
+    return Number.isFinite(n) && n >= 13 && n <= 24 ? n : 16;
+  });
+  const [readerLineHeight, setReaderLineHeight] = useState<number>(() => {
+    if (typeof window === 'undefined') return 1.82;
+    const n = parseFloat(localStorage.getItem('bhashabook-line-height') ?? '1.82');
+    return Number.isFinite(n) && n >= 1.4 && n <= 2.3 ? n : 1.82;
   });
 
   // Server capabilities
@@ -136,8 +161,22 @@ export default function App() {
   const [activeSentenceIndex, setActiveSentenceIndex] = useState<number | null>(null);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isPreparingAudio, setIsPreparingAudio] = useState(false);
+  const [narrationSource, setNarrationSource] = useState<'translated' | 'original'>('translated');
   const [jumpRequest, setJumpRequest] = useState<{ index: number; nonce: number } | null>(null);
   const audiobookControlRef = useRef<AudiobookControlHandle | null>(null);
+
+  // Discovery Hub & Chapter Summarizer State
+  const [loadingBookAction, setLoadingBookAction] = useState<{
+    bookId: string;
+    action: DiscoverBookAction;
+    status: string;
+  } | null>(null);
+  const [pendingPostLoadAction, setPendingPostLoadAction] = useState<{
+    bookId: string;
+    action: 'translate' | 'listen';
+  } | null>(null);
+  const [chapterSummaryModal, setChapterSummaryModal] = useState<ChapterSummaryResult | null>(null);
+  const [summarizingChapterId, setSummarizingChapterId] = useState<string | null>(null);
 
   // Print-only Selectable Unicode PDF State
   const [printPayload, setPrintPayload] = useState<{
@@ -145,17 +184,25 @@ export default function App() {
     includeCover: boolean;
   } | null>(null);
 
-  // Sync dark mode class on <html>
+  // Sync reading theme (light / sepia / dark) on <html>
   useEffect(() => {
     const root = document.documentElement;
-    if (darkMode) {
+    root.classList.remove('dark', 'sepia');
+    if (readingTheme === 'dark') {
       root.classList.add('dark');
-      localStorage.setItem('bhashabook-theme', 'dark');
-    } else {
-      root.classList.remove('dark');
-      localStorage.setItem('bhashabook-theme', 'light');
+    } else if (readingTheme === 'sepia') {
+      root.classList.add('sepia');
     }
-  }, [darkMode]);
+    localStorage.setItem('bhashabook-theme', readingTheme);
+  }, [readingTheme]);
+
+  useEffect(() => {
+    localStorage.setItem('bhashabook-font-size', String(readerFontSize));
+  }, [readerFontSize]);
+
+  useEffect(() => {
+    localStorage.setItem('bhashabook-line-height', String(readerLineHeight));
+  }, [readerLineHeight]);
 
   useEffect(() => {
     localStorage.setItem('bhashabook-auto-preload-next', String(autoPreloadNext));
@@ -445,6 +492,168 @@ export default function App() {
       }
     }
   };
+
+  // Load, translate, listen, or download a book directly from the Global E-Book Discovery Hub
+  const handleActionDiscoveredBook = async (
+    book: DiscoveredBook,
+    action: DiscoverBookAction
+  ) => {
+    setAppBanner(null);
+    setLoadingBookAction({
+      bookId: book.id,
+      action,
+      status: `Preparing "${book.title}"…`,
+    });
+
+    try {
+      const { buffer, fileName } = await fetchExternalBookAsPdfBuffer(book, (status) => {
+        setLoadingBookAction({ bookId: book.id, action, status });
+      });
+
+      if (action === 'download') {
+        downloadBlob(new Blob([buffer], { type: 'application/pdf' }), fileName);
+        setAppBanner(`Downloaded "${book.title}" (${fileName}).`);
+        return;
+      }
+
+      setLoadingBookAction({
+        bookId: book.id,
+        action,
+        status: `Parsing pages, cover & chapters for "${book.title}"…`,
+      });
+
+      const pdf = await loadPdfFromBuffer(buffer);
+      const [{ chapters, detectedTitle, detectedAuthor }, coverRes, p1] = await Promise.all([
+        detectChapters(pdf),
+        renderPageToDataUrl(pdf, 1, 1.35, 'image/jpeg', 0.88),
+        pdf.getPage(1),
+      ]);
+      const vp1 = p1.getViewport({ scale: 1.0 });
+
+      // Start on page 2 if Page 1 is pure cover art and book has multiple pages
+      const ch1 = chapters.find((c) => c.index === 1) ?? chapters[0];
+      const startPage =
+        ch1 && ch1.startPage > 1
+          ? ch1.startPage
+          : pdf.numPages > 1
+          ? 2
+          : 1;
+
+      const storedId = `discover-${book.source}-${book.identifier.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40)}`;
+      const newBook: StoredBook = {
+        id: storedId,
+        title: book.title || detectedTitle || 'Public Domain E-Book',
+        author: book.author || detectedAuthor || '',
+        fileName,
+        numPages: pdf.numPages,
+        coverDataUrl: coverRes.dataUrl,
+        chapters,
+        pdfData: buffer,
+        addedAt: Date.now(),
+        lastPage: startPage,
+        pageWidth: vp1.width,
+        pageHeight: vp1.height,
+        externalSource: book.source,
+        externalUrl: book.readOnlineUrl,
+      };
+
+      await saveBook(newBook);
+      const all = await listBooks();
+      setBooks(all);
+
+      setLoadedPdf((prev) => {
+        if (prev && prev !== pdf) prev.cleanup().catch(() => {});
+        return pdf;
+      });
+      setActiveBook(newBook);
+      setCurrentPage(startPage);
+      setActiveTab('reader');
+
+      if (action === 'translate' || action === 'listen') {
+        setPendingPostLoadAction({ bookId: storedId, action });
+      }
+    } catch (err) {
+      setAppBanner(
+        err instanceof Error
+          ? err.message
+          : 'Unable to open this public-domain book right now.'
+      );
+    } finally {
+      setLoadingBookAction(null);
+    }
+  };
+
+  // Toggle Bookmark for the active page
+  const handleToggleCurrentPageBookmark = useCallback(async () => {
+    if (!activeBook) return;
+    const updated = await toggleBookBookmark(activeBook.id, currentPage);
+    if (updated) {
+      setActiveBook(updated);
+      setBooks((prev) => prev.map((b) => (b.id === updated.id ? updated : b)));
+    }
+  }, [activeBook, currentPage]);
+
+  // One-Click Chapter Summarizer & Key Takeaways
+  const handleSummarizeChapter = useCallback(
+    async (chapter: ChapterItem) => {
+      if (!activeBook || !loadedPdf || summarizingChapterId) return;
+      setSummarizingChapterId(chapter.id);
+      setAppBanner(null);
+      try {
+        // Sample up to first 6 pages of the chapter so summarization is fast and thorough
+        const end = Math.min(chapter.endPage, chapter.startPage + 5);
+        const chunks: string[] = [];
+        for (let p = chapter.startPage; p <= end; p++) {
+          const cachedTr = await getTranslation(activeBook.id, targetLang, p);
+          if (cachedTr && cachedTr.blocks.length > 0) {
+            chunks.push(cachedTr.blocks.map((b) => b.translatedText || b.text).join(' '));
+            continue;
+          }
+          let parsed = await getParsedPage(activeBook.id, p);
+          if (!parsed) {
+            parsed = await extractPageContent(loadedPdf, p);
+            await saveParsedPage(activeBook.id, parsed);
+          }
+          if (parsed.blocks.length > 0) {
+            chunks.push(parsed.blocks.map((b) => b.text).join(' '));
+          }
+        }
+        const combined = chunks.join('\n\n').trim();
+        if (combined.length < 40) {
+          setAppBanner(`Not enough extractable text in "${chapter.title}" to summarize.`);
+          return;
+        }
+        const summary = await summarizeChapterApi({
+          chapterTitle: chapter.title,
+          text: combined,
+          targetLang,
+        });
+        setChapterSummaryModal(summary);
+      } catch (err) {
+        setAppBanner(
+          err instanceof Error ? `Chapter summary failed: ${err.message}` : 'Chapter summary failed.'
+        );
+      } finally {
+        setSummarizingChapterId(null);
+      }
+    },
+    [activeBook, loadedPdf, summarizingChapterId, targetLang]
+  );
+
+  // Export all Highlights, Sticky Notes & Bookmarks as a study summary sheet
+  const handleExportHighlightsSheet = useCallback(() => {
+    if (!activeBook) return;
+    const { exportedCount, fileName } = exportHighlightsSummarySheet(
+      activeBook,
+      bookTranslations,
+      getLanguageOption(targetLang).name
+    );
+    setAppBanner(
+      exportedCount > 0
+        ? `Exported ${exportedCount} highlights, notes & bookmarks to ${fileName}.`
+        : `Downloaded ${fileName}. Highlight passages or bookmark pages to populate your study sheet.`
+    );
+  }, [activeBook, bookTranslations, targetLang]);
 
   // Helper to translate a single page with deduplication and auto-save to IndexedDB
   const translateSinglePageInternal = useCallback(
@@ -1216,12 +1425,43 @@ export default function App() {
   );
 
   const sentences = useMemo(() => {
+    if (narrationSource === 'original') {
+      if (!parsedPage) return [];
+      return splitBlocksIntoSentences(
+        parsedPage.blocks.map((b) => ({ ...b, translatedText: b.text })),
+        []
+      );
+    }
     if (!translatedPage) return [];
     return splitBlocksIntoSentences(
       translatedPage.blocks,
       translatedPage.imageExplanations
     );
-  }, [translatedPage]);
+  }, [narrationSource, parsedPage, translatedPage]);
+
+  // Execute queued Translate or Listen action right after opening a book from the Discovery Hub
+  useEffect(() => {
+    if (!pendingPostLoadAction || !activeBook || !loadedPdf) return;
+    if (activeBook.id !== pendingPostLoadAction.bookId) return;
+    if (!parsedPage || parsedPage.pageNumber !== currentPage) return;
+
+    const action = pendingPostLoadAction.action;
+    setPendingPostLoadAction(null);
+
+    if (action === 'translate') {
+      if (!translatedPage) {
+        handleTranslateCurrentPage(false);
+      }
+    } else if (action === 'listen') {
+      if (translatedPage) {
+        setNarrationSource('translated');
+        setTimeout(() => audiobookControlRef.current?.playCurrentPage(), 80);
+      } else if (!parsedPage.isBlank) {
+        setNarrationSource('original');
+        setTimeout(() => audiobookControlRef.current?.playCurrentPage(), 120);
+      }
+    }
+  }, [pendingPostLoadAction, activeBook, loadedPdf, parsedPage, translatedPage, currentPage, handleTranslateCurrentPage]);
 
   // Audiobook lookahead: auto-translate & auto-save next page when narration approaches the last 2 sentences
   useEffect(() => {
@@ -1305,9 +1545,18 @@ export default function App() {
   );
 
   const langOption = getLanguageOption(targetLang);
+  const isCurrentPageBookmarked = Boolean(
+    activeBook?.bookmarks?.includes(currentPage)
+  );
+
+  const cycleTheme = () => {
+    setReadingTheme((curr) =>
+      curr === 'light' ? 'sepia' : curr === 'sepia' ? 'dark' : 'light'
+    );
+  };
 
   return (
-    <div className="min-h-screen flex flex-col bg-[#FAF9F5] dark:bg-[#111110] text-stone-900 dark:text-stone-100">
+    <div className="min-h-screen flex flex-col bg-[#FAF9F5] sepia:bg-[#F4ECD8] dark:bg-[#090908] text-stone-900 sepia:text-[#3B2F23] dark:text-stone-100">
       {/* Top 3-Zone Navigation Bar */}
       <TopBar
         activeTab={activeTab}
@@ -1318,7 +1567,7 @@ export default function App() {
 
       {/* Reader Workspace Utility Bar */}
       {activeTab === 'reader' && (
-        <div className="no-print border-b border-stone-200 dark:border-stone-800 bg-[#F5F3EE] dark:bg-[#161513]">
+        <div className="no-print border-b border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#F5F3EE] sepia:bg-[#ECE2CA] dark:bg-[#141312]">
           <div className="max-w-[1680px] mx-auto px-3 sm:px-6 py-2 flex flex-wrap items-center justify-between gap-2.5">
             {/* Left controls: Sidebar toggle + Language + Engine */}
             <div className="flex flex-wrap items-center gap-2">
@@ -1332,7 +1581,7 @@ export default function App() {
                   }
                 }}
                 aria-label="Toggle chapters panel"
-                className="inline-flex items-center gap-1.5 h-8 px-2.5 rounded border border-stone-300 dark:border-stone-700 bg-white dark:bg-[#1F1E1B] text-xs font-medium text-stone-700 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer whitespace-nowrap"
+                className="inline-flex items-center gap-1.5 h-8 px-2.5 rounded border border-stone-300 dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] text-xs font-medium text-stone-700 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer whitespace-nowrap"
               >
                 <PanelLeft className="w-3.5 h-3.5" />
                 <span className="hidden sm:inline">Chapters</span>
@@ -1345,7 +1594,7 @@ export default function App() {
                   aria-label="Target translation language"
                   value={targetLang}
                   onChange={(e) => setTargetLang(e.target.value as LanguageCode)}
-                  className="h-8 px-2.5 rounded border border-stone-300 dark:border-stone-700 bg-white dark:bg-[#1F1E1B] text-xs font-medium text-stone-900 dark:text-stone-100 focus:outline-none focus:border-amber-700 cursor-pointer"
+                  className="h-8 px-2.5 rounded border border-stone-300 dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] text-xs font-medium text-stone-900 dark:text-stone-100 focus:outline-none focus:border-amber-700 cursor-pointer"
                 >
                   {LANGUAGES.map((l) => (
                     <option key={l.code} value={l.code}>
@@ -1356,7 +1605,7 @@ export default function App() {
               </div>
 
               {/* Engine Selector (Free Open Default + Optional Smart AI) */}
-              <div className="inline-flex rounded border border-stone-300 dark:border-stone-700 bg-white dark:bg-[#1F1E1B] p-0.5">
+              <div className="inline-flex rounded border border-stone-300 dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] p-0.5">
                 <button
                   type="button"
                   onClick={() => setEngine('free')}
@@ -1387,9 +1636,9 @@ export default function App() {
                 </button>
               </div>
 
-              {/* Technical Term Preservation, Auto-Save Next Toggle & Custom Glossary */}
+              {/* Technical Term Preservation, Auto-Save Next Toggle & Custom Reading Preferences */}
               <div className="relative flex items-center gap-1.5">
-                <label className="hidden md:inline-flex items-center gap-1.5 h-8 px-2.5 rounded border border-stone-300 dark:border-stone-700 bg-white dark:bg-[#1F1E1B] text-xs text-stone-700 dark:text-stone-200 cursor-pointer select-none whitespace-nowrap">
+                <label className="hidden md:inline-flex items-center gap-1.5 h-8 px-2.5 rounded border border-stone-300 dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] text-xs text-stone-700 dark:text-stone-200 cursor-pointer select-none whitespace-nowrap">
                   <input
                     type="checkbox"
                     checked={preserveTerms}
@@ -1401,7 +1650,7 @@ export default function App() {
 
                 <label
                   title="Automatically translate and save the next page in the background when you reach the end of the current page"
-                  className="hidden xl:inline-flex items-center gap-1.5 h-8 px-2.5 rounded border border-stone-300 dark:border-stone-700 bg-white dark:bg-[#1F1E1B] text-xs text-stone-700 dark:text-stone-200 cursor-pointer select-none whitespace-nowrap"
+                  className="hidden xl:inline-flex items-center gap-1.5 h-8 px-2.5 rounded border border-stone-300 dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] text-xs text-stone-700 dark:text-stone-200 cursor-pointer select-none whitespace-nowrap"
                 >
                   <input
                     type="checkbox"
@@ -1415,17 +1664,17 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => setShowGlossaryPopover((v) => !v)}
-                  title="Reading & translation preferences"
-                  className="h-8 w-8 inline-flex items-center justify-center rounded border border-stone-300 dark:border-stone-700 bg-white dark:bg-[#1F1E1B] text-stone-600 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer"
+                  title="Reading theme, font size, spacing & glossary preferences"
+                  className="h-8 w-8 inline-flex items-center justify-center rounded border border-stone-300 dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] text-stone-600 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer"
                 >
                   <SlidersHorizontal className="w-3.5 h-3.5" />
                 </button>
 
                 {showGlossaryPopover && (
-                  <div className="absolute left-0 top-10 z-40 w-80 p-4 rounded-lg border border-stone-200 dark:border-stone-700 bg-white dark:bg-[#1C1B19] shadow-lg space-y-3">
+                  <div className="absolute left-0 top-10 z-40 w-80 p-4 rounded-lg border border-stone-200 dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1C1B19] shadow-lg space-y-3.5">
                     <div className="flex items-center justify-between">
                       <span className="text-xs font-semibold text-stone-900 dark:text-stone-100">
-                        Translation &amp; Reading Preferences
+                        Reading &amp; Translation Preferences
                       </span>
                       <button
                         type="button"
@@ -1435,44 +1684,131 @@ export default function App() {
                         <X className="w-3.5 h-3.5" />
                       </button>
                     </div>
-                    <label className="flex items-start gap-2 text-xs text-stone-700 dark:text-stone-300 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={autoPreloadNext}
-                        onChange={(e) => setAutoPreloadNext(e.target.checked)}
-                        className="mt-0.5 rounded accent-amber-700"
-                      />
-                      <span>
-                        Auto-translate &amp; save next page when reaching the end of the current page
+
+                    {/* 3-Mode Reading Theme Picker */}
+                    <div className="space-y-1.5">
+                      <span className="block text-[11px] font-medium text-stone-500 dark:text-stone-400">
+                        Reading Theme
                       </span>
-                    </label>
-                    <label className="flex items-center gap-2 text-xs text-stone-700 dark:text-stone-300 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={preserveTerms}
-                        onChange={(e) => setPreserveTerms(e.target.checked)}
-                        className="rounded accent-amber-700"
-                      />
-                      Keep software &amp; UI terms in English
-                    </label>
-                    <div>
-                      <label className="block text-[11px] text-stone-500 dark:text-stone-400 mb-1">
-                        Extra protected terms (comma-separated):
+                      <div className="grid grid-cols-3 gap-1.5 text-xs font-medium">
+                        {(
+                          [
+                            { id: 'light', label: 'Light' },
+                            { id: 'sepia', label: 'Sepia Paper' },
+                            { id: 'dark', label: 'OLED Dark' },
+                          ] as const
+                        ).map((t) => (
+                          <button
+                            key={t.id}
+                            type="button"
+                            onClick={() => setReadingTheme(t.id)}
+                            className={`h-8 rounded border transition-colors cursor-pointer ${
+                              readingTheme === t.id
+                                ? 'border-amber-700 bg-amber-700 text-white'
+                                : 'border-stone-300 dark:border-stone-700 text-stone-700 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800'
+                            }`}
+                          >
+                            {t.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Font Size & Line Spacing Sliders */}
+                    <div className="grid grid-cols-2 gap-3 pt-1">
+                      <label className="space-y-1 text-[11px] text-stone-600 dark:text-stone-400">
+                        <div className="flex justify-between font-mono-num">
+                          <span>Font Size</span>
+                          <span>{readerFontSize}px</span>
+                        </div>
+                        <input
+                          type="range"
+                          min={13}
+                          max={23}
+                          step={1}
+                          value={readerFontSize}
+                          onChange={(e) => setReaderFontSize(parseInt(e.target.value, 10))}
+                          className="w-full accent-amber-700 cursor-pointer"
+                        />
                       </label>
-                      <textarea
-                        rows={3}
-                        value={customTermsInput}
-                        onChange={(e) => setCustomTermsInput(e.target.value)}
-                        className="w-full p-2 text-xs rounded border border-stone-300 dark:border-stone-700 bg-[#FAF9F5] dark:bg-[#141312] text-stone-900 dark:text-stone-100 focus:outline-none focus:border-amber-700"
-                      />
+
+                      <label className="space-y-1 text-[11px] text-stone-600 dark:text-stone-400">
+                        <div className="flex justify-between font-mono-num">
+                          <span>Line Space</span>
+                          <span>{readerLineHeight.toFixed(2)}</span>
+                        </div>
+                        <input
+                          type="range"
+                          min={1.45}
+                          max={2.25}
+                          step={0.05}
+                          value={readerLineHeight}
+                          onChange={(e) => setReaderLineHeight(parseFloat(e.target.value))}
+                          className="w-full accent-amber-700 cursor-pointer"
+                        />
+                      </label>
+                    </div>
+
+                    <div className="pt-2 border-t border-stone-200 dark:border-stone-800 space-y-2.5">
+                      <label className="flex items-start gap-2 text-xs text-stone-700 dark:text-stone-300 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={autoPreloadNext}
+                          onChange={(e) => setAutoPreloadNext(e.target.checked)}
+                          className="mt-0.5 rounded accent-amber-700"
+                        />
+                        <span>
+                          Auto-translate &amp; save next page when reaching the end of the current page
+                        </span>
+                      </label>
+                      <label className="flex items-center gap-2 text-xs text-stone-700 dark:text-stone-300 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={preserveTerms}
+                          onChange={(e) => setPreserveTerms(e.target.checked)}
+                          className="rounded accent-amber-700"
+                        />
+                        Keep software &amp; UI terms in English
+                      </label>
+                      <div>
+                        <label className="block text-[11px] text-stone-500 dark:text-stone-400 mb-1">
+                          Extra protected terms (comma-separated):
+                        </label>
+                        <textarea
+                          rows={2}
+                          value={customTermsInput}
+                          onChange={(e) => setCustomTermsInput(e.target.value)}
+                          className="w-full p-2 text-xs rounded border border-stone-300 dark:border-stone-700 bg-[#FAF9F5] dark:bg-[#141312] text-stone-900 dark:text-stone-100 focus:outline-none focus:border-amber-700"
+                        />
+                      </div>
                     </div>
                   </div>
                 )}
               </div>
             </div>
 
-            {/* Right controls: Fast Full-PDF Converter + Batch progress or Quick Translate + Theme toggle */}
+            {/* Right controls: Bookmark + Fast Full-PDF Converter + Quick Translate + Theme cycle */}
             <div className="flex items-center gap-2">
+              {activeBook && (
+                <button
+                  type="button"
+                  onClick={handleToggleCurrentPageBookmark}
+                  title={
+                    isCurrentPageBookmarked
+                      ? `Remove bookmark on Page ${currentPage}`
+                      : `Bookmark Page ${currentPage}`
+                  }
+                  aria-label={isCurrentPageBookmarked ? 'Remove page bookmark' : 'Bookmark current page'}
+                  className={`h-8 w-8 inline-flex items-center justify-center rounded border transition-colors cursor-pointer ${
+                    isCurrentPageBookmarked
+                      ? 'border-amber-700 bg-amber-700 text-white'
+                      : 'border-stone-300 dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] text-stone-600 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800'
+                  }`}
+                >
+                  <Bookmark className={`w-3.5 h-3.5 ${isCurrentPageBookmarked ? 'fill-current' : ''}`} />
+                </button>
+              )}
+
               {batchProgress ? (
                 <div className="flex items-center gap-2.5 px-3 h-8 rounded border border-amber-700/40 bg-amber-50/80 dark:bg-amber-950/30 text-xs">
                   <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-700 dark:text-amber-400 shrink-0" />
@@ -1509,7 +1845,7 @@ export default function App() {
                     disabled={!activeBook}
                     onClick={() => setActiveTab('export')}
                     title="Fast-translate all pages in parallel batches and convert the full PDF"
-                    className="inline-flex items-center gap-1.5 h-8 px-2.5 rounded border border-amber-700/45 dark:border-amber-600/50 bg-white dark:bg-[#1F1E1B] text-xs font-medium text-amber-800 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-950/30 disabled:opacity-45 cursor-pointer whitespace-nowrap"
+                    className="inline-flex items-center gap-1.5 h-8 px-2.5 rounded border border-amber-700/45 dark:border-amber-600/50 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] text-xs font-medium text-amber-800 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-950/30 disabled:opacity-45 cursor-pointer whitespace-nowrap"
                   >
                     <Zap className="w-3.5 h-3.5" />
                     <span className="hidden sm:inline">Full PDF Fast</span>
@@ -1519,11 +1855,19 @@ export default function App() {
 
               <button
                 type="button"
-                onClick={() => setDarkMode((d) => !d)}
-                aria-label={darkMode ? 'Switch to light reading paper' : 'Switch to dark theme'}
-                className="h-8 w-8 inline-flex items-center justify-center rounded border border-stone-300 dark:border-stone-700 bg-white dark:bg-[#1F1E1B] text-stone-600 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer"
+                onClick={cycleTheme}
+                title={`Reading Theme: ${readingTheme === 'light' ? 'Light' : readingTheme === 'sepia' ? 'Sepia Paper' : 'OLED Dark'} (click to switch)`}
+                aria-label="Cycle reading theme (Light, Sepia, OLED Dark)"
+                className="h-8 px-2 inline-flex items-center justify-center gap-1 rounded border border-stone-300 dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] text-xs font-medium text-stone-600 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer whitespace-nowrap"
               >
-                {darkMode ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+                {readingTheme === 'dark' ? (
+                  <Sun className="w-3.5 h-3.5" />
+                ) : readingTheme === 'sepia' ? (
+                  <BookOpen className="w-3.5 h-3.5 text-amber-800" />
+                ) : (
+                  <Moon className="w-3.5 h-3.5" />
+                )}
+                <span className="hidden xl:inline capitalize">{readingTheme}</span>
               </button>
             </div>
           </div>
@@ -1568,11 +1912,19 @@ export default function App() {
 
       {/* Main View Content */}
       <div className="no-print flex-1 flex flex-col min-h-0">
-        {isInitializing ? (
+        {activeTab === 'discover' ? (
+          <DiscoverView
+            targetLang={targetLang}
+            onActionBook={handleActionDiscoveredBook}
+            loadingBookAction={loadingBookAction}
+            onUploadPdf={handleUploadPdf}
+            isUploading={isUploading}
+          />
+        ) : isInitializing ? (
           <div className="flex-1 flex flex-col items-center justify-center gap-3 py-20 text-stone-600 dark:text-stone-400">
             <Loader2 className="w-6 h-6 animate-spin text-amber-700 dark:text-amber-500" />
             <p className="text-sm font-medium">
-              Loading The OBS Superuser Guidebook & detecting chapters…
+              Loading library &amp; detecting book chapters…
             </p>
           </div>
         ) : activeTab === 'library' ? (
@@ -1586,6 +1938,7 @@ export default function App() {
             }}
             onUploadPdf={handleUploadPdf}
             onDeleteBook={handleDeleteBook}
+            onGoToDiscover={() => setActiveTab('discover')}
             isUploading={isUploading}
           />
         ) : activeTab === 'export' ? (
@@ -1614,14 +1967,21 @@ export default function App() {
             <BookOpen className="w-10 h-10 text-stone-400" />
             <h1 className="font-display text-2xl font-semibold">No Book Loaded</h1>
             <p className="text-sm text-stone-600 dark:text-stone-400 max-w-md">
-              Upload any illustrated PDF guidebook using the Upload PDF button above to start
-              translating, listening, and exporting with the original cover preserved.
+              Discover free public-domain PDFs and e-books or upload your own illustrated PDF to
+              start translating, listening, and exporting with the original cover preserved.
             </p>
+            <button
+              type="button"
+              onClick={() => setActiveTab('discover')}
+              className="h-9 px-4 rounded-md text-xs font-medium bg-amber-700 hover:bg-amber-800 text-white cursor-pointer"
+            >
+              Browse Global E-Book Search
+            </button>
           </div>
         ) : (
           /* Split-Screen Desktop / Tabbed Mobile Reader */
           <div className="flex-1 flex min-h-0 h-[calc(100vh-160px)]">
-            {/* Desktop Collapsible Chapters Sidebar */}
+            {/* Desktop Collapsible Chapters & Bookmarks Sidebar */}
             {sidebarOpen && (
               <div className="hidden lg:block w-[272px] shrink-0 h-full overflow-hidden">
                 <ChapterSidebar
@@ -1630,11 +1990,14 @@ export default function App() {
                   chapters={activeBook.chapters}
                   currentPage={currentPage}
                   translatedPageNumbers={translatedPageNumbers}
+                  bookmarks={activeBook.bookmarks ?? []}
                   isSpeaking={isSpeaking}
                   isPreparingAudio={isPreparingAudio}
                   onSelectPage={setCurrentPage}
                   onPlayChapterAudio={handlePlayChapterAudio}
                   onTranslateChapter={handleTranslateChapter}
+                  onSummarizeChapter={handleSummarizeChapter}
+                  summarizingChapterId={summarizingChapterId}
                   isBatchTranslating={Boolean(batchProgress)}
                 />
               </div>
@@ -1650,6 +2013,7 @@ export default function App() {
                     chapters={activeBook.chapters}
                     currentPage={currentPage}
                     translatedPageNumbers={translatedPageNumbers}
+                    bookmarks={activeBook.bookmarks ?? []}
                     isSpeaking={isSpeaking}
                     isPreparingAudio={isPreparingAudio}
                     onSelectPage={(p) => {
@@ -1665,6 +2029,11 @@ export default function App() {
                       setMobileChaptersOpen(false);
                       handleTranslateChapter(ch);
                     }}
+                    onSummarizeChapter={(ch) => {
+                      setMobileChaptersOpen(false);
+                      handleSummarizeChapter(ch);
+                    }}
+                    summarizingChapterId={summarizingChapterId}
                     isBatchTranslating={Boolean(batchProgress)}
                     onCloseMobile={() => setMobileChaptersOpen(false)}
                   />
@@ -1682,7 +2051,7 @@ export default function App() {
             <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 min-w-0 h-full overflow-hidden">
               {/* Left Pane: Original PDF */}
               <div
-                className={`h-full overflow-hidden border-r border-stone-200 dark:border-stone-800 ${
+                className={`h-full overflow-hidden border-r border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 ${
                   mobilePane === 'pdf' ? 'block' : 'hidden lg:block'
                 }`}
               >
@@ -1735,6 +2104,15 @@ export default function App() {
                   onUpdateBlockText={handleUpdateBlockText}
                   onUpdateHighlights={handleUpdatePageHighlights}
                   onClickSentence={handleClickSentence}
+                  readerFontSize={readerFontSize}
+                  readerLineHeight={readerLineHeight}
+                  onSummarizeCurrentChapter={
+                    currentChapter
+                      ? () => handleSummarizeChapter(currentChapter)
+                      : undefined
+                  }
+                  isSummarizingChapter={Boolean(summarizingChapterId)}
+                  onExportHighlights={handleExportHighlightsSheet}
                 />
               </div>
 
@@ -1747,6 +2125,7 @@ export default function App() {
                     chapters={activeBook.chapters}
                     currentPage={currentPage}
                     translatedPageNumbers={translatedPageNumbers}
+                    bookmarks={activeBook.bookmarks ?? []}
                     isSpeaking={isSpeaking}
                     isPreparingAudio={isPreparingAudio}
                     onSelectPage={(p) => {
@@ -1761,6 +2140,11 @@ export default function App() {
                       setMobilePane('translated');
                       handleTranslateChapter(ch);
                     }}
+                    onSummarizeChapter={(ch) => {
+                      setMobilePane('translated');
+                      handleSummarizeChapter(ch);
+                    }}
+                    summarizingChapterId={summarizingChapterId}
                     isBatchTranslating={Boolean(batchProgress)}
                   />
                 </div>
@@ -1791,7 +2175,94 @@ export default function App() {
           onAdvancePage={handleAdvancePageFromAudio}
           onRequestTranslatePage={() => handleTranslateCurrentPage(false)}
           aiAvailable={aiAvailable}
+          narrationSource={narrationSource}
+          onNarrationSourceChange={setNarrationSource}
         />
+      )}
+
+      {/* One-Click Chapter Summary & Key Takeaways Modal */}
+      {chapterSummaryModal && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="chapter-summary-title"
+          className="no-print fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/55 backdrop-blur-[1px]"
+          onClick={() => setChapterSummaryModal(null)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className={`w-full max-w-2xl max-h-[88vh] overflow-y-auto rounded-lg border border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#FAF9F5] sepia:bg-[#F4ECD8] dark:bg-[#191816] shadow-2xl ${langOption.cssClass}`}
+            dir={langOption.rtl ? 'rtl' : 'ltr'}
+          >
+            <div
+              dir="ltr"
+              className="px-6 py-4 border-b border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 flex items-center justify-between gap-3"
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                <FileText className="w-4 h-4 text-amber-700 dark:text-amber-500 shrink-0" />
+                <span className="text-xs font-semibold uppercase tracking-wider text-stone-500 dark:text-stone-400 truncate">
+                  Chapter Summary &amp; Key Takeaways · {chapterSummaryModal.readingTimeMinutes} min read
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setChapterSummaryModal(null)}
+                aria-label="Close chapter summary"
+                className="h-8 w-8 inline-flex items-center justify-center rounded-md text-stone-500 hover:text-stone-950 dark:hover:text-stone-100 hover:bg-stone-200/60 dark:hover:bg-stone-800 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-6 space-y-5">
+              <div>
+                <h2
+                  id="chapter-summary-title"
+                  className="font-display text-xl sm:text-2xl font-semibold text-stone-950 dark:text-stone-50"
+                >
+                  {chapterSummaryModal.chapterTitle}
+                </h2>
+                <p className="mt-2.5 text-sm sm:text-[15px] leading-relaxed text-stone-700 sepia:text-[#3B2F23] dark:text-stone-300">
+                  {chapterSummaryModal.summary}
+                </p>
+              </div>
+
+              <div className="pt-4 border-t border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 space-y-2.5">
+                <h3
+                  dir="ltr"
+                  className="text-xs font-semibold uppercase tracking-wider text-stone-500 dark:text-stone-400"
+                >
+                  Key Takeaways
+                </h3>
+                <ul className="space-y-2.5">
+                  {chapterSummaryModal.keyTakeaways.map((point, idx) => (
+                    <li
+                      key={idx}
+                      className="flex items-start gap-2.5 text-sm leading-relaxed text-stone-800 sepia:text-[#3B2F23] dark:text-stone-200"
+                    >
+                      <span className="font-mono-num text-xs font-semibold text-amber-800 dark:text-amber-400 mt-0.5 shrink-0">
+                        {String(idx + 1).padStart(2, '0')}.
+                      </span>
+                      <span>{point}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+
+              {chapterSummaryModal.keyTerms.length > 0 && (
+                <div
+                  dir="ltr"
+                  className="pt-4 border-t border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 text-xs text-stone-600 dark:text-stone-400"
+                >
+                  <span className="font-semibold text-stone-800 dark:text-stone-200">
+                    Key Concepts:{' '}
+                  </span>
+                  {chapterSummaryModal.keyTerms.join(' · ')}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Hidden Print-Only Vector Unicode Document for "Print / Save Selectable PDF" */}

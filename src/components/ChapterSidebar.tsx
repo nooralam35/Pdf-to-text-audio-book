@@ -1,7 +1,9 @@
 import React, { useMemo, useState } from 'react';
 import {
+  Bookmark,
   BookMarked,
   Check,
+  FileText,
   Languages,
   Loader2,
   Pause,
@@ -18,11 +20,14 @@ interface ChapterSidebarProps {
   chapters: ChapterItem[];
   currentPage: number;
   translatedPageNumbers: Set<number>;
+  bookmarks?: number[];
   isSpeaking: boolean;
   isPreparingAudio?: boolean;
   onSelectPage: (page: number) => void;
   onPlayChapterAudio: (chapter: ChapterItem) => void;
   onTranslateChapter: (chapter: ChapterItem) => void;
+  onSummarizeChapter?: (chapter: ChapterItem) => void;
+  summarizingChapterId?: string | null;
   isBatchTranslating: boolean;
   onCloseMobile?: () => void;
 }
@@ -33,15 +38,19 @@ export const ChapterSidebar: React.FC<ChapterSidebarProps> = ({
   chapters,
   currentPage,
   translatedPageNumbers,
+  bookmarks = [],
   isSpeaking,
   isPreparingAudio = false,
   onSelectPage,
   onPlayChapterAudio,
   onTranslateChapter,
+  onSummarizeChapter,
+  summarizingChapterId = null,
   isBatchTranslating,
   onCloseMobile,
 }) => {
   const [query, setQuery] = useState('');
+  const [sidebarView, setSidebarView] = useState<'chapters' | 'bookmarks'>('chapters');
 
   const filteredChapters = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -57,9 +66,9 @@ export const ChapterSidebar: React.FC<ChapterSidebarProps> = ({
   const totalTranslated = translatedPageNumbers.size;
 
   return (
-    <aside className="flex flex-col h-full bg-[#F5F3EE] dark:bg-[#161513] border-r border-stone-200 dark:border-stone-800">
+    <aside className="flex flex-col h-full bg-[#F5F3EE] sepia:bg-[#ECE2CA] dark:bg-[#141312] border-r border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800">
       {/* Header */}
-      <div className="px-4 py-3.5 border-b border-stone-200 dark:border-stone-800">
+      <div className="px-4 py-3.5 border-b border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800">
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0">
             <div className="flex items-center gap-1.5 text-xs font-medium text-stone-500 dark:text-stone-400">
@@ -88,22 +97,95 @@ export const ChapterSidebar: React.FC<ChapterSidebarProps> = ({
           )}
         </div>
 
-        {/* Search chapters */}
-        <div className="mt-3 relative">
-          <Search className="w-3.5 h-3.5 text-stone-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-          <input
-            type="text"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Filter chapters…"
-            className="w-full h-8 pl-8 pr-2.5 text-xs rounded-md bg-white dark:bg-[#1F1E1B] border border-stone-200 dark:border-stone-700 text-stone-900 dark:text-stone-100 placeholder:text-stone-400 focus:outline-none focus:border-amber-700 dark:focus:border-amber-500"
-          />
+        {/* Chapters vs Bookmarks Toggle */}
+        <div className="mt-3 grid grid-cols-2 rounded-md border border-stone-200 sepia:border-[#D4C7AA] dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] p-0.5 text-[11px] font-medium">
+          <button
+            type="button"
+            onClick={() => setSidebarView('chapters')}
+            className={`h-7 rounded transition-colors cursor-pointer ${
+              sidebarView === 'chapters'
+                ? 'bg-stone-900 text-stone-50 dark:bg-stone-100 dark:text-stone-950'
+                : 'text-stone-600 dark:text-stone-300'
+            }`}
+          >
+            Chapters ({chapters.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => setSidebarView('bookmarks')}
+            className={`h-7 rounded inline-flex items-center justify-center gap-1 transition-colors cursor-pointer ${
+              sidebarView === 'bookmarks'
+                ? 'bg-stone-900 text-stone-50 dark:bg-stone-100 dark:text-stone-950'
+                : 'text-stone-600 dark:text-stone-300'
+            }`}
+          >
+            <Bookmark className="w-3 h-3" />
+            <span>Bookmarks ({bookmarks.length})</span>
+          </button>
         </div>
+
+        {/* Search chapters */}
+        {sidebarView === 'chapters' && (
+          <div className="mt-2.5 relative">
+            <Search className="w-3.5 h-3.5 text-stone-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <input
+              type="text"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Filter chapters…"
+              className="w-full h-8 pl-8 pr-2.5 text-xs rounded-md bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] border border-stone-200 dark:border-stone-700 text-stone-900 dark:text-stone-100 placeholder:text-stone-400 focus:outline-none focus:border-amber-700 dark:focus:border-amber-500"
+            />
+          </div>
+        )}
       </div>
 
-      {/* Chapter List */}
-      <div className="flex-1 overflow-y-auto divide-y divide-stone-200/70 dark:divide-stone-800/70">
-        {filteredChapters.length === 0 ? (
+      {/* Chapter List or Bookmarks List */}
+      <div className="flex-1 overflow-y-auto divide-y divide-stone-200/70 sepia:divide-[#DFD4BC] dark:divide-stone-800/70">
+        {sidebarView === 'bookmarks' ? (
+          bookmarks.length === 0 ? (
+            <div className="px-4 py-10 text-xs text-stone-500 dark:text-stone-400 text-center space-y-1.5">
+              <Bookmark className="w-5 h-5 mx-auto text-stone-400" />
+              <p className="font-medium text-stone-700 dark:text-stone-300">No bookmarked pages yet</p>
+              <p>Click the Bookmark button in the Reader bar to save any page for quick revision.</p>
+            </div>
+          ) : (
+            bookmarks.map((pg) => {
+              const ch = chapters.find((c) => pg >= c.startPage && pg <= c.endPage);
+              const isCurr = pg === currentPage;
+              return (
+                <button
+                  key={pg}
+                  type="button"
+                  onClick={() => {
+                    onSelectPage(pg);
+                    onCloseMobile?.();
+                  }}
+                  className={`w-full px-4 py-3 text-left flex items-center justify-between gap-2 transition-colors cursor-pointer ${
+                    isCurr
+                      ? 'bg-white sepia:bg-[#FBF6E9] dark:bg-[#22201D]'
+                      : 'hover:bg-stone-200/40 dark:hover:bg-stone-800/40'
+                  }`}
+                >
+                  <div className="min-w-0">
+                    <p
+                      className={`text-xs font-medium font-mono-num ${
+                        isCurr ? 'text-amber-800 dark:text-amber-400' : 'text-stone-900 dark:text-stone-100'
+                      }`}
+                    >
+                      Page {pg}
+                    </p>
+                    {ch && (
+                      <p className="mt-0.5 text-[11px] text-stone-500 dark:text-stone-400 truncate">
+                        {ch.title}
+                      </p>
+                    )}
+                  </div>
+                  <Bookmark className="w-3.5 h-3.5 text-amber-700 dark:text-amber-500 fill-current shrink-0" />
+                </button>
+              );
+            })
+          )
+        ) : filteredChapters.length === 0 ? (
           <div className="px-4 py-8 text-xs text-stone-500 dark:text-stone-400 text-center">
             No matching chapters found.
           </div>
@@ -212,6 +294,26 @@ export const ChapterSidebar: React.FC<ChapterSidebarProps> = ({
                         <Play className="w-3.5 h-3.5 translate-x-[0.5px]" />
                       )}
                     </button>
+
+                    {onSummarizeChapter && (
+                      <button
+                        type="button"
+                        disabled={Boolean(summarizingChapterId)}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onSummarizeChapter(ch);
+                        }}
+                        aria-label={`Summarize ${ch.title}`}
+                        title={`Key Takeaways & Summary for "${ch.title}"`}
+                        className="h-7 w-7 inline-flex items-center justify-center rounded-md text-stone-500 hover:text-amber-800 dark:text-stone-400 dark:hover:text-amber-400 hover:bg-stone-200/70 dark:hover:bg-stone-700/60 transition-colors disabled:opacity-35 cursor-pointer"
+                      >
+                        {summarizingChapterId === ch.id ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-700" />
+                        ) : (
+                          <FileText className="w-3.5 h-3.5" />
+                        )}
+                      </button>
+                    )}
 
                     <button
                       type="button"

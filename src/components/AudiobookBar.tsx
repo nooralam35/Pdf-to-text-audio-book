@@ -9,6 +9,7 @@ import {
   SkipForward,
   Sparkles,
   Square,
+  Timer,
   Volume2,
 } from 'lucide-react';
 import { ElementPitchShifter } from '../lib/audioPitchShifter';
@@ -59,6 +60,8 @@ interface AudiobookBarProps {
   onAdvancePage: () => void;
   onRequestTranslatePage: () => void;
   aiAvailable: boolean;
+  narrationSource: 'translated' | 'original';
+  onNarrationSourceChange: (src: 'translated' | 'original') => void;
 }
 
 export const AudiobookBar: React.FC<AudiobookBarProps> = ({
@@ -80,6 +83,8 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
   onAdvancePage,
   onRequestTranslatePage,
   aiAvailable,
+  narrationSource,
+  onNarrationSourceChange,
 }) => {
   const [engineMode, setEngineMode] = useState<SpeechEngineMode>('hd');
   const [aiVoiceProfileId, setAiVoiceProfileId] = useState<AiVoiceProfileId>(() => {
@@ -96,8 +101,11 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
   const [isDownloadingAudio, setIsDownloadingAudio] = useState(false);
   const [audioMessage, setAudioMessage] = useState<string | null>(null);
   const [waitingForTranslation, setWaitingForTranslation] = useState(false);
+  const [sleepTimerMinutes, setSleepTimerMinutes] = useState<number>(0);
+  const [sleepSecondsLeft, setSleepSecondsLeft] = useState<number>(0);
 
-  const langOption = getLanguageOption(targetLang);
+  const effectiveAudioLang: LanguageCode = narrationSource === 'original' ? 'en' : targetLang;
+  const langOption = getLanguageOption(effectiveAudioLang);
   const activeVoiceProfile = useMemo(
     () => getAiVoiceProfile(aiVoiceProfileId),
     [aiVoiceProfileId]
@@ -131,7 +139,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
   const autoAdvanceRef = useRef(autoAdvance);
   const sentencesRef = useRef(sentences);
   const engineModeRef = useRef(engineMode);
-  const targetLangRef = useRef(targetLang);
+  const targetLangRef = useRef(effectiveAudioLang);
 
   rateRef.current = rate;
   pitchRef.current = pitch;
@@ -141,7 +149,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
   autoAdvanceRef.current = autoAdvance;
   sentencesRef.current = sentences;
   engineModeRef.current = engineMode;
-  targetLangRef.current = targetLang;
+  targetLangRef.current = effectiveAudioLang;
 
   useEffect(() => {
     try {
@@ -282,13 +290,30 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     };
   }, []);
 
-  // Reset audio state & cache when switching pages or languages
+  // Reset audio state & cache when switching pages, languages, or narration source
   useEffect(() => {
     stopPlayback(true);
     clearCachedObjectUrls();
     setAudioMessage(null);
     setWaitingForTranslation(false);
-  }, [pageNumber, targetLang]);
+  }, [pageNumber, targetLang, narrationSource]);
+
+  // Countdown Sleep Timer: pauses playback cleanly when countdown hits 0
+  useEffect(() => {
+    if (sleepSecondsLeft <= 0) return;
+    const id = window.setInterval(() => {
+      setSleepSecondsLeft((prev) => {
+        if (prev <= 1) {
+          stopPlayback(false);
+          setSleepTimerMinutes(0);
+          setAudioMessage('Sleep timer ended — audiobook playback paused.');
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [sleepSecondsLeft > 0]);
 
   // If page advanced automatically via Auto-next, seamlessly continue reading once the next page's sentences are ready
   useEffect(() => {
@@ -797,11 +822,12 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
   };
 
   const handleDownloadAudio = async () => {
-    const narrationText = translatedPage
-      ? buildAudiobookText(translatedPage)
-      : parsedPage
-      ? parsedPage.blocks.map((b) => b.text).join('\n\n')
-      : '';
+    const useOriginal = narrationSource === 'original' || !translatedPage;
+    const narrationText = useOriginal
+      ? parsedPage
+        ? parsedPage.blocks.map((b) => b.text).join('\n\n')
+        : ''
+      : buildAudiobookText(translatedPage);
 
     if (!narrationText.trim()) {
       setAudioMessage('No text available on this page to generate audio.');
@@ -811,12 +837,13 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     setIsDownloadingAudio(true);
     setAudioMessage(null);
     try {
-      const effectiveLang: LanguageCode = translatedPage ? targetLang : 'en';
+      const effectiveLang: LanguageCode = useOriginal ? 'en' : targetLang;
+      const effectiveLangOption = getLanguageOption(effectiveLang);
       const { blob, ext } = await synthesizePageAudio({
         text: narrationText,
         voiceName: activeVoiceProfile.id,
         voiceStyle: activeVoiceProfile.style,
-        languageName: translatedPage ? langOption.name : 'English',
+        languageName: effectiveLangOption.name,
         targetLang: effectiveLang,
       });
       const slug = bookTitle
@@ -841,8 +868,13 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
   const currentPos = activeSentenceIndex !== null ? activeSentenceIndex + 1 : 0;
   const isCustomTone = Math.abs(rate - 1.0) > 0.01 || Math.abs(pitch - 1.0) > 0.01;
 
+  const sleepDisplay =
+    sleepSecondsLeft > 0
+      ? `${Math.floor(sleepSecondsLeft / 60)}:${String(sleepSecondsLeft % 60).padStart(2, '0')}`
+      : null;
+
   return (
-    <div className="no-print sticky bottom-0 z-20 border-t border-stone-200 dark:border-stone-800 bg-[#FAF9F5]/95 dark:bg-[#161513]/95 backdrop-blur-sm">
+    <div className="no-print sticky bottom-0 z-20 border-t border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#FAF9F5]/95 sepia:bg-[#F4ECD8]/95 dark:bg-[#141312]/95 backdrop-blur-sm">
       <audio ref={audioRef} playsInline preload="auto" className="hidden" />
 
       {audioMessage && (
@@ -1063,6 +1095,69 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
               ))}
             </select>
           )}
+
+          {/* Original EN vs Translated Narration Source */}
+          <div className="hidden lg:inline-flex rounded border border-stone-300 dark:border-stone-700 bg-white dark:bg-[#1F1E1B] p-0.5">
+            <button
+              type="button"
+              onClick={() => onNarrationSourceChange('translated')}
+              title="Read translated text aloud"
+              className={`h-6 px-2 rounded-sm text-[11px] font-medium cursor-pointer whitespace-nowrap ${
+                narrationSource === 'translated'
+                  ? 'bg-amber-700 text-white'
+                  : 'text-stone-600 dark:text-stone-300'
+              }`}
+            >
+              Translated
+            </button>
+            <button
+              type="button"
+              onClick={() => onNarrationSourceChange('original')}
+              title="Read original English text aloud"
+              className={`h-6 px-2 rounded-sm text-[11px] font-medium cursor-pointer whitespace-nowrap ${
+                narrationSource === 'original'
+                  ? 'bg-amber-700 text-white'
+                  : 'text-stone-600 dark:text-stone-300'
+              }`}
+            >
+              Original EN
+            </button>
+          </div>
+
+          {/* Sleep Timer */}
+          <label
+            title="Sleep Timer — automatically pauses narration"
+            className="hidden sm:inline-flex items-center gap-1 text-xs text-stone-600 dark:text-stone-400 whitespace-nowrap"
+          >
+            <Timer
+              className={`w-3.5 h-3.5 shrink-0 ${
+                sleepSecondsLeft > 0
+                  ? 'text-amber-700 dark:text-amber-400'
+                  : 'text-stone-400 dark:text-stone-500'
+              }`}
+            />
+            <select
+              aria-label="Audiobook sleep timer"
+              value={sleepTimerMinutes}
+              onChange={(e) => {
+                const mins = parseInt(e.target.value, 10) || 0;
+                setSleepTimerMinutes(mins);
+                setSleepSecondsLeft(mins * 60);
+              }}
+              className="h-7 px-1.5 rounded border border-stone-300 dark:border-stone-700 bg-white dark:bg-[#1F1E1B] text-[11px] font-mono-num text-stone-800 dark:text-stone-200 focus:outline-none focus:border-amber-700 cursor-pointer"
+            >
+              <option value={0}>Sleep: Off</option>
+              <option value={5}>5 min</option>
+              <option value={15}>15 min</option>
+              <option value={30}>30 min</option>
+              <option value={60}>60 min</option>
+            </select>
+            {sleepDisplay && (
+              <span className="font-mono-num text-[11px] font-medium text-amber-800 dark:text-amber-400">
+                {sleepDisplay}
+              </span>
+            )}
+          </label>
 
           <label className="hidden 2xl:inline-flex items-center gap-1.5 text-xs text-stone-600 dark:text-stone-400 cursor-pointer whitespace-nowrap select-none">
             <input

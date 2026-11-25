@@ -1,5 +1,5 @@
 import React, { useMemo, useRef, useState } from 'react';
-import { BookOpen, HardDrive, Search, Trash2, Upload, X } from 'lucide-react';
+import { BookOpen, Compass, HardDrive, Search, Trash2, Upload, X } from 'lucide-react';
 import { PRELOADED_OBS_BOOK_ID } from '../lib/languages';
 import type { StoredBook } from '../types';
 
@@ -10,6 +10,7 @@ interface LibraryViewProps {
   onSelectBook: (book: StoredBook) => void;
   onUploadPdf: (file: File) => void;
   onDeleteBook: (bookId: string) => void;
+  onGoToDiscover?: () => void;
   isUploading: boolean;
 }
 
@@ -20,6 +21,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   onSelectBook,
   onUploadPdf,
   onDeleteBook,
+  onGoToDiscover,
   isUploading,
 }) => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -60,9 +62,21 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
             and audiobook playback.
           </p>
         </div>
-        <div className="inline-flex items-center gap-1.5 text-xs text-stone-500 dark:text-stone-400 font-mono-num">
-          <HardDrive className="w-3.5 h-3.5" />
-          <span>{books.length} {books.length === 1 ? 'book' : 'books'} cached</span>
+        <div className="flex items-center gap-3">
+          <div className="inline-flex items-center gap-1.5 text-xs text-stone-500 dark:text-stone-400 font-mono-num">
+            <HardDrive className="w-3.5 h-3.5" />
+            <span>{books.length} {books.length === 1 ? 'book' : 'books'} cached</span>
+          </div>
+          {onGoToDiscover && (
+            <button
+              type="button"
+              onClick={onGoToDiscover}
+              className="inline-flex items-center gap-1.5 h-8 px-3 rounded-md border border-stone-300 dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#191816] text-xs font-medium text-stone-800 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer whitespace-nowrap"
+            >
+              <Compass className="w-3.5 h-3.5 text-amber-700 dark:text-amber-500" />
+              <span>Discover Free Books</span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -214,10 +228,36 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                   <p className="mt-3 text-xs text-stone-500 dark:text-stone-400 font-mono-num">
                     {book.numPages} pages · {book.chapters.length} chapters · {translatedCount}{' '}
                     translated
+                    {book.bookmarks && book.bookmarks.length > 0
+                      ? ` · ${book.bookmarks.length} bookmarked`
+                      : ''}
                     {book.annotations && Object.keys(book.annotations).length > 0
                       ? ` · ${Object.keys(book.annotations).length} annotated`
                       : ''}
                   </p>
+
+                  {/* Continue Reading Progress Bar */}
+                  {(() => {
+                    const lastPg = Math.max(1, Math.min(book.numPages, book.lastPage || 1));
+                    const pct = Math.max(
+                      1,
+                      Math.min(100, Math.round((lastPg / Math.max(1, book.numPages)) * 100))
+                    );
+                    return (
+                      <div className="mt-3 space-y-1">
+                        <div className="flex items-center justify-between text-[11px] text-stone-500 dark:text-stone-400 font-mono-num">
+                          <span>Page {lastPg} of {book.numPages}</span>
+                          <span>{pct}% read</span>
+                        </div>
+                        <div className="h-1.5 w-full rounded-full bg-stone-200 dark:bg-stone-800 overflow-hidden">
+                          <div
+                            className="h-full bg-amber-700 dark:bg-amber-500 transition-all"
+                            style={{ width: `${pct}%` }}
+                          />
+                        </div>
+                      </div>
+                    );
+                  })()}
 
                   <div className="mt-4 pt-3 border-t border-stone-200/80 dark:border-stone-800/80 flex items-center justify-between gap-2">
                     <button
@@ -226,7 +266,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                       className="inline-flex items-center gap-1.5 h-8 px-3 rounded text-xs font-medium bg-stone-900 text-stone-50 hover:bg-stone-800 dark:bg-stone-100 dark:text-stone-950 dark:hover:bg-stone-200 cursor-pointer"
                     >
                       <BookOpen className="w-3.5 h-3.5" />
-                      <span>{isCurrent ? 'Continue Reading' : 'Open Reader'}</span>
+                      <span>{isCurrent || (book.lastPage ?? 1) > 1 ? 'Continue Reading' : 'Open Reader'}</span>
                     </button>
 
                     {!isPreloaded && (

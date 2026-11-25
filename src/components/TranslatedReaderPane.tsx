@@ -4,9 +4,11 @@ import {
   BookOpen,
   Check,
   Copy,
+  Download,
   Edit3,
   Eye,
   EyeOff,
+  FileText,
   Highlighter,
   Image as ImageIcon,
   Languages,
@@ -58,6 +60,11 @@ interface TranslatedReaderPaneProps {
   onUpdateBlockText: (blockId: string, newText: string) => void;
   onUpdateHighlights: (highlights: TextHighlight[]) => void;
   onClickSentence: (sentenceIndex: number) => void;
+  readerFontSize?: number;
+  readerLineHeight?: number;
+  onSummarizeCurrentChapter?: () => void;
+  isSummarizingChapter?: boolean;
+  onExportHighlights?: () => void;
 }
 
 type StreamItem =
@@ -207,6 +214,11 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
   onUpdateBlockText,
   onUpdateHighlights,
   onClickSentence,
+  readerFontSize = 16,
+  readerLineHeight = 1.82,
+  onSummarizeCurrentChapter,
+  isSummarizingChapter = false,
+  onExportHighlights,
 }) => {
   const [editingBlockId, setEditingBlockId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState('');
@@ -823,9 +835,9 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
   };
 
   return (
-    <section className="flex flex-col h-full bg-[#FAF9F5] dark:bg-[#111110] min-w-0">
+    <section className="flex flex-col h-full bg-[#FAF9F5] sepia:bg-[#F4ECD8] dark:bg-[#0D0D0C] min-w-0">
       {/* Pane Sub-Header */}
-      <div className="px-4 h-11 border-b border-stone-200 dark:border-stone-800 bg-[#FAF9F5] dark:bg-[#181715] flex items-center justify-between gap-3 shrink-0">
+      <div className="px-4 h-11 border-b border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#FAF9F5] sepia:bg-[#EFE5CE] dark:bg-[#141312] flex items-center justify-between gap-3 shrink-0">
         <div className="flex items-center gap-2 min-w-0">
           <span className="text-xs font-semibold uppercase tracking-wider text-stone-500 dark:text-stone-400 whitespace-nowrap">
             {langOption.name} Edition
@@ -841,6 +853,35 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
+          {onSummarizeCurrentChapter && (
+            <button
+              type="button"
+              disabled={isSummarizingChapter}
+              onClick={onSummarizeCurrentChapter}
+              className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded text-xs font-medium text-stone-600 dark:text-stone-300 hover:bg-stone-200/70 dark:hover:bg-stone-800 disabled:opacity-45 cursor-pointer whitespace-nowrap"
+              title="Generate Chapter Summary & Key Takeaways"
+            >
+              {isSummarizingChapter ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-700" />
+              ) : (
+                <FileText className="w-3.5 h-3.5" />
+              )}
+              <span className="hidden xl:inline">Summary</span>
+            </button>
+          )}
+
+          {onExportHighlights && (
+            <button
+              type="button"
+              onClick={onExportHighlights}
+              className="inline-flex items-center gap-1.5 h-7 px-2 rounded text-xs font-medium text-stone-600 dark:text-stone-300 hover:bg-stone-200/70 dark:hover:bg-stone-800 cursor-pointer whitespace-nowrap"
+              title="Export all highlights, sticky notes & bookmarks as a summary sheet"
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span className="hidden 2xl:inline">Export Notes</span>
+            </button>
+          )}
+
           {translatedPage && (
             <>
               {pageHighlights.length > 0 && (
@@ -1404,12 +1445,22 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
                       ) : blk.kind === 'callout' ? (
                         <div
                           data-block-id={blk.id}
-                          className="p-4 rounded-md border border-stone-200 dark:border-stone-800 bg-[#F4F1EA] dark:bg-[#1B1917] text-[15px] leading-relaxed text-stone-800 dark:text-stone-200 select-text"
+                          style={{
+                            fontSize: `${Math.max(13, readerFontSize - 1)}px`,
+                            lineHeight: readerLineHeight,
+                          }}
+                          className="p-4 rounded-md border border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#F4F1EA] sepia:bg-[#ECE2CA] dark:bg-[#1B1917] text-stone-800 sepia:text-[#3B2F23] dark:text-stone-200 select-text"
                         >
                           {renderClickableSentences(blk.id, textVal)}
                         </div>
                       ) : blk.kind === 'bullet' ? (
-                        <div className="flex items-start gap-2.5 text-[16px] leading-[1.78] text-stone-800 dark:text-stone-200">
+                        <div
+                          style={{
+                            fontSize: `${readerFontSize}px`,
+                            lineHeight: readerLineHeight,
+                          }}
+                          className="flex items-start gap-2.5 text-stone-800 sepia:text-[#3B2F23] dark:text-stone-200"
+                        >
                           <span
                             aria-hidden="true"
                             className="mt-2.5 w-1.5 h-1.5 rounded-full bg-amber-700 dark:bg-amber-500 shrink-0"
@@ -1421,7 +1472,11 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
                       ) : (
                         <p
                           data-block-id={blk.id}
-                          className="text-[16px] leading-[1.82] text-stone-800 dark:text-stone-200 select-text"
+                          style={{
+                            fontSize: `${readerFontSize}px`,
+                            lineHeight: readerLineHeight,
+                          }}
+                          className="text-stone-800 sepia:text-[#3B2F23] dark:text-stone-200 select-text"
                         >
                           {renderClickableSentences(blk.id, textVal)}
                         </p>

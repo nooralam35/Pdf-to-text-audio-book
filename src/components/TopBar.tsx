@@ -1,7 +1,7 @@
 import React, { useRef } from 'react';
 import { BookOpen, Upload } from 'lucide-react';
 
-export type ActiveTab = 'reader' | 'library' | 'export';
+export type ActiveTab = 'discover' | 'reader' | 'library' | 'export';
 
 interface TopBarProps {
   activeTab: ActiveTab;
@@ -27,19 +27,20 @@ export const TopBar: React.FC<TopBarProps> = ({
   };
 
   const navItems: Array<{ id: ActiveTab; label: string }> = [
+    { id: 'discover', label: 'Discover' },
     { id: 'reader', label: 'Reader' },
     { id: 'library', label: 'Library' },
     { id: 'export', label: 'Export PDF' },
   ];
 
   return (
-    <header className="no-print sticky top-0 z-30 h-14 border-b border-stone-200 dark:border-stone-800 bg-[#FAF9F5]/95 dark:bg-[#111110]/95 backdrop-blur-sm">
+    <header className="no-print sticky top-0 z-30 h-14 border-b border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#FAF9F5]/95 sepia:bg-[#F4ECD8]/95 dark:bg-[#0D0D0C]/95 backdrop-blur-sm">
       <div className="h-full max-w-[1680px] mx-auto px-4 sm:px-6 flex items-center justify-between gap-4">
         {/* Zone 1: Brand Wordmark */}
         <button
           type="button"
-          onClick={() => onSelectTab('reader')}
-          className="flex items-center gap-2.5 text-stone-900 dark:text-stone-100 whitespace-nowrap shrink-0 focus:outline-none group"
+          onClick={() => onSelectTab('discover')}
+          className="flex items-center gap-2.5 text-stone-900 sepia:text-[#2E241A] dark:text-stone-100 whitespace-nowrap shrink-0 focus:outline-none group cursor-pointer"
         >
           <BookOpen className="w-5 h-5 text-amber-700 dark:text-amber-500 transition-transform group-hover:scale-105" />
           <span className="font-display text-lg font-semibold tracking-tight">

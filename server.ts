@@ -1317,6 +1317,1002 @@ Follow these exact rules:
     }
   });
 
+  // ---------------------------------------------------------------------------
+  // MODULE 1 & 5: Multi-Source Public-Domain E-Book Search, Safe Proxy & Summarizer
+  // ---------------------------------------------------------------------------
+  const ALLOWED_BOOK_HOST_PATTERNS = [
+    /^archive\.org$/i,
+    /^[a-z0-9-]+\.archive\.org$/i,
+    /^[a-z0-9-]+\.[a-z0-9-]+\.archive\.org$/i,
+    /^gutenberg\.org$/i,
+    /^[a-z0-9-]+\.gutenberg\.org$/i,
+    /^openlibrary\.org$/i,
+    /^covers\.openlibrary\.org$/i,
+  ];
+
+  const isPrivateOrNumericHost = (host: string): boolean => {
+    const h = host.toLowerCase();
+    if (
+      h === 'localhost' ||
+      h === '0.0.0.0' ||
+      h === '::1' ||
+      h.startsWith('[') ||
+      /^\d{1,3}(\.\d{1,3}){3}$/.test(h) ||
+      /^\d+$/.test(h)
+    ) {
+      return true;
+    }
+    return false;
+  };
+
+  const parseAllowedBookUrl = (rawUrl: string): URL | null => {
+    if (!rawUrl || typeof rawUrl !== 'string' || rawUrl.length > 2048) return null;
+    try {
+      const parsed = new URL(rawUrl.trim());
+      if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null;
+      if (parsed.username || parsed.password) return null;
+      if (isPrivateOrNumericHost(parsed.hostname)) return null;
+      const allowed = ALLOWED_BOOK_HOST_PATTERNS.some((re) => re.test(parsed.hostname));
+      return allowed ? parsed : null;
+    } catch {
+      return null;
+    }
+  };
+
+  // Follow redirects manually while validating every redirect hop against the public-domain host allowlist
+  const safeFetchAllowlisted = async (
+    rawUrl: string,
+    opts: { timeoutMs?: number; accept?: string; maxRedirects?: number } = {}
+  ): Promise<{ response: Response; finalUrl: string }> => {
+    const { timeoutMs = 22000, accept = '*/*', maxRedirects = 5 } = opts;
+    let currentUrl = rawUrl;
+
+    for (let hop = 0; hop <= maxRedirects; hop++) {
+      const validated = parseAllowedBookUrl(currentUrl);
+      if (!validated) {
+        throw new Error('Blocked request to disallowed external host.');
+      }
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      let res: Response;
+      try {
+        res = await fetch(validated.toString(), {
+          method: 'GET',
+          redirect: 'manual',
+          signal: controller.signal,
+          headers: {
+            Accept: accept,
+            'User-Agent': 'BhashaBook/1.0 (+https://openlibrary.org)',
+          },
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+
+      if (res.status >= 300 && res.status < 400) {
+        const location = res.headers.get('location');
+        if (!location) {
+          throw new Error(`Redirect missing location header (${res.status})`);
+        }
+        currentUrl = new URL(location, validated).toString();
+        continue;
+      }
+
+      return { response: res, finalUrl: validated.toString() };
+    }
+
+    throw new Error('Too many redirects while fetching external book resource.');
+  };
+
+  const CATEGORY_KEYWORDS: Record<string, { iaSubject: string; olSubject: string; gutenTopic: string; queryHint: string }> = {
+    all: { iaSubject: '', olSubject: '', gutenTopic: '', queryHint: '' },
+    programming: {
+      iaSubject: 'programming OR computer OR software OR python',
+      olSubject: 'programming',
+      gutenTopic: 'computer',
+      queryHint: 'programming software',
+    },
+    business: {
+      iaSubject: 'business OR economics OR management OR finance',
+      olSubject: 'business',
+      gutenTopic: 'economics',
+      queryHint: 'business economics',
+    },
+    science: {
+      iaSubject: 'science OR physics OR biology OR mathematics',
+      olSubject: 'science',
+      gutenTopic: 'science',
+      queryHint: 'science physics',
+    },
+    history: {
+      iaSubject: 'history OR biography OR civilization',
+      olSubject: 'history',
+      gutenTopic: 'history',
+      queryHint: 'history',
+    },
+    fiction: {
+      iaSubject: 'fiction OR novel OR literature OR stories',
+      olSubject: 'fiction',
+      gutenTopic: 'fiction',
+      queryHint: 'classic fiction',
+    },
+    self_help: {
+      iaSubject: 'self-help OR philosophy OR psychology OR productivity',
+      olSubject: 'psychology',
+      gutenTopic: 'philosophy',
+      queryHint: 'philosophy psychology',
+    },
+  };
+
+  const LANG_TO_IA: Record<string, string> = {
+    en: 'eng',
+    hi: 'hin',
+    es: 'spa',
+    fr: 'fre',
+    de: 'ger',
+    ar: 'ara',
+    ur: 'urd',
+    bn: 'ben',
+  };
+
+  const normalizeLangLabel = (raw: unknown): string => {
+    const val = Array.isArray(raw) ? String(raw[0] ?? '') : String(raw ?? '');
+    const lower = val.toLowerCase().trim();
+    if (!lower) return 'English';
+    if (lower.startsWith('en')) return 'English';
+    if (lower.startsWith('hi')) return 'Hindi';
+    if (lower.startsWith('es') || lower === 'spa') return 'Spanish';
+    if (lower.startsWith('fr') || lower === 'fre') return 'French';
+    if (lower.startsWith('de') || lower === 'ger') return 'German';
+    if (lower.startsWith('ar') || lower === 'ara') return 'Arabic';
+    if (lower.startsWith('ur') || lower === 'urd') return 'Urdu';
+    if (lower.startsWith('bn') || lower === 'ben') return 'Bengali';
+    return val.slice(0, 16);
+  };
+
+  // GET /api/books/search — Multi-source free public-domain e-book discovery
+  app.get('/api/books/search', async (req, res) => {
+    try {
+      const rawQuery = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 140) : '';
+      const category =
+        typeof req.query.category === 'string' && CATEGORY_KEYWORDS[req.query.category]
+          ? req.query.category
+          : 'all';
+      const lang =
+        typeof req.query.lang === 'string' && /^[a-z]{2,3}$/i.test(req.query.lang)
+          ? req.query.lang.toLowerCase()
+          : 'all';
+      const format =
+        typeof req.query.format === 'string' && ['all', 'pdf', 'text', 'online'].includes(req.query.format)
+          ? req.query.format
+          : 'all';
+      const sort =
+        typeof req.query.sort === 'string' && ['downloads', 'rating', 'latest'].includes(req.query.sort)
+          ? req.query.sort
+          : 'downloads';
+      const pageNum = Math.max(1, Math.min(10, parseInt(String(req.query.page ?? '1'), 10) || 1));
+
+      const catCfg = CATEGORY_KEYWORDS[category];
+      const effectiveQuery = rawQuery || catCfg.queryHint || 'classic literature science programming';
+
+      type SearchBookItem = {
+        id: string;
+        source: 'internet_archive' | 'open_library' | 'gutenberg';
+        identifier: string;
+        title: string;
+        author: string;
+        year?: number;
+        language: string;
+        pageCount?: number;
+        downloads?: number;
+        rating?: number;
+        subjects: string[];
+        description?: string;
+        coverUrl?: string;
+        pdfUrl?: string;
+        textUrl?: string;
+        epubUrl?: string;
+        readOnlineUrl?: string;
+        format: 'PDF' | 'EPUB / Text' | 'Read Online';
+        isbn?: string;
+      };
+
+      const fetchJsonWithTimeout = async (url: string, timeoutMs = 8500): Promise<unknown> => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          const r = await fetch(url, {
+            signal: controller.signal,
+            headers: {
+              Accept: 'application/json',
+              'User-Agent': 'BhashaBook/1.0 (+https://openlibrary.org)',
+            },
+          });
+          if (!r.ok) return null;
+          return await r.json();
+        } catch {
+          return null;
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+
+      // 1. Internet Archive Advanced Search (Direct PDF & open-access texts)
+      const queryInternetArchive = async (): Promise<SearchBookItem[]> => {
+        const safeTerm = effectiveQuery.replace(/[()":\\]/g, ' ').trim();
+        const clauses: string[] = ['mediatype:texts', 'format:"Text PDF"'];
+        if (safeTerm) {
+          clauses.push(`(title:(${safeTerm}) OR creator:(${safeTerm}) OR subject:(${safeTerm}))`);
+        }
+        if (catCfg.iaSubject) {
+          clauses.push(`subject:(${catCfg.iaSubject})`);
+        }
+        if (lang !== 'all' && LANG_TO_IA[lang]) {
+          clauses.push(`language:${LANG_TO_IA[lang]}`);
+        }
+        const iaSort =
+          sort === 'rating'
+            ? 'avg_rating desc'
+            : sort === 'latest'
+            ? 'year desc'
+            : 'downloads desc';
+
+        const params = new URLSearchParams();
+        params.set('q', clauses.join(' AND '));
+        params.append('fl[]', 'identifier');
+        params.append('fl[]', 'title');
+        params.append('fl[]', 'creator');
+        params.append('fl[]', 'downloads');
+        params.append('fl[]', 'avg_rating');
+        params.append('fl[]', 'year');
+        params.append('fl[]', 'language');
+        params.append('fl[]', 'subject');
+        params.append('fl[]', 'description');
+        params.append('sort[]', iaSort);
+        params.set('rows', '12');
+        params.set('page', String(pageNum));
+        params.set('output', 'json');
+
+        const data = (await fetchJsonWithTimeout(
+          `https://archive.org/advancedsearch.php?${params.toString()}`,
+          9000
+        )) as {
+          response?: {
+            docs?: Array<{
+              identifier?: string;
+              title?: string;
+              creator?: string | string[];
+              downloads?: number;
+              avg_rating?: number;
+              year?: string | number;
+              language?: string | string[];
+              subject?: string | string[];
+              description?: string | string[];
+            }>;
+          };
+        } | null;
+
+        const docs = data?.response?.docs ?? [];
+        const items: SearchBookItem[] = [];
+        for (const d of docs) {
+          if (!d.identifier || !d.title) continue;
+          const author = Array.isArray(d.creator)
+            ? d.creator.slice(0, 2).join(', ')
+            : String(d.creator ?? 'Unknown Author');
+          const rawSubjects = Array.isArray(d.subject)
+            ? d.subject
+            : typeof d.subject === 'string'
+            ? [d.subject]
+            : [];
+          const desc = Array.isArray(d.description)
+            ? String(d.description[0] ?? '')
+            : typeof d.description === 'string'
+            ? d.description
+            : '';
+          const parsedYear = parseInt(String(d.year ?? ''), 10);
+
+          items.push({
+            id: `ia:${d.identifier}`,
+            source: 'internet_archive',
+            identifier: d.identifier,
+            title: String(d.title).trim(),
+            author: author.trim() || 'Unknown Author',
+            year: Number.isFinite(parsedYear) && parsedYear > 1400 && parsedYear <= 2030 ? parsedYear : undefined,
+            language: normalizeLangLabel(d.language),
+            downloads: typeof d.downloads === 'number' ? d.downloads : undefined,
+            rating: typeof d.avg_rating === 'number' && d.avg_rating > 0 ? Math.min(5, d.avg_rating) : undefined,
+            subjects: rawSubjects.map((s) => String(s).trim()).filter(Boolean).slice(0, 5),
+            description: desc.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 500) || undefined,
+            coverUrl: `https://archive.org/services/img/${encodeURIComponent(d.identifier)}`,
+            pdfUrl: `https://archive.org/download/${encodeURIComponent(d.identifier)}/${encodeURIComponent(d.identifier)}.pdf`,
+            readOnlineUrl: `https://archive.org/details/${encodeURIComponent(d.identifier)}`,
+            format: 'PDF',
+          });
+        }
+        return items;
+      };
+
+      // 2. Open Library Search API (Rich metadata, ratings, page counts, high-res covers & public IA links)
+      const queryOpenLibrary = async (): Promise<SearchBookItem[]> => {
+        const params = new URLSearchParams();
+        params.set('q', rawQuery || catCfg.queryHint || 'programming');
+        if (catCfg.olSubject) {
+          params.set('subject', catCfg.olSubject);
+        }
+        if (lang !== 'all' && LANG_TO_IA[lang]) {
+          params.set('language', LANG_TO_IA[lang]);
+        }
+        if (sort === 'rating') params.set('sort', 'rating');
+        else if (sort === 'latest') params.set('sort', 'new');
+        params.set('limit', '12');
+        params.set('page', String(pageNum));
+        params.set(
+          'fields',
+          'key,title,author_name,first_publish_year,cover_i,ia,number_of_pages_median,ratings_average,subject,language,isbn,ebook_access,edition_count'
+        );
+
+        const data = (await fetchJsonWithTimeout(
+          `https://openlibrary.org/search.json?${params.toString()}`,
+          11000
+        )) as {
+          docs?: Array<{
+            key?: string;
+            title?: string;
+            author_name?: string[];
+            first_publish_year?: number;
+            cover_i?: number;
+            ia?: string[];
+            number_of_pages_median?: number;
+            ratings_average?: number;
+            subject?: string[];
+            language?: string[];
+            isbn?: string[];
+            ebook_access?: string;
+            edition_count?: number;
+          }>;
+        } | null;
+
+        const docs = data?.docs ?? [];
+        const items: SearchBookItem[] = [];
+        for (const d of docs) {
+          if (!d.key || !d.title) continue;
+          const isPublicIa = d.ebook_access === 'public' && Array.isArray(d.ia) && d.ia.length > 0;
+          const iaId = isPublicIa ? d.ia![0] : undefined;
+          const coverUrl = d.cover_i
+            ? `https://covers.openlibrary.org/b/id/${d.cover_i}-L.jpg`
+            : iaId
+            ? `https://archive.org/services/img/${encodeURIComponent(iaId)}`
+            : undefined;
+
+          items.push({
+            id: `ol:${d.key}`,
+            source: 'open_library',
+            identifier: iaId || d.key,
+            title: String(d.title).trim(),
+            author: Array.isArray(d.author_name) && d.author_name.length > 0
+              ? d.author_name.slice(0, 2).join(', ')
+              : 'Unknown Author',
+            year: typeof d.first_publish_year === 'number' ? d.first_publish_year : undefined,
+            language: normalizeLangLabel(d.language),
+            pageCount: typeof d.number_of_pages_median === 'number' ? d.number_of_pages_median : undefined,
+            downloads: typeof d.edition_count === 'number' ? d.edition_count * 120 : undefined,
+            rating:
+              typeof d.ratings_average === 'number' && d.ratings_average > 0
+                ? Math.round(d.ratings_average * 10) / 10
+                : undefined,
+            subjects: Array.isArray(d.subject) ? d.subject.slice(0, 5) : [],
+            coverUrl,
+            pdfUrl: iaId
+              ? `https://archive.org/download/${encodeURIComponent(iaId)}/${encodeURIComponent(iaId)}.pdf`
+              : undefined,
+            readOnlineUrl: iaId
+              ? `https://archive.org/details/${encodeURIComponent(iaId)}`
+              : `https://openlibrary.org${d.key}`,
+            format: iaId ? 'PDF' : 'Read Online',
+            isbn: Array.isArray(d.isbn) ? d.isbn[0] : undefined,
+          });
+        }
+        return items;
+      };
+
+      // 3. Gutendex / Project Gutenberg API (with fast fallback to Archive's official Project Gutenberg mirror)
+      const queryGutendex = async (): Promise<SearchBookItem[]> => {
+        const params = new URLSearchParams();
+        if (rawQuery) {
+          params.set('search', rawQuery);
+        }
+        if (catCfg.gutenTopic) {
+          params.set('topic', catCfg.gutenTopic);
+        }
+        if (lang !== 'all') {
+          params.set('languages', lang);
+        }
+        params.set('page', String(pageNum));
+
+        const data = (await fetchJsonWithTimeout(
+          `https://gutendex.com/books?${params.toString()}`,
+          4200
+        )) as {
+          results?: Array<{
+            id?: number;
+            title?: string;
+            authors?: Array<{ name?: string; birth_year?: number; death_year?: number }>;
+            subjects?: string[];
+            bookshelves?: string[];
+            languages?: string[];
+            download_count?: number;
+            summaries?: string[];
+            formats?: Record<string, string>;
+          }>;
+        } | null;
+
+        const results = data?.results ?? [];
+        const items: SearchBookItem[] = [];
+        for (const b of results.slice(0, 12)) {
+          if (!b.id || !b.title) continue;
+          const formats = b.formats ?? {};
+          const textUrl =
+            formats['text/plain; charset=utf-8'] ||
+            formats['text/plain; charset=us-ascii'] ||
+            formats['text/plain'] ||
+            undefined;
+          const epubUrl = formats['application/epub+zip'] || undefined;
+          const htmlUrl =
+            formats['text/html'] ||
+            formats['text/html; charset=utf-8'] ||
+            `https://www.gutenberg.org/ebooks/${b.id}`;
+          const coverUrl = formats['image/jpeg'] || undefined;
+
+          const authorName =
+            Array.isArray(b.authors) && b.authors.length > 0
+              ? b.authors
+                  .slice(0, 2)
+                  .map((a) => {
+                    const name = (a.name ?? '').trim();
+                    if (name.includes(',')) {
+                      const [last, first] = name.split(',').map((s) => s.trim());
+                      return first ? `${first} ${last}` : last;
+                    }
+                    return name;
+                  })
+                  .filter(Boolean)
+                  .join(', ')
+              : 'Project Gutenberg Author';
+
+          const rawDesc = Array.isArray(b.summaries) && b.summaries[0] ? b.summaries[0] : undefined;
+
+          items.push({
+            id: `gutenberg:${b.id}`,
+            source: 'gutenberg',
+            identifier: String(b.id),
+            title: b.title.trim(),
+            author: authorName || 'Unknown Author',
+            language: normalizeLangLabel(b.languages),
+            downloads: typeof b.download_count === 'number' ? b.download_count : undefined,
+            subjects: [...(b.subjects ?? []), ...(b.bookshelves ?? [])]
+              .map((s) => s.replace(/^Browsing:\s*/i, '').trim())
+              .filter(Boolean)
+              .slice(0, 5),
+            description: rawDesc ? rawDesc.slice(0, 500) : undefined,
+            coverUrl,
+            textUrl,
+            epubUrl,
+            readOnlineUrl: htmlUrl,
+            format: 'EPUB / Text',
+          });
+        }
+
+        if (items.length > 0) return items;
+
+        // Fast resilient fallback: Internet Archive's official Project Gutenberg mirror
+        const safeTerm = (rawQuery || catCfg.gutenTopic || '').replace(/[()":\\]/g, ' ').trim();
+        const gClauses = ['collection:gutenberg', 'mediatype:texts'];
+        if (safeTerm) {
+          gClauses.push(`(title:(${safeTerm}) OR creator:(${safeTerm}) OR subject:(${safeTerm}))`);
+        }
+        if (lang !== 'all' && LANG_TO_IA[lang]) {
+          gClauses.push(`language:${LANG_TO_IA[lang]}`);
+        }
+        const gParams = new URLSearchParams();
+        gParams.set('q', gClauses.join(' AND '));
+        gParams.append('fl[]', 'identifier');
+        gParams.append('fl[]', 'title');
+        gParams.append('fl[]', 'creator');
+        gParams.append('fl[]', 'downloads');
+        gParams.append('fl[]', 'year');
+        gParams.append('fl[]', 'language');
+        gParams.append('fl[]', 'subject');
+        gParams.append('sort[]', 'downloads desc');
+        gParams.set('rows', '8');
+        gParams.set('page', String(pageNum));
+        gParams.set('output', 'json');
+
+        const mirror = (await fetchJsonWithTimeout(
+          `https://archive.org/advancedsearch.php?${gParams.toString()}`,
+          5000
+        )) as {
+          response?: {
+            docs?: Array<{
+              identifier?: string;
+              title?: string;
+              creator?: string | string[];
+              downloads?: number;
+              year?: string | number;
+              language?: string | string[];
+              subject?: string | string[];
+            }>;
+          };
+        } | null;
+
+        for (const d of mirror?.response?.docs ?? []) {
+          if (!d.identifier || !d.title) continue;
+          const author = Array.isArray(d.creator)
+            ? d.creator.slice(0, 2).join(', ')
+            : String(d.creator ?? 'Project Gutenberg Author');
+          const parsedYear = parseInt(String(d.year ?? ''), 10);
+          items.push({
+            id: `gutenberg-ia:${d.identifier}`,
+            source: 'gutenberg',
+            identifier: d.identifier,
+            title: String(d.title).trim(),
+            author: author.trim() || 'Project Gutenberg Author',
+            year: Number.isFinite(parsedYear) && parsedYear > 1400 && parsedYear <= 2030 ? parsedYear : undefined,
+            language: normalizeLangLabel(d.language),
+            downloads: typeof d.downloads === 'number' ? d.downloads : undefined,
+            subjects: (Array.isArray(d.subject) ? d.subject : typeof d.subject === 'string' ? [d.subject] : [])
+              .map((s) => String(s).trim())
+              .filter(Boolean)
+              .slice(0, 4),
+            coverUrl: `https://archive.org/services/img/${encodeURIComponent(d.identifier)}`,
+            pdfUrl: `https://archive.org/download/${encodeURIComponent(d.identifier)}/${encodeURIComponent(d.identifier)}.pdf`,
+            readOnlineUrl: `https://archive.org/details/${encodeURIComponent(d.identifier)}`,
+            format: 'EPUB / Text',
+          });
+        }
+
+        return items;
+      };
+
+      const [iaResults, olResults, gutenResults] = await Promise.all([
+        queryInternetArchive(),
+        queryOpenLibrary(),
+        queryGutendex(),
+      ]);
+
+      // Merge & deduplicate by normalized title+author, preferring items with direct PDF or Text URLs
+      const mergedMap = new Map<string, SearchBookItem>();
+      const allRaw = [...gutenResults, ...iaResults, ...olResults];
+
+      for (const item of allRaw) {
+        const key = `${item.title.toLowerCase().replace(/[^a-z0-9]+/g, '').slice(0, 36)}::${item.author
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '')
+          .slice(0, 18)}`;
+        const existing = mergedMap.get(key);
+        if (!existing) {
+          mergedMap.set(key, item);
+        } else {
+          // Prefer whichever entry has direct downloadable PDF or plain text
+          const existingScore = (existing.pdfUrl ? 3 : 0) + (existing.textUrl ? 2 : 0) + (existing.coverUrl ? 1 : 0);
+          const nextScore = (item.pdfUrl ? 3 : 0) + (item.textUrl ? 2 : 0) + (item.coverUrl ? 1 : 0);
+          if (nextScore > existingScore) {
+            mergedMap.set(key, {
+              ...item,
+              rating: item.rating ?? existing.rating,
+              pageCount: item.pageCount ?? existing.pageCount,
+              description: item.description ?? existing.description,
+            });
+          }
+        }
+      }
+
+      let combined = Array.from(mergedMap.values());
+
+      // Apply format filter
+      if (format === 'pdf') {
+        combined = combined.filter((b) => Boolean(b.pdfUrl));
+      } else if (format === 'text') {
+        combined = combined.filter((b) => Boolean(b.textUrl || b.epubUrl));
+      } else if (format === 'online') {
+        combined = combined.filter((b) => Boolean(b.pdfUrl || b.textUrl || b.readOnlineUrl));
+      }
+
+      // Sort merged catalog
+      combined.sort((a, b) => {
+        if (sort === 'rating') {
+          return (b.rating ?? 0) - (a.rating ?? 0) || (b.downloads ?? 0) - (a.downloads ?? 0);
+        }
+        if (sort === 'latest') {
+          return (b.year ?? 0) - (a.year ?? 0) || (b.downloads ?? 0) - (a.downloads ?? 0);
+        }
+        // Prioritize immediately readable PDF/Text items alongside download volume
+        const aReadable = a.pdfUrl || a.textUrl ? 1 : 0;
+        const bReadable = b.pdfUrl || b.textUrl ? 1 : 0;
+        if (aReadable !== bReadable) return bReadable - aReadable;
+        return (b.downloads ?? 0) - (a.downloads ?? 0);
+      });
+
+      return res.json({
+        query: rawQuery,
+        page: pageNum,
+        total: combined.length,
+        sources: {
+          internetArchive: iaResults.length,
+          openLibrary: olResults.length,
+          gutenberg: gutenResults.length,
+        },
+        books: combined.slice(0, 30),
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Book search failed.';
+      return res.status(502).json({ error: message });
+    }
+  });
+
+  // GET /api/books/resolve — Resolve exact downloadable PDF/Text file & metadata for an Internet Archive identifier
+  app.get('/api/books/resolve', async (req, res) => {
+    try {
+      const identifier = typeof req.query.identifier === 'string' ? req.query.identifier.trim() : '';
+      if (!identifier || !/^[A-Za-z0-9._-]{1,160}$/.test(identifier)) {
+        return res.status(400).json({ error: 'Invalid book identifier.' });
+      }
+
+      const { response } = await safeFetchAllowlisted(
+        `https://archive.org/metadata/${encodeURIComponent(identifier)}`,
+        { timeoutMs: 12000, accept: 'application/json' }
+      );
+      if (!response.ok) {
+        return res.status(502).json({ error: `Could not fetch metadata (${response.status}).` });
+      }
+
+      const meta = (await response.json()) as {
+        metadata?: {
+          title?: string;
+          creator?: string | string[];
+          description?: string | string[];
+          imagecount?: string | number;
+          year?: string | number;
+        };
+        files?: Array<{
+          name?: string;
+          format?: string;
+          size?: string | number;
+          private?: string | boolean;
+        }>;
+      };
+
+      const files = Array.isArray(meta.files) ? meta.files : [];
+      const publicFiles = files.filter((f) => f.private !== 'true' && f.private !== true && typeof f.name === 'string');
+
+      // Prefer standard Text PDF / PDF under 45 MB
+      const pdfCandidates = publicFiles
+        .filter((f) => /\.pdf$/i.test(f.name!) && !/encrypted/i.test(f.format ?? ''))
+        .sort((a, b) => {
+          const aScore =
+            (/text pdf/i.test(a.format ?? '') ? 10 : 0) +
+            (!/_bw\.pdf$/i.test(a.name!) ? 5 : 0) +
+            (Number(a.size ?? 0) > 0 && Number(a.size ?? 0) < 42_000_000 ? 4 : -10);
+          const bScore =
+            (/text pdf/i.test(b.format ?? '') ? 10 : 0) +
+            (!/_bw\.pdf$/i.test(b.name!) ? 5 : 0) +
+            (Number(b.size ?? 0) > 0 && Number(b.size ?? 0) < 42_000_000 ? 4 : -10);
+          return bScore - aScore;
+        });
+
+      const txtCandidate = publicFiles.find(
+        (f) => /_djvu\.txt$/i.test(f.name!) || /\.txt$/i.test(f.name!)
+      );
+
+      const bestPdf = pdfCandidates[0];
+      const pdfUrl = bestPdf
+        ? `https://archive.org/download/${encodeURIComponent(identifier)}/${bestPdf.name!
+            .split('/')
+            .map(encodeURIComponent)
+            .join('/')}`
+        : undefined;
+
+      const textUrl = txtCandidate
+        ? `https://archive.org/download/${encodeURIComponent(identifier)}/${txtCandidate.name!
+            .split('/')
+            .map(encodeURIComponent)
+            .join('/')}`
+        : undefined;
+
+      const rawDesc = Array.isArray(meta.metadata?.description)
+        ? String(meta.metadata?.description[0] ?? '')
+        : String(meta.metadata?.description ?? '');
+
+      return res.json({
+        identifier,
+        pdfUrl,
+        pdfSize: bestPdf ? Number(bestPdf.size ?? 0) : undefined,
+        textUrl,
+        pageCount: meta.metadata?.imagecount ? Number(meta.metadata.imagecount) : undefined,
+        description: rawDesc.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 900) || undefined,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to resolve book files.';
+      return res.status(502).json({ error: message });
+    }
+  });
+
+  // GET /api/books/proxy-pdf — SSRF-protected streaming proxy for allowlisted public-domain PDFs
+  app.get('/api/books/proxy-pdf', async (req, res) => {
+    try {
+      const rawUrl = typeof req.query.url === 'string' ? req.query.url : '';
+      if (!parseAllowedBookUrl(rawUrl)) {
+        return res.status(400).json({ error: 'Only verified public-domain book URLs are allowed.' });
+      }
+
+      const { response } = await safeFetchAllowlisted(rawUrl, {
+        timeoutMs: 30000,
+        accept: 'application/pdf,*/*',
+      });
+
+      if (!response.ok) {
+        return res.status(502).json({ error: `Upstream PDF unavailable (${response.status}).` });
+      }
+
+      const contentLen = Number(response.headers.get('content-length') ?? '0');
+      const MAX_PDF_BYTES = 48 * 1024 * 1024;
+      if (contentLen > MAX_PDF_BYTES) {
+        return res.status(413).json({ error: 'PDF exceeds 48 MB browser streaming limit.' });
+      }
+
+      const arrBuf = await response.arrayBuffer();
+      if (arrBuf.byteLength > MAX_PDF_BYTES) {
+        return res.status(413).json({ error: 'PDF exceeds 48 MB browser streaming limit.' });
+      }
+      const buf = Buffer.from(arrBuf);
+      // Verify PDF magic header (%PDF-) to avoid serving HTML login/error pages as PDFs
+      const headerSlice = buf.subarray(0, 1024).toString('latin1');
+      if (!headerSlice.includes('%PDF-')) {
+        return res.status(422).json({
+          error: 'This book requires borrowing or is not an open downloadable PDF on Internet Archive.',
+        });
+      }
+
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      return res.send(buf);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Could not fetch remote PDF.';
+      return res.status(502).json({ error: message });
+    }
+  });
+
+  // GET /api/books/fetch-text — SSRF-protected plain-text e-book fetcher (Gutendex / Internet Archive)
+  app.get('/api/books/fetch-text', async (req, res) => {
+    try {
+      const rawUrl = typeof req.query.url === 'string' ? req.query.url : '';
+      if (!parseAllowedBookUrl(rawUrl)) {
+        return res.status(400).json({ error: 'Only verified public-domain text URLs are allowed.' });
+      }
+
+      const { response } = await safeFetchAllowlisted(rawUrl, {
+        timeoutMs: 20000,
+        accept: 'text/plain,text/html;q=0.8,*/*',
+      });
+      if (!response.ok) {
+        return res.status(502).json({ error: `Upstream text unavailable (${response.status}).` });
+      }
+
+      const rawText = await response.text();
+      if (rawText.length > 8_000_000) {
+        return res.status(413).json({ error: 'Text e-book exceeds 8 MB size limit.' });
+      }
+
+      // Clean Project Gutenberg header & footer boilerplate if present
+      let cleaned = rawText.replace(/\r\n/g, '\n');
+      const startMatch = cleaned.match(/\*\*\*\s*START OF (?:THE|THIS) PROJECT GUTENBERG EBOOK[^*]*\*\*\*/i);
+      if (startMatch && startMatch.index !== undefined) {
+        cleaned = cleaned.slice(startMatch.index + startMatch[0].length);
+      }
+      const endMatch = cleaned.match(/\*\*\*\s*END OF (?:THE|THIS) PROJECT GUTENBERG EBOOK[^*]*\*\*\*/i);
+      if (endMatch && endMatch.index !== undefined) {
+        cleaned = cleaned.slice(0, endMatch.index);
+      }
+
+      // Strip HTML tags cleanly if an HTML stream was returned
+      if (/<html[\s>]/i.test(cleaned.slice(0, 600))) {
+        cleaned = cleaned
+          .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+          .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+          .replace(/<\/(?:p|div|h[1-6]|li|br)>/gi, '\n\n')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/&nbsp;/gi, ' ')
+          .replace(/&amp;/gi, '&')
+          .replace(/&lt;/gi, '<')
+          .replace(/&gt;/gi, '>')
+          .replace(/&quot;/gi, '"');
+      }
+
+      return res.json({ text: cleaned.trim() });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to fetch book text.';
+      return res.status(502).json({ error: message });
+    }
+  });
+
+  // GET /api/books/proxy-cover — SSRF-protected image proxy so pdf-lib can embed remote book covers onto Page 1
+  app.get('/api/books/proxy-cover', async (req, res) => {
+    try {
+      const rawUrl = typeof req.query.url === 'string' ? req.query.url : '';
+      if (!parseAllowedBookUrl(rawUrl)) {
+        return res.status(400).json({ error: 'Invalid cover URL.' });
+      }
+      const { response } = await safeFetchAllowlisted(rawUrl, {
+        timeoutMs: 12000,
+        accept: 'image/jpeg,image/png,image/webp,*/*',
+      });
+      if (!response.ok) {
+        return res.status(404).end();
+      }
+      const ct = response.headers.get('content-type') || 'image/jpeg';
+      if (!ct.toLowerCase().startsWith('image/')) {
+        return res.status(415).end();
+      }
+      const buf = Buffer.from(await response.arrayBuffer());
+      if (buf.byteLength > 5 * 1024 * 1024) {
+        return res.status(413).end();
+      }
+      res.setHeader('Content-Type', ct);
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      return res.send(buf);
+    } catch {
+      return res.status(404).end();
+    }
+  });
+
+  // POST /api/summarize-chapter — One-Click Chapter Summarizer & Key Takeaways (100% Free + Optional AI Upgrade)
+  app.post('/api/summarize-chapter', async (req, res) => {
+    try {
+      const { chapterTitle, text, targetLang = 'en' } = req.body ?? {};
+      if (typeof text !== 'string' || text.trim().length < 40) {
+        return res.status(400).json({ error: 'Chapter needs at least a few sentences to summarize.' });
+      }
+      if (typeof targetLang !== 'string' || !ALLOWED_LANGS[targetLang]) {
+        return res.status(400).json({ error: 'Unsupported target language.' });
+      }
+
+      const safeTitle = typeof chapterTitle === 'string' ? chapterTitle.trim().slice(0, 140) : 'Current Chapter';
+      const clipped = text.replace(/\s+/g, ' ').trim().slice(0, 22000);
+      const wordCount = clipped.split(/\s+/).filter(Boolean).length;
+      const readingTimeMinutes = Math.max(1, Math.round(wordCount / 210));
+      const langMeta = ALLOWED_LANGS[targetLang];
+
+      // 1. Optional Gemini AI structured summary when API key is configured
+      const ai = getGeminiClient();
+      if (ai) {
+        try {
+          const prompt = `Summarize the following book chapter titled "${safeTitle}" for a student/reader in ${langMeta.name}.
+Return strict JSON with:
+- "summary": concise 2-3 sentence overview in ${langMeta.name}
+- "keyTakeaways": 4 to 6 crisp, actionable bullet-point takeaways in ${langMeta.name}
+- "keyTerms": 4 to 6 important concepts/terms mentioned in the chapter.
+
+Chapter text:
+${clipped.slice(0, 14000)}`;
+
+          const response = await ai.models.generateContent({
+            model: 'gemini-3-flash-preview',
+            contents: prompt,
+            config: {
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  summary: { type: Type.STRING },
+                  keyTakeaways: { type: Type.ARRAY, items: { type: Type.STRING } },
+                  keyTerms: { type: Type.ARRAY, items: { type: Type.STRING } },
+                },
+                required: ['summary', 'keyTakeaways', 'keyTerms'],
+              },
+            },
+          });
+
+          const parsed = JSON.parse(response.text || '{}') as {
+            summary?: string;
+            keyTakeaways?: string[];
+            keyTerms?: string[];
+          };
+          if (parsed.summary && Array.isArray(parsed.keyTakeaways) && parsed.keyTakeaways.length > 0) {
+            return res.json({
+              chapterTitle: safeTitle,
+              summary: parsed.summary.trim(),
+              keyTakeaways: parsed.keyTakeaways.map((s) => s.trim()).filter(Boolean).slice(0, 6),
+              keyTerms: (parsed.keyTerms ?? []).map((s) => s.trim()).filter(Boolean).slice(0, 8),
+              readingTimeMinutes,
+              source: 'ai',
+            });
+          }
+        } catch {
+          // Fall through cleanly to zero-cost extractive summarizer
+        }
+      }
+
+      // 2. 100% Free Extractive Summarizer (TF-IDF term-frequency scoring + automatic target language translation)
+      const rawSentences = (clipped.match(/[^.!?।۔؟]+[.!?।۔؟]+/g) ?? [clipped])
+        .map((s) => s.trim())
+        .filter((s) => s.length >= 35 && s.length <= 360);
+
+      const stopWords = new Set([
+        'the', 'and', 'for', 'that', 'with', 'this', 'from', 'have', 'were', 'been', 'will',
+        'their', 'there', 'which', 'about', 'would', 'could', 'should', 'into', 'more', 'also',
+        'they', 'them', 'then', 'than', 'when', 'what', 'your', 'some', 'only', 'such', 'other',
+        'very', 'just', 'like', 'over', 'most', 'many', 'each', 'well', 'make', 'made', 'using',
+      ]);
+
+      const freq = new Map<string, number>();
+      for (const s of rawSentences) {
+        const words = s.toLowerCase().match(/[a-z\u0900-\u097f]{4,}/g) ?? [];
+        for (const w of words) {
+          if (!stopWords.has(w)) {
+            freq.set(w, (freq.get(w) ?? 0) + 1);
+          }
+        }
+      }
+
+      const keyTerms = Array.from(freq.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 6)
+        .map(([w]) => w.charAt(0).toUpperCase() + w.slice(1));
+
+      const scored = rawSentences.map((sentence, idx) => {
+        const words = sentence.toLowerCase().match(/[a-z\u0900-\u097f]{4,}/g) ?? [];
+        let score = 0;
+        for (const w of words) {
+          score += freq.get(w) ?? 0;
+        }
+        // Mild positional boost for opening/concluding thesis sentences
+        const posBoost = idx < 3 ? 1.28 : idx >= rawSentences.length - 2 ? 1.12 : 1.0;
+        const normScore = (score / Math.max(6, words.length)) * posBoost;
+        return { sentence, idx, score: normScore };
+      });
+
+      const topCount = Math.min(6, Math.max(3, scored.length));
+      const picked = scored
+        .sort((a, b) => b.score - a.score)
+        .slice(0, topCount)
+        .sort((a, b) => a.idx - b.idx)
+        .map((s) => s.sentence);
+
+      let summaryText = picked.slice(0, 2).join(' ');
+      let takeaways = picked.slice(0, 5);
+
+      // If text looks English and user wants a non-English target language, translate summary & takeaways for free
+      const asciiRatio =
+        (summaryText.match(/[A-Za-z]/g)?.length ?? 0) / Math.max(1, summaryText.length);
+      if (targetLang !== 'en' && asciiRatio > 0.45) {
+        try {
+          const blocksToTr = [
+            { id: 'sum', text: summaryText },
+            ...takeaways.map((t, i) => ({ id: `tk-${i}`, text: t })),
+          ];
+          const { translations } = await translateBlocksFast(blocksToTr, targetLang, true, []);
+          if (translations.sum) summaryText = translations.sum;
+          takeaways = takeaways.map((t, i) => translations[`tk-${i}`] || t);
+        } catch {
+          // Keep original summary text if free translation momentarily fails
+        }
+      }
+
+      return res.json({
+        chapterTitle: safeTitle,
+        summary: summaryText || clipped.slice(0, 320),
+        keyTakeaways: takeaways.length > 0 ? takeaways : [clipped.slice(0, 220)],
+        keyTerms,
+        readingTimeMinutes,
+        source: 'extractive',
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Chapter summarization failed.';
+      return res.status(502).json({ error: message });
+    }
+  });
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: {

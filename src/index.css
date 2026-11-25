@@ -1,5 +1,6 @@
 @import "tailwindcss";
 @custom-variant dark (&:where(.dark, .dark *));
+@custom-variant sepia (&:where(.sepia, .sepia *));
 
 @layer base {
   :root {
@@ -15,6 +16,16 @@
 
   body {
     font-family: var(--font-sans);
+  }
+
+  html.sepia body {
+    background-color: #F4ECD8;
+    color: #3B2F23;
+  }
+
+  html.dark body {
+    background-color: #090908;
+    color: #F5F5F4;
   }
 
   h1, h2, .font-editorial {

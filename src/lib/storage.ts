@@ -90,6 +90,24 @@ export async function updateBookLastPage(bookId: string, lastPage: number): Prom
   }
 }
 
+export async function toggleBookBookmark(
+  bookId: string,
+  pageNumber: number
+): Promise<StoredBook | undefined> {
+  const db = await getDb();
+  const existing = await db.get('books', bookId);
+  if (!existing) return undefined;
+  const current = new Set<number>(existing.bookmarks ?? []);
+  if (current.has(pageNumber)) {
+    current.delete(pageNumber);
+  } else {
+    current.add(pageNumber);
+  }
+  existing.bookmarks = Array.from(current).sort((a, b) => a - b);
+  await db.put('books', existing);
+  return existing;
+}
+
 export async function deleteBook(bookId: string): Promise<void> {
   const db = await getDb();
   await db.delete('books', bookId);

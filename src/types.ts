@@ -132,6 +132,57 @@ export interface StoredBook {
   pageWidth?: number;
   pageHeight?: number;
   annotations?: Record<number, PageAnnotationLayer>;
+  bookmarks?: number[];
+  externalSource?: BookSearchSource;
+  externalUrl?: string;
+}
+
+export type BookSearchSource = 'internet_archive' | 'open_library' | 'gutenberg';
+
+export type BookCategory =
+  | 'all'
+  | 'programming'
+  | 'business'
+  | 'science'
+  | 'history'
+  | 'fiction'
+  | 'self_help';
+
+export type BookFormatFilter = 'all' | 'pdf' | 'text' | 'online';
+
+export type BookSortBy = 'downloads' | 'rating' | 'latest';
+
+export interface DiscoveredBook {
+  id: string;
+  source: BookSearchSource;
+  identifier: string;
+  title: string;
+  author: string;
+  year?: number;
+  language: string;
+  pageCount?: number;
+  downloads?: number;
+  rating?: number;
+  subjects: string[];
+  description?: string;
+  coverUrl?: string;
+  pdfUrl?: string;
+  textUrl?: string;
+  epubUrl?: string;
+  readOnlineUrl?: string;
+  format: 'PDF' | 'EPUB / Text' | 'Read Online';
+  isbn?: string;
+}
+
+export type ReadingTheme = 'light' | 'sepia' | 'dark';
+
+export interface ChapterSummaryResult {
+  chapterTitle: string;
+  summary: string;
+  keyTakeaways: string[];
+  keyTerms: string[];
+  readingTimeMinutes: number;
+  source: 'ai' | 'extractive';
 }
 
 export interface SentenceSpan {
@@ -192,5 +243,3 @@ export interface BatchTranslationProgress {
   skippedCached: number;
   statusNote?: string;
 }
-
-
