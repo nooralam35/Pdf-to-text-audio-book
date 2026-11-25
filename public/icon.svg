@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <rect width="512" height="512" rx="112" fill="#B45309" />
+  <rect x="28" y="28" width="456" height="456" rx="88" stroke="#FAF9F5" stroke-opacity="0.22" stroke-width="6" />
+  <g transform="translate(106 132)">
+    <path
+      d="M150 42C122 18 76 8 24 14C14 15 6 23 6 33V222C6 233 15 241 26 240C76 234 120 242 150 264V42Z"
+      fill="#FAF9F5"
+    />
+    <path
+      d="M150 42C178 18 224 8 276 14C286 15 294 23 294 33V222C294 233 285 241 274 240C224 234 180 242 150 264V42Z"
+      fill="#F5ECE0"
+    />
+    <path d="M150 42V264" stroke="#B45309" stroke-width="10" stroke-linecap="round" />
+    <line x1="42" y1="76" x2="118" y2="84" stroke="#B45309" stroke-width="12" stroke-linecap="round" stroke-opacity="0.72" />
+    <line x1="42" y1="120" x2="118" y2="128" stroke="#B45309" stroke-width="12" stroke-linecap="round" stroke-opacity="0.45" />
+    <line x1="42" y1="164" x2="104" y2="170" stroke="#B45309" stroke-width="12" stroke-linecap="round" stroke-opacity="0.45" />
+    <line x1="182" y1="84" x2="258" y2="76" stroke="#92400E" stroke-width="12" stroke-linecap="round" stroke-opacity="0.72" />
+    <line x1="182" y1="128" x2="258" y2="120" stroke="#92400E" stroke-width="12" stroke-linecap="round" stroke-opacity="0.45" />
+    <line x1="182" y1="170" x2="244" y2="164" stroke="#92400E" stroke-width="12" stroke-linecap="round" stroke-opacity="0.45" />
+  </g>
+</svg>

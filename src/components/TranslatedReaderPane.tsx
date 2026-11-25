@@ -14,6 +14,7 @@ import {
   Languages,
   Loader2,
   RefreshCw,
+  Share2,
   Sparkles,
   StickyNote,
   Trash2,
@@ -65,6 +66,13 @@ interface TranslatedReaderPaneProps {
   onSummarizeCurrentChapter?: () => void;
   isSummarizingChapter?: boolean;
   onExportHighlights?: () => void;
+  onShareQuote?: (draft: {
+    id?: string;
+    quoteText: string;
+    note?: string;
+    highlightColor?: TextHighlightColor;
+  }) => void;
+  onOpenShareStudio?: () => void;
 }
 
 type StreamItem =
@@ -219,6 +227,8 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
   onSummarizeCurrentChapter,
   isSummarizingChapter = false,
   onExportHighlights,
+  onShareQuote,
+  onOpenShareStudio,
 }) => {
   const [editingBlockId, setEditingBlockId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState('');
@@ -870,6 +880,18 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
             </button>
           )}
 
+          {onOpenShareStudio && translatedPage && (
+            <button
+              type="button"
+              onClick={onOpenShareStudio}
+              className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded text-xs font-medium text-stone-700 dark:text-stone-200 hover:bg-stone-200/70 dark:hover:bg-stone-800 cursor-pointer whitespace-nowrap"
+              title="Create a shareable visual quote card from your highlights"
+            >
+              <Share2 className="w-3.5 h-3.5 text-amber-700 dark:text-amber-500" />
+              <span className="hidden xl:inline">Share Quote</span>
+            </button>
+          )}
+
           {onExportHighlights && (
             <button
               type="button"
@@ -1022,6 +1044,29 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
                   <BookOpen className="w-3.5 h-3.5" />
                   <span>Define</span>
                 </button>
+
+                {onShareQuote && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const existing = popover.highlightId
+                        ? pageHighlights.find((h) => h.id === popover.highlightId)
+                        : undefined;
+                      onShareQuote({
+                        id: popover.highlightId,
+                        quoteText: popover.selectedText,
+                        note: noteDraft.trim() || existing?.note,
+                        highlightColor: popover.color,
+                      });
+                      closePopover();
+                    }}
+                    className="inline-flex items-center gap-1 h-7 px-2 rounded text-xs font-medium text-amber-800 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-950/50 transition-colors cursor-pointer whitespace-nowrap"
+                    title="Create a shareable visual quote card"
+                  >
+                    <Share2 className="w-3.5 h-3.5" />
+                    <span>Share</span>
+                  </button>
+                )}
 
                 <button
                   type="button"
@@ -1639,6 +1684,23 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
                   </button>
 
                   <div className="flex items-center gap-1 shrink-0">
+                    {onShareQuote && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onShareQuote({
+                            id: hl.id,
+                            quoteText: hl.selectedText,
+                            note: hl.note,
+                            highlightColor: hl.color,
+                          })
+                        }
+                        title="Share as visual quote card"
+                        className="h-7 w-7 inline-flex items-center justify-center rounded text-stone-500 hover:text-amber-700 dark:text-stone-400 dark:hover:text-amber-400 hover:bg-stone-200/60 dark:hover:bg-stone-800 cursor-pointer"
+                      >
+                        <Share2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => jumpToHighlightInPage(hl, 'dictionary')}

@@ -166,6 +166,20 @@ export async function listTranslationsForBookLang(
   return rows.sort((a, b) => a.pageNumber - b.pageNumber);
 }
 
+export async function listAllTranslationCountsByBook(): Promise<Record<string, number>> {
+  const db = await getDb();
+  const counts: Record<string, number> = {};
+  const tx = db.transaction('translations', 'readonly');
+  let cursor = await tx.store.openCursor();
+  while (cursor) {
+    const id = cursor.value.bookId;
+    counts[id] = (counts[id] ?? 0) + 1;
+    cursor = await cursor.continue();
+  }
+  await tx.done;
+  return counts;
+}
+
 export async function saveParsedPage(bookId: string, page: ParsedPage): Promise<void> {
   const db = await getDb();
   await db.put('parsedPages', {

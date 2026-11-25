@@ -11,9 +11,20 @@ import {
   Sparkles,
   Square,
   Sun,
+  WifiOff,
   X,
   Zap,
 } from 'lucide-react';
+import { useOnlineStatus } from './hooks/useOnlineStatus';
+import {
+  cacheBookForOffline,
+  getCachedBookBufferFromSW,
+  inspectOfflineLibraryCache,
+  removeBookFromOfflineCache,
+  subscribeServiceWorkerStatus,
+  warmPdfEngineOfflineAssets,
+  type ServiceWorkerStatus,
+} from './lib/offlineCache';
 import { TopBar, type ActiveTab } from './components/TopBar';
 import { DiscoverView, type DiscoverBookAction } from './components/DiscoverView';
 import { ChapterSidebar } from './components/ChapterSidebar';
@@ -28,11 +39,13 @@ import {
 } from './components/AudiobookBar';
 import { LibraryView } from './components/LibraryView';
 import { ExportView } from './components/ExportView';
+import { ShareHighlightModal } from './components/ShareHighlightModal';
 import {
   exportHighlightsSummarySheet,
   fetchExternalBookAsPdfBuffer,
   summarizeChapterApi,
 } from './lib/bookDiscovery';
+import type { ShareQuotePayload } from './lib/highlightCardCanvas';
 import {
   getLanguageOption,
   LANGUAGES,
@@ -53,6 +66,7 @@ import {
   getBook,
   getParsedPage,
   getTranslation,
+  listAllTranslationCountsByBook,
   listBooks,
   listTranslationsForBookLang,
   makeTranslationKey,
@@ -79,6 +93,7 @@ import type {
   ReadingTheme,
   StoredBook,
   TextHighlight,
+  TextHighlightColor,
   TranslatedPageRecord,
   TranslationEngine,
 } from './types';
@@ -86,8 +101,21 @@ import type {
 type MobilePane = 'pdf' | 'translated' | 'chapters';
 
 export default function App() {
+  // Connectivity & Service Worker Offline Cache State
+  const isOnline = useOnlineStatus();
+  const [swStatus, setSwStatus] = useState<ServiceWorkerStatus>('registering');
+  const [cachedBookIds, setCachedBookIds] = useState<Set<string>>(() => new Set());
+  const [storageUsageBytes, setStorageUsageBytes] = useState<number | null>(null);
+  const [allLangTranslationCountsByBook, setAllLangTranslationCountsByBook] = useState<
+    Record<string, number>
+  >({});
+  const [cachingBookId, setCachingBookId] = useState<string | null>(null);
+  const [isSyncingAllOffline, setIsSyncingAllOffline] = useState(false);
+
   // Navigation & Reading Themes (Light Paper, Sepia, OLED Dark)
-  const [activeTab, setActiveTab] = useState<ActiveTab>('discover');
+  const [activeTab, setActiveTab] = useState<ActiveTab>(() =>
+    typeof navigator !== 'undefined' && navigator.onLine === false ? 'library' : 'discover'
+  );
   const [mobilePane, setMobilePane] = useState<MobilePane>('translated');
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [mobileChaptersOpen, setMobileChaptersOpen] = useState(false);
@@ -138,6 +166,7 @@ export default function App() {
   const [parsedPage, setParsedPage] = useState<ParsedPage | null>(null);
   const [translatedPage, setTranslatedPage] = useState<TranslatedPageRecord | null>(null);
   const [bookTranslations, setBookTranslations] = useState<TranslatedPageRecord[]>([]);
+  const [shareModalPayload, setShareModalPayload] = useState<ShareQuotePayload | null>(null);
   const [translatedCountsByBook, setTranslatedCountsByBook] = useState<Record<string, number>>({});
 
   // Loading / Processing States
@@ -221,7 +250,7 @@ export default function App() {
     [customTermsInput]
   );
 
-  // Refresh translated counts across library for active language
+  // Refresh translated counts across library for active language + all cached languages
   const refreshLibraryCounts = useCallback(
     async (bookList: StoredBook[], lang: LanguageCode) => {
       const counts: Record<string, number> = {};
@@ -232,45 +261,92 @@ export default function App() {
         })
       );
       setTranslatedCountsByBook(counts);
+      const allCounts = await listAllTranslationCountsByBook().catch(() => counts);
+      setAllLangTranslationCountsByBook(allCounts);
     },
     []
   );
 
-  // Open a StoredBook into the active PDF.js instance
-  const openStoredBook = useCallback(async (book: StoredBook) => {
-    setAppBanner(null);
-    let pdfDoc: LoadedPdf;
-    if (book.pdfData) {
-      pdfDoc = await loadPdfFromBuffer(book.pdfData);
-    } else if (book.sourceUrl) {
-      pdfDoc = await loadPdfFromUrl(book.sourceUrl);
-    } else {
-      throw new Error('PDF source data missing for this book.');
-    }
-
-    setLoadedPdf((prev) => {
-      if (prev && prev !== pdfDoc) {
-        prev.cleanup().catch(() => {});
-      }
-      return pdfDoc;
-    });
-    setActiveBook(book);
-    setCurrentPage(Math.max(1, Math.min(book.numPages, book.lastPage || 1)));
+  // Refresh Service Worker & local IndexedDB offline cache diagnostics
+  const refreshOfflineInspection = useCallback(async (bookList: StoredBook[]) => {
+    const info = await inspectOfflineLibraryCache(bookList);
+    setCachedBookIds(info.cachedBookIds);
+    setStorageUsageBytes(info.storageUsageBytes);
   }, []);
+
+  // Subscribe to Service Worker registration status & warm PDF.js fonts once online
+  useEffect(() => {
+    const unsubscribe = subscribeServiceWorkerStatus((status) => {
+      setSwStatus(status);
+    });
+    return unsubscribe;
+  }, []);
+
+  useEffect(() => {
+    refreshOfflineInspection(books);
+  }, [books, swStatus, translatedCountsByBook, refreshOfflineInspection]);
+
+  useEffect(() => {
+    if (isOnline && swStatus === 'active') {
+      warmPdfEngineOfflineAssets().catch(() => {});
+    }
+  }, [isOnline, swStatus]);
+
+  // Open a StoredBook into the active PDF.js instance (offline-first: IndexedDB -> SW Cache -> Network)
+  const openStoredBook = useCallback(
+    async (book: StoredBook) => {
+      setAppBanner(null);
+      let pdfDoc: LoadedPdf;
+      if (book.pdfData && book.pdfData.byteLength > 0) {
+        pdfDoc = await loadPdfFromBuffer(book.pdfData);
+      } else {
+        const cachedSwBuffer = await getCachedBookBufferFromSW(book);
+        if (cachedSwBuffer) {
+          pdfDoc = await loadPdfFromBuffer(cachedSwBuffer);
+        } else if (book.sourceUrl) {
+          if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+            throw new Error(
+              'This PDF has not been saved for offline reading yet. Reconnect once and click “Save Offline” in My Library.'
+            );
+          }
+          pdfDoc = await loadPdfFromUrl(book.sourceUrl);
+          // Persist into Service Worker cache & IndexedDB in background so future offline opens work immediately
+          cacheBookForOffline(book)
+            .then((cached) => {
+              setBooks((prev) => prev.map((b) => (b.id === cached.id ? cached : b)));
+              setActiveBook((prev) => (prev && prev.id === cached.id ? cached : prev));
+            })
+            .catch(() => {});
+        } else {
+          throw new Error('PDF source data missing for this book.');
+        }
+      }
+
+      setLoadedPdf((prev) => {
+        if (prev && prev !== pdfDoc) {
+          prev.cleanup().catch(() => {});
+        }
+        return pdfDoc;
+      });
+      setActiveBook(book);
+      setCurrentPage(Math.max(1, Math.min(book.numPages, book.lastPage || 1)));
+    },
+    []
+  );
 
   // Boot: check server capabilities + load IndexedDB library or preload attached OBS Superuser Guidebook
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const caps = await checkServerCapabilities();
+        const caps = await checkServerCapabilities().catch(() => ({ aiAvailable: false }));
         if (!cancelled) setAiAvailable(caps.aiAvailable);
 
         const existingBooks = await listBooks();
         let obsBook = await getBook(PRELOADED_OBS_BOOK_ID);
         let openedDuringBoot = false;
 
-        if (!obsBook) {
+        if (!obsBook && (typeof navigator === 'undefined' || navigator.onLine !== false)) {
           try {
             const pdf = await loadPdfFromUrl(PRELOADED_OBS_BOOK_URL);
             const [{ chapters, detectedTitle, detectedAuthor }, coverRes, p1] = await Promise.all([
@@ -298,6 +374,19 @@ export default function App() {
               pageHeight: vp1.height,
             };
             await saveBook(obsBook);
+            // Automatically cache the preloaded guidebook in Service Worker Cache Storage + IndexedDB
+            cacheBookForOffline(obsBook)
+              .then((cachedObs) => {
+                if (!cancelled) {
+                  setBooks((prev) =>
+                    prev.map((b) => (b.id === cachedObs.id ? cachedObs : b))
+                  );
+                  setActiveBook((prev) =>
+                    prev && prev.id === cachedObs.id ? cachedObs : prev
+                  );
+                }
+              })
+              .catch(() => {});
             if (!cancelled) {
               setLoadedPdf(pdf);
               setActiveBook(obsBook);
@@ -459,6 +548,7 @@ export default function App() {
       };
 
       await saveBook(newBook);
+      await cacheBookForOffline(newBook).catch(() => {});
       const all = await listBooks();
       setBooks(all);
 
@@ -479,19 +569,86 @@ export default function App() {
   };
 
   const handleDeleteBook = async (bookId: string) => {
+    const target = books.find((b) => b.id === bookId);
+    if (target) {
+      await removeBookFromOfflineCache(target);
+    }
     await deleteBook(bookId);
     const remaining = await listBooks();
     setBooks(remaining);
     if (activeBook?.id === bookId) {
       const fallback = remaining[0];
       if (fallback) {
-        await openStoredBook(fallback);
+        await openStoredBook(fallback).catch(() => {});
       } else {
         setActiveBook(null);
         setLoadedPdf(null);
       }
     }
   };
+
+  const handleCacheBookOffline = useCallback(
+    async (book: StoredBook) => {
+      if (cachingBookId || isSyncingAllOffline) return;
+      setCachingBookId(book.id);
+      setAppBanner(null);
+      try {
+        const cached = await cacheBookForOffline(book);
+        await warmPdfEngineOfflineAssets();
+        const updatedList = await listBooks();
+        setBooks(updatedList);
+        if (activeBook?.id === cached.id) {
+          setActiveBook(cached);
+        }
+        await refreshOfflineInspection(updatedList);
+        setAppBanner(`“${book.title}” is now cached in your browser for offline reading.`);
+      } catch (err) {
+        setAppBanner(
+          err instanceof Error
+            ? `Could not cache “${book.title}” offline: ${err.message}`
+            : 'Could not cache this book offline.'
+        );
+      } finally {
+        setCachingBookId(null);
+      }
+    },
+    [activeBook?.id, cachingBookId, isSyncingAllOffline, refreshOfflineInspection]
+  );
+
+  const handleSyncAllOffline = useCallback(async () => {
+    if (isSyncingAllOffline || books.length === 0) return;
+    setIsSyncingAllOffline(true);
+    setAppBanner(null);
+    let newlyCached = 0;
+    let failed = 0;
+    try {
+      await warmPdfEngineOfflineAssets();
+      for (const book of books) {
+        try {
+          await cacheBookForOffline(book);
+          newlyCached++;
+        } catch {
+          failed++;
+        }
+      }
+      const updatedList = await listBooks();
+      setBooks(updatedList);
+      await refreshOfflineInspection(updatedList);
+      if (failed === 0) {
+        setAppBanner(
+          `Offline cache verified: all ${newlyCached} ${
+            newlyCached === 1 ? 'book' : 'books'
+          } and PDF viewer assets are ready offline.`
+        );
+      } else {
+        setAppBanner(
+          `Cached ${newlyCached} book(s) offline (${failed} could not be downloaded right now).`
+        );
+      }
+    } finally {
+      setIsSyncingAllOffline(false);
+    }
+  }, [books, isSyncingAllOffline, refreshOfflineInspection]);
 
   // Load, translate, listen, or download a book directly from the Global E-Book Discovery Hub
   const handleActionDiscoveredBook = async (
@@ -558,6 +715,7 @@ export default function App() {
       };
 
       await saveBook(newBook);
+      await cacheBookForOffline(newBook).catch(() => {});
       const all = await listBooks();
       setBooks(all);
 
@@ -1424,6 +1582,27 @@ export default function App() {
     [bookTranslations]
   );
 
+  // Word counts per translated page in the current chapter for accurate chapter duration & seeking
+  const chapterPageWordCounts = useMemo<Record<number, number>>(() => {
+    const counts: Record<number, number> = {};
+    const startP = currentChapter ? currentChapter.startPage : currentPage;
+    const endP = currentChapter ? currentChapter.endPage : currentPage;
+    for (const rec of bookTranslations) {
+      if (rec.pageNumber < startP || rec.pageNumber > endP) continue;
+      let words = 0;
+      for (const blk of rec.blocks) {
+        const txt = (narrationSource === 'original' ? blk.text : blk.translatedText || blk.text).trim();
+        if (txt) {
+          words += txt.split(/\s+/).filter(Boolean).length;
+        }
+      }
+      if (words > 0) {
+        counts[rec.pageNumber] = words;
+      }
+    }
+    return counts;
+  }, [bookTranslations, currentChapter, currentPage, narrationSource]);
+
   const sentences = useMemo(() => {
     if (narrationSource === 'original') {
       if (!parsedPage) return [];
@@ -1519,6 +1698,86 @@ export default function App() {
     setCurrentPage((p) => Math.min(activeBook.numPages, p + 1));
   }, [activeBook, currentPage]);
 
+  // Aggregate all saved text highlights across the active book for the Share Highlights Studio
+  const allBookShareHighlights = useMemo<ShareQuotePayload[]>(() => {
+    if (!activeBook) return [];
+    const list: ShareQuotePayload[] = [];
+    const sortedPages = [...bookTranslations].sort((a, b) => a.pageNumber - b.pageNumber);
+    for (const pg of sortedPages) {
+      const ch = activeBook.chapters.find(
+        (c) => pg.pageNumber >= c.startPage && pg.pageNumber <= c.endPage
+      );
+      for (const hl of pg.highlights ?? []) {
+        list.push({
+          id: hl.id,
+          quoteText: hl.selectedText,
+          note: hl.note,
+          bookTitle: activeBook.title,
+          author: activeBook.author,
+          pageNumber: pg.pageNumber,
+          chapterTitle: ch?.title,
+          lang: pg.lang,
+          coverDataUrl: activeBook.coverDataUrl,
+          highlightColor: hl.color,
+        });
+      }
+    }
+    return list;
+  }, [activeBook, bookTranslations]);
+
+  const handleShareQuoteFromReader = useCallback(
+    (draft: {
+      id?: string;
+      quoteText: string;
+      note?: string;
+      highlightColor?: TextHighlightColor;
+    }) => {
+      if (!activeBook) return;
+      setShareModalPayload({
+        id: draft.id,
+        quoteText: draft.quoteText,
+        note: draft.note,
+        bookTitle: activeBook.title,
+        author: activeBook.author,
+        pageNumber: currentPage,
+        chapterTitle: currentChapter?.title,
+        lang: targetLang,
+        coverDataUrl: activeBook.coverDataUrl,
+        highlightColor: draft.highlightColor,
+      });
+    },
+    [activeBook, currentPage, currentChapter, targetLang]
+  );
+
+  const handleOpenShareStudio = useCallback(() => {
+    if (!activeBook) return;
+    // Prefer latest highlight on current page, then any saved book highlight, then first paragraph on current page
+    const pageHls = translatedPage?.highlights ?? [];
+    if (pageHls.length > 0) {
+      const latest = pageHls[pageHls.length - 1];
+      handleShareQuoteFromReader({
+        id: latest.id,
+        quoteText: latest.selectedText,
+        note: latest.note,
+        highlightColor: latest.color,
+      });
+      return;
+    }
+    if (allBookShareHighlights.length > 0) {
+      setShareModalPayload(allBookShareHighlights[allBookShareHighlights.length - 1]);
+      return;
+    }
+    const sampleBlock =
+      translatedPage?.blocks.find(
+        (b) => (b.kind === 'paragraph' || b.kind === 'callout') && (b.translatedText || b.text).trim().length > 24
+      ) ?? translatedPage?.blocks[0];
+    const fallbackText = (sampleBlock?.translatedText || sampleBlock?.text || '').trim().slice(0, 280);
+    handleShareQuoteFromReader({
+      quoteText: fallbackText || `Reading "${activeBook.title}" on Page ${currentPage}.`,
+      highlightColor: 'amber',
+    });
+  }, [activeBook, translatedPage, allBookShareHighlights, currentPage, handleShareQuoteFromReader]);
+
   // Play or pause audio directly from any chapter's audio button in the Chapter List
   const handlePlayChapterAudio = useCallback(
     (chapter: ChapterItem) => {
@@ -1564,6 +1823,31 @@ export default function App() {
         onUploadPdf={handleUploadPdf}
         isUploading={isUploading}
       />
+
+      {/* Offline Mode Connectivity Bar */}
+      {!isOnline && (
+        <div
+          role="status"
+          className="no-print px-4 py-2 text-xs bg-amber-50 sepia:bg-[#ECE2CA] dark:bg-[#1E1A14] border-b border-amber-200/80 sepia:border-[#D4C6AA] dark:border-amber-900/50 text-amber-950 sepia:text-[#3B2F23] dark:text-amber-200 flex flex-wrap items-center justify-between gap-2"
+        >
+          <div className="flex items-center gap-2 min-w-0">
+            <WifiOff className="w-3.5 h-3.5 text-amber-700 dark:text-amber-400 shrink-0" />
+            <span>
+              You are offline. Cached PDFs, saved translations, and device-voice narration in My
+              Library remain fully available.
+            </span>
+          </div>
+          {activeTab !== 'library' && activeTab !== 'reader' && (
+            <button
+              type="button"
+              onClick={() => setActiveTab('library')}
+              className="h-7 px-2.5 rounded border border-amber-700/40 dark:border-amber-500/40 bg-white sepia:bg-[#FBF6E9] dark:bg-[#191816] text-xs font-medium text-amber-900 dark:text-amber-300 hover:bg-amber-100/60 dark:hover:bg-amber-950/40 cursor-pointer whitespace-nowrap"
+            >
+              Open My Library
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Reader Workspace Utility Bar */}
       {activeTab === 'reader' && (
@@ -1932,12 +2216,29 @@ export default function App() {
             books={books}
             activeBookId={activeBook?.id ?? null}
             translatedCountsByBook={translatedCountsByBook}
+            allLangTranslationCountsByBook={allLangTranslationCountsByBook}
+            isOnline={isOnline}
+            swStatus={swStatus}
+            cachedBookIds={cachedBookIds}
+            storageUsageBytes={storageUsageBytes}
+            cachingBookId={cachingBookId}
+            isSyncingAllOffline={isSyncingAllOffline}
             onSelectBook={async (book) => {
-              await openStoredBook(book);
-              setActiveTab('reader');
+              try {
+                await openStoredBook(book);
+                setActiveTab('reader');
+              } catch (err) {
+                setAppBanner(
+                  err instanceof Error
+                    ? err.message
+                    : 'Unable to open this book while offline.'
+                );
+              }
             }}
             onUploadPdf={handleUploadPdf}
             onDeleteBook={handleDeleteBook}
+            onCacheBookOffline={handleCacheBookOffline}
+            onSyncAllOffline={handleSyncAllOffline}
             onGoToDiscover={() => setActiveTab('discover')}
             isUploading={isUploading}
           />
@@ -2113,6 +2414,8 @@ export default function App() {
                   }
                   isSummarizingChapter={Boolean(summarizingChapterId)}
                   onExportHighlights={handleExportHighlightsSheet}
+                  onShareQuote={handleShareQuoteFromReader}
+                  onOpenShareStudio={handleOpenShareStudio}
                 />
               </div>
 
@@ -2160,6 +2463,8 @@ export default function App() {
           bookTitle={activeBook.title}
           pageNumber={currentPage}
           numPages={activeBook.numPages}
+          currentChapter={currentChapter}
+          chapterPageWordCounts={chapterPageWordCounts}
           targetLang={targetLang}
           parsedPage={parsedPage}
           translatedPage={translatedPage}
@@ -2173,6 +2478,9 @@ export default function App() {
           controlRef={audiobookControlRef}
           jumpRequest={jumpRequest}
           onAdvancePage={handleAdvancePageFromAudio}
+          onSeekToPage={(targetPage) =>
+            setCurrentPage(Math.max(1, Math.min(activeBook.numPages, targetPage)))
+          }
           onRequestTranslatePage={() => handleTranslateCurrentPage(false)}
           aiAvailable={aiAvailable}
           narrationSource={narrationSource}
@@ -2263,6 +2571,15 @@ export default function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Share Highlights Visual Quote Card Studio Modal */}
+      {shareModalPayload && (
+        <ShareHighlightModal
+          initialPayload={shareModalPayload}
+          savedHighlights={allBookShareHighlights}
+          onClose={() => setShareModalPayload(null)}
+        />
       )}
 
       {/* Hidden Print-Only Vector Unicode Document for "Print / Save Selectable PDF" */}
