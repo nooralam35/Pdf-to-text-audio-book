@@ -29,9 +29,13 @@ export interface SearchBooksResponse {
     internetArchive: number;
     openLibrary: number;
     gutenberg: number;
+    arxiv?: number;
   };
   books: DiscoveredBook[];
 }
+
+const CLIENT_SEARCH_CACHE_TTL_MS = 5 * 60 * 1000;
+const clientSearchCache = new Map<string, { data: SearchBooksResponse; expiresAt: number }>();
 
 export async function searchGlobalBooks(params: SearchBooksParams): Promise<SearchBooksResponse> {
   const qs = new URLSearchParams();
@@ -42,7 +46,13 @@ export async function searchGlobalBooks(params: SearchBooksParams): Promise<Sear
   qs.set('sort', params.sort);
   qs.set('page', String(params.page ?? 1));
 
-  const res = await fetch(`/api/books/search?${qs.toString()}`, {
+  const cacheKey = qs.toString();
+  const cached = clientSearchCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.data;
+  }
+
+  const res = await fetch(`/api/books/search?${cacheKey}`, {
     signal: params.signal,
   });
   if (!res.ok) {
@@ -55,7 +65,18 @@ export async function searchGlobalBooks(params: SearchBooksParams): Promise<Sear
     }
     throw new Error(msg);
   }
-  return (await res.json()) as SearchBooksResponse;
+  const data = (await res.json()) as SearchBooksResponse;
+  if (data.books && data.books.length > 0) {
+    if (clientSearchCache.size >= 80) {
+      const oldest = clientSearchCache.keys().next().value;
+      if (oldest !== undefined) clientSearchCache.delete(oldest);
+    }
+    clientSearchCache.set(cacheKey, {
+      data,
+      expiresAt: Date.now() + CLIENT_SEARCH_CACHE_TTL_MS,
+    });
+  }
+  return data;
 }
 
 export interface ResolvedArchiveBook {
@@ -307,22 +328,43 @@ export async function fetchExternalBookAsPdfBuffer(
     }
   }
 
-  // Path A: Stream genuine PDF directly through safe proxy
+  // Path A: Stream genuine PDF directly through safe proxy (with 35s timeout guard)
   if (pdfUrl) {
-    onStatus?.('Downloading PDF stream…');
-    const res = await fetch(`/api/books/proxy-pdf?url=${encodeURIComponent(pdfUrl)}`);
-    if (res.ok) {
+    onStatus?.(
+      book.source === 'arxiv'
+        ? 'Downloading open-access PDF from arXiv…'
+        : 'Downloading PDF stream…'
+    );
+    const pdfController = new AbortController();
+    const pdfTimer = window.setTimeout(() => pdfController.abort(), 35000);
+    let res: Response | null = null;
+    try {
+      res = await fetch(`/api/books/proxy-pdf?url=${encodeURIComponent(pdfUrl)}`, {
+        signal: pdfController.signal,
+      });
+    } catch {
+      res = null;
+    } finally {
+      window.clearTimeout(pdfTimer);
+    }
+
+    if (res && res.ok) {
       const buffer = await res.arrayBuffer();
       return { buffer, fileName };
     }
-    // If PDF wasn't open-downloadable (e.g. borrow-only) and we have a plain-text fallback, try text!
+
+    // If PDF wasn't open-downloadable or timed out and we have a plain-text fallback, seamlessly convert text!
     if (!textUrl) {
-      let msg = `Could not download PDF (${res.status}).`;
-      try {
-        const body = (await res.json()) as { error?: string };
-        if (body.error) msg = body.error;
-      } catch {
-        // ignore
+      let msg = res
+        ? `Could not download PDF (${res.status}).`
+        : 'PDF download timed out on this source. Try another edition or format.';
+      if (res) {
+        try {
+          const body = (await res.json()) as { error?: string };
+          if (body.error) msg = body.error;
+        } catch {
+          // ignore
+        }
       }
       throw new Error(msg);
     }
@@ -331,7 +373,16 @@ export async function fetchExternalBookAsPdfBuffer(
   // Path B: Fetch Project Gutenberg / Archive plain-text e-book & build a crisp cover-preserved PDF
   if (textUrl) {
     onStatus?.('Fetching full public-domain book text…');
-    const res = await fetch(`/api/books/fetch-text?url=${encodeURIComponent(textUrl)}`);
+    const txtController = new AbortController();
+    const txtTimer = window.setTimeout(() => txtController.abort(), 25000);
+    let res: Response;
+    try {
+      res = await fetch(`/api/books/fetch-text?url=${encodeURIComponent(textUrl)}`, {
+        signal: txtController.signal,
+      });
+    } finally {
+      window.clearTimeout(txtTimer);
+    }
     if (!res.ok) {
       let msg = `Could not download book text (${res.status}).`;
       try {
@@ -351,7 +402,7 @@ export async function fetchExternalBookAsPdfBuffer(
   }
 
   throw new Error(
-    'This Open Library catalog record is reference-only and does not include a free public-domain PDF or text file. Try a book marked PDF or EPUB / Text.'
+    'This edition could not be streamed directly right now. Try another edition of this book from the search results.'
   );
 }
 

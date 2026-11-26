@@ -34,22 +34,22 @@ export const TopBar: React.FC<TopBarProps> = ({
   ];
 
   return (
-    <header className="no-print sticky top-0 z-30 h-14 border-b border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#FAF9F5]/95 sepia:bg-[#F4ECD8]/95 dark:bg-[#0D0D0C]/95 backdrop-blur-sm">
-      <div className="h-full max-w-[1680px] mx-auto px-4 sm:px-6 flex items-center justify-between gap-4">
+    <header className="no-print sticky top-0 z-30 w-full border-b border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#FAF9F5]/95 sepia:bg-[#F4ECD8]/95 dark:bg-[#0D0D0C]/95 backdrop-blur-sm">
+      <div className="max-w-[1680px] mx-auto px-3 sm:px-6 h-12 md:h-14 flex items-center justify-between gap-2 sm:gap-4">
         {/* Zone 1: Brand Wordmark */}
         <button
           type="button"
           onClick={() => onSelectTab('discover')}
-          className="flex items-center gap-2.5 text-stone-900 sepia:text-[#2E241A] dark:text-stone-100 whitespace-nowrap shrink-0 focus:outline-none group cursor-pointer"
+          className="flex items-center gap-2 text-stone-900 sepia:text-[#2E241A] dark:text-stone-100 whitespace-nowrap shrink-0 focus:outline-none group cursor-pointer"
         >
           <BookOpen className="w-5 h-5 text-amber-700 dark:text-amber-500 transition-transform group-hover:scale-105" />
-          <span className="font-display text-lg font-semibold tracking-tight">
+          <span className="font-display text-base sm:text-lg font-semibold tracking-tight">
             BhashaBook
           </span>
         </button>
 
-        {/* Zone 2: Primary Navigation */}
-        <nav aria-label="Main navigation" className="flex items-center gap-1 sm:gap-6">
+        {/* Zone 2: Primary Navigation (Desktop inline) */}
+        <nav aria-label="Main navigation" className="hidden md:flex items-center gap-6">
           {navItems.map((item) => {
             const isActive = activeTab === item.id;
             return (
@@ -57,7 +57,7 @@ export const TopBar: React.FC<TopBarProps> = ({
                 key={item.id}
                 type="button"
                 onClick={() => onSelectTab(item.id)}
-                className={`relative h-14 px-2.5 sm:px-1 inline-flex items-center text-sm font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+                className={`relative h-14 px-1 inline-flex items-center text-sm font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
                   isActive
                     ? 'text-stone-950 dark:text-stone-50'
                     : 'text-stone-500 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-200'
@@ -85,13 +85,40 @@ export const TopBar: React.FC<TopBarProps> = ({
             type="button"
             disabled={isUploading}
             onClick={() => fileInputRef.current?.click()}
-            className="inline-flex items-center gap-2 h-9 px-3.5 rounded-md text-sm font-medium whitespace-nowrap shrink-0 bg-stone-900 text-stone-50 hover:bg-stone-800 dark:bg-stone-100 dark:text-stone-950 dark:hover:bg-stone-200 transition-colors disabled:opacity-50 cursor-pointer"
+            className="inline-flex items-center gap-1.5 sm:gap-2 h-8 md:h-9 px-2.5 sm:px-3.5 rounded-md text-xs sm:text-sm font-medium whitespace-nowrap shrink-0 bg-stone-900 text-stone-50 hover:bg-stone-800 dark:bg-stone-100 dark:text-stone-950 dark:hover:bg-stone-200 transition-colors disabled:opacity-50 cursor-pointer"
           >
-            <Upload className="w-4 h-4" />
+            <Upload className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
             <span>{isUploading ? 'Loading…' : 'Upload PDF'}</span>
           </button>
         </div>
       </div>
+
+      {/* Mobile Full-Width 4-Tab Navigation Row (< md, zero horizontal overflow) */}
+      <nav
+        aria-label="Mobile navigation"
+        className="md:hidden grid grid-cols-4 border-t border-stone-200/80 sepia:border-[#DFD4BC] dark:border-stone-800"
+      >
+        {navItems.map((item) => {
+          const isActive = activeTab === item.id;
+          return (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => onSelectTab(item.id)}
+              className={`relative h-10 px-1 inline-flex items-center justify-center text-xs font-medium truncate transition-colors cursor-pointer ${
+                isActive
+                  ? 'text-stone-950 dark:text-stone-50'
+                  : 'text-stone-500 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-200'
+              }`}
+            >
+              <span className="truncate">{item.label}</span>
+              {isActive && (
+                <span className="absolute bottom-0 left-1 right-1 h-[2px] bg-amber-700 dark:bg-amber-500" />
+              )}
+            </button>
+          );
+        })}
+      </nav>
     </header>
   );
 };

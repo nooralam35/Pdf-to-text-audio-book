@@ -33,6 +33,7 @@ export interface TranslatePageParams {
   preserveTerms: boolean;
   customTerms: string[];
   pageImageBase64?: string;
+  signal?: AbortSignal;
 }
 
 export async function translatePageBlocks(
@@ -47,6 +48,7 @@ export async function translatePageBlocks(
     preserveTerms,
     customTerms,
     pageImageBase64,
+    signal,
   } = params;
 
   const key = makeTranslationKey(bookId, targetLang, parsedPage.pageNumber);
@@ -112,21 +114,74 @@ export async function translatePageBlocks(
           customTerms,
         };
 
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
+  const timeoutMs = engine === 'ai' ? 45000 : 22000;
+  const maxAttempts = engine === 'free' ? 2 : 1;
+  let response: Response | null = null;
+  let lastError: Error | null = null;
 
-  if (!response.ok) {
-    let errMsg = `Translation request failed (${response.status})`;
-    try {
-      const errBody = (await response.json()) as { error?: string };
-      if (errBody.error) errMsg = errBody.error;
-    } catch {
-      // keep default message
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (signal?.aborted) {
+      throw new DOMException('Translation cancelled', 'AbortError');
     }
-    throw new Error(errMsg);
+    if (attempt > 0) {
+      await new Promise((r) => window.setTimeout(r, 650));
+      if (signal?.aborted) {
+        throw new DOMException('Translation cancelled', 'AbortError');
+      }
+    }
+
+    const reqController = new AbortController();
+    let timedOut = false;
+    const onCallerAbort = () => reqController.abort();
+    if (signal) {
+      signal.addEventListener('abort', onCallerAbort, { once: true });
+    }
+    const timer = window.setTimeout(() => {
+      timedOut = true;
+      reqController.abort();
+    }, timeoutMs);
+
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: reqController.signal,
+      });
+
+      if (res.ok) {
+        response = res;
+        break;
+      }
+
+      let errMsg = `Translation request failed (${res.status})`;
+      try {
+        const errBody = (await res.json()) as { error?: string };
+        if (errBody.error) errMsg = errBody.error;
+      } catch {
+        // keep default message
+      }
+      lastError = new Error(errMsg);
+      if (res.status < 500 && res.status !== 429) {
+        throw lastError;
+      }
+    } catch (err) {
+      if (signal?.aborted) {
+        throw err;
+      }
+      if (timedOut) {
+        lastError = new Error('Translation took too long. Please tap Retry.');
+      } else {
+        lastError = err instanceof Error ? err : new Error('Network error during translation.');
+      }
+    } finally {
+      window.clearTimeout(timer);
+      signal?.removeEventListener('abort', onCallerAbort);
+    }
+  }
+
+  if (!response) {
+    throw lastError ?? new Error('Translation failed. Please try again.');
   }
 
   const data = (await response.json()) as {

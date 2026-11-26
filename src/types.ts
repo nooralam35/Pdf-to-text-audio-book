@@ -145,7 +145,7 @@ export interface StoredBook {
   externalUrl?: string;
 }
 
-export type BookSearchSource = 'internet_archive' | 'open_library' | 'gutenberg';
+export type BookSearchSource = 'internet_archive' | 'open_library' | 'gutenberg' | 'arxiv';
 
 export type BookCategory =
   | 'all'
@@ -158,7 +158,7 @@ export type BookCategory =
 
 export type BookFormatFilter = 'all' | 'pdf' | 'text' | 'online';
 
-export type BookSortBy = 'downloads' | 'rating' | 'latest';
+export type BookSortBy = 'relevance' | 'downloads' | 'rating' | 'latest' | 'oldest';
 
 export interface DiscoveredBook {
   id: string;

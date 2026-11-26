@@ -57,6 +57,7 @@ interface TranslatedReaderPaneProps {
   onReachPageEnd: () => void;
   onGoToNextPage: () => void;
   onTranslatePage: (force?: boolean) => void;
+  onCancelTranslation?: () => void;
   onTranslateChapter: (chapter: ChapterItem) => void;
   onUpdateBlockText: (blockId: string, newText: string) => void;
   onUpdateHighlights: (highlights: TextHighlight[]) => void;
@@ -218,6 +219,7 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
   onReachPageEnd,
   onGoToNextPage,
   onTranslatePage,
+  onCancelTranslation,
   onTranslateChapter,
   onUpdateBlockText,
   onUpdateHighlights,
@@ -845,9 +847,9 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
   };
 
   return (
-    <section className="flex flex-col h-full bg-[#FAF9F5] sepia:bg-[#F4ECD8] dark:bg-[#0D0D0C] min-w-0">
+    <section className="flex flex-col h-full bg-[#FAF9F5] sepia:bg-[#F4ECD8] dark:bg-[#0D0D0C] min-w-0 max-w-full overflow-hidden">
       {/* Pane Sub-Header */}
-      <div className="px-4 h-11 border-b border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#FAF9F5] sepia:bg-[#EFE5CE] dark:bg-[#141312] flex items-center justify-between gap-3 shrink-0">
+      <div className="px-3 sm:px-4 h-11 border-b border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#FAF9F5] sepia:bg-[#EFE5CE] dark:bg-[#141312] flex items-center justify-between gap-2 sm:gap-3 shrink-0 min-w-0">
         <div className="flex items-center gap-2 min-w-0">
           <span className="text-xs font-semibold uppercase tracking-wider text-stone-500 dark:text-stone-400 whitespace-nowrap">
             {langOption.name} Edition
@@ -959,7 +961,7 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
         ref={scrollContainerRef}
         onMouseUp={handleTextSelectionEnd}
         onTouchEnd={handleTextSelectionEnd}
-        className="relative flex-1 overflow-y-auto px-5 sm:px-9 py-6 sm:py-8"
+        className="relative flex-1 overflow-y-auto overflow-x-hidden px-4 sm:px-9 py-5 sm:py-8"
       >
         {/* Floating Selection Highlight / Note / Dictionary Popover */}
         {popover && (
@@ -1263,25 +1265,47 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
           {translationError && (
             <div
               dir="ltr"
-              className="mb-6 p-4 rounded-md border border-red-200 dark:border-red-900/60 bg-red-50/70 dark:bg-red-950/30 text-sm text-red-800 dark:text-red-300"
+              className="mb-6 p-4 rounded-md border border-red-200 dark:border-red-900/60 bg-red-50/70 dark:bg-red-950/30 text-sm text-red-800 dark:text-red-300 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
             >
-              <p className="font-medium">Translation could not complete</p>
-              <p className="mt-1 text-xs opacity-90">{translationError}</p>
+              <div className="min-w-0">
+                <p className="font-medium">Translation could not complete</p>
+                <p className="mt-1 text-xs opacity-90 break-words">{translationError}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => onTranslatePage(true)}
+                className="inline-flex items-center justify-center gap-1.5 h-8 px-3 rounded text-xs font-medium bg-red-700 hover:bg-red-800 text-white shrink-0 cursor-pointer self-start sm:self-center"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>Retry</span>
+              </button>
             </div>
           )}
 
           {/* Loading State */}
           {isTranslating && (
-            <div dir="ltr" className="py-12 space-y-4">
-              <div className="flex items-center gap-2.5 text-sm font-medium text-stone-700 dark:text-stone-300">
-                <RefreshCw className="w-4 h-4 animate-spin text-amber-700 dark:text-amber-500" />
-                <span>
-                  Translating Page {pageNumber} into {langOption.name}
-                  {engine === 'ai' ? ' (analyzing layout & diagrams)…' : '…'}
-                </span>
+            <div dir="ltr" className="py-10 sm:py-12 space-y-4 w-full max-w-full overflow-hidden">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2.5 text-sm font-medium text-stone-700 dark:text-stone-300 min-w-0">
+                  <RefreshCw className="w-4 h-4 animate-spin text-amber-700 dark:text-amber-500 shrink-0" />
+                  <span className="truncate">
+                    Translating Page {pageNumber} into {langOption.name}
+                    {engine === 'ai' ? ' (analyzing layout & diagrams)…' : '…'}
+                  </span>
+                </div>
+                {onCancelTranslation && (
+                  <button
+                    type="button"
+                    onClick={onCancelTranslation}
+                    className="inline-flex items-center gap-1 h-7 px-2.5 rounded border border-stone-300 dark:border-stone-700 text-xs font-medium text-stone-600 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer shrink-0"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                    <span>Cancel</span>
+                  </button>
+                )}
               </div>
-              <div className="space-y-2.5 animate-pulse">
-                <div className="h-5 w-2/3 rounded bg-stone-200 dark:bg-stone-800" />
+              <div className="space-y-2.5 animate-pulse w-full">
+                <div className="h-5 w-2/3 max-w-full rounded bg-stone-200 dark:bg-stone-800" />
                 <div className="h-3.5 w-full rounded bg-stone-200/80 dark:bg-stone-800/80" />
                 <div className="h-3.5 w-11/12 rounded bg-stone-200/80 dark:bg-stone-800/80" />
                 <div className="h-3.5 w-4/5 rounded bg-stone-200/80 dark:bg-stone-800/80" />

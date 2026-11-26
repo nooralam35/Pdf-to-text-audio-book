@@ -206,6 +206,7 @@ export default function App() {
   const [batchProgress, setBatchProgress] = useState<BatchTranslationProgress | null>(null);
   const batchCancelRef = useRef(false);
   const batchAbortRef = useRef<AbortController | null>(null);
+  const pageTranslateAbortRef = useRef<AbortController | null>(null);
 
   // Deduplicated Background Auto-Translate & Auto-Save Tracking
   const inFlightTranslationsRef = useRef<Map<string, Promise<TranslatedPageRecord>>>(new Map());
@@ -446,32 +447,57 @@ export default function App() {
     [syncUpdatedBookInState]
   );
 
-  // Boot: check server capabilities + load IndexedDB library or preload attached OBS Superuser Guidebook
+  // Boot: non-blocking IndexedDB load first so Discover & Library render immediately, then preload sample guidebook in background
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const caps = await checkServerCapabilities().catch(() => ({ aiAvailable: false }));
-        if (!cancelled) setAiAvailable(caps.aiAvailable);
+        checkServerCapabilities()
+          .then((caps) => {
+            if (!cancelled) setAiAvailable(caps.aiAvailable);
+          })
+          .catch(() => {});
 
         const existingBooks = await listBooks();
-        let obsBook = await getBook(PRELOADED_OBS_BOOK_ID);
-        let openedDuringBoot = false;
+        if (!cancelled) {
+          setBooks(existingBooks);
+          setIsInitializing(false);
+          refreshLibraryCounts(existingBooks, targetLang).catch(() => {});
+        }
 
-        if (!obsBook && (typeof navigator === 'undefined' || navigator.onLine !== false)) {
+        const existingObs = existingBooks.find((b) => b.id === PRELOADED_OBS_BOOK_ID);
+        if (existingObs) {
+          if (!cancelled) {
+            await openStoredBook(existingObs).catch(() => {});
+          }
+          return;
+        }
+
+        if (existingBooks.length > 0) {
+          if (!cancelled) {
+            await openStoredBook(existingBooks[0]).catch(() => {});
+          }
+          return;
+        }
+
+        // First-ever visit with empty library: preload sample guidebook in the background without blocking Discover UI
+        if (typeof navigator === 'undefined' || navigator.onLine !== false) {
           try {
             const pdf = await loadPdfFromUrl(PRELOADED_OBS_BOOK_URL);
+            if (cancelled) {
+              pdf.cleanup().catch(() => {});
+              return;
+            }
             const [{ chapters, detectedTitle, detectedAuthor }, coverRes, p1] = await Promise.all([
               detectChapters(pdf),
               renderPageToDataUrl(pdf, 1, 1.35, 'image/jpeg', 0.88),
               pdf.getPage(1),
             ]);
             const vp1 = p1.getViewport({ scale: 1.0 });
-            // Start at Chapter 1 so user immediately sees rich illustrated technical content
             const ch1 = chapters.find((c) => c.index === 1) ?? chapters[0];
             const initialPage = ch1 ? ch1.startPage : 1;
 
-            obsBook = {
+            const obsBook: StoredBook = {
               id: PRELOADED_OBS_BOOK_ID,
               title: detectedTitle || 'The OBS Superuser Guidebook',
               author: detectedAuthor || 'Paul Richards',
@@ -486,7 +512,6 @@ export default function App() {
               pageHeight: vp1.height,
             };
             await saveBook(obsBook);
-            // Automatically cache the preloaded guidebook in Service Worker Cache Storage + IndexedDB
             cacheBookForOffline(obsBook)
               .then((cachedObs) => {
                 if (!cancelled) {
@@ -499,32 +524,22 @@ export default function App() {
                 }
               })
               .catch(() => {});
+            const updatedList = await listBooks();
             if (!cancelled) {
-              setLoadedPdf(pdf);
-              setActiveBook(obsBook);
-              setCurrentPage(initialPage);
-              openedDuringBoot = true;
+              setBooks(updatedList);
+              refreshLibraryCounts(updatedList, targetLang).catch(() => {});
+              // Only attach as active book if user hasn't already opened another book
+              if (!activeBookIdRef.current) {
+                setLoadedPdf(pdf);
+                setActiveBook(obsBook);
+                setCurrentPage(initialPage);
+              } else {
+                pdf.cleanup().catch(() => {});
+              }
             }
-          } catch (err) {
-            if (!cancelled) {
-              setAppBanner(
-                err instanceof Error
-                  ? `Could not preload sample guidebook: ${err.message}`
-                  : 'Upload any PDF to begin translating.'
-              );
-            }
+          } catch {
+            // Non-fatal: user can browse Discover or upload any local PDF directly
           }
-        }
-
-        const updatedList = await listBooks();
-        if (!cancelled) {
-          setBooks(updatedList);
-          await refreshLibraryCounts(updatedList, targetLang);
-        }
-
-        const toOpen = obsBook ?? existingBooks[0];
-        if (toOpen && !openedDuringBoot && !cancelled) {
-          await openStoredBook(toOpen).catch(() => {});
         }
       } finally {
         if (!cancelled) setIsInitializing(false);
@@ -568,6 +583,10 @@ export default function App() {
     if (!activeBookId || !loadedPdf) return;
     let cancelled = false;
 
+    // Abort any stale single-page translation from the previous page/language so the spinner never gets stuck
+    pageTranslateAbortRef.current?.abort();
+    pageTranslateAbortRef.current = null;
+    setIsTranslatingPage(false);
     setTranslationError(null);
     updateBookProgress(activeBookId, {
       lastPage: currentPage,
@@ -1115,7 +1134,8 @@ export default function App() {
       pdf: LoadedPdf,
       pageNum: number,
       lang: LanguageCode,
-      force = false
+      force = false,
+      signal?: AbortSignal
     ): Promise<TranslatedPageRecord> => {
       const key = makeTranslationKey(book.id, lang, pageNum);
 
@@ -1154,6 +1174,7 @@ export default function App() {
           preserveTerms,
           customTerms,
           pageImageBase64,
+          signal,
         });
 
         await saveTranslation(record);
@@ -1219,10 +1240,20 @@ export default function App() {
     []
   );
 
-  // Translate currently visible page
+  const handleCancelPageTranslation = useCallback(() => {
+    pageTranslateAbortRef.current?.abort();
+    pageTranslateAbortRef.current = null;
+    setIsTranslatingPage(false);
+  }, []);
+
+  // Translate currently visible page (with AbortController safeguard so it never hangs)
   const handleTranslateCurrentPage = useCallback(
     async (force = false) => {
       if (!activeBook || !loadedPdf) return;
+      pageTranslateAbortRef.current?.abort();
+      const controller = new AbortController();
+      pageTranslateAbortRef.current = controller;
+
       setIsTranslatingPage(true);
       setTranslationError(null);
       try {
@@ -1231,13 +1262,25 @@ export default function App() {
           loadedPdf,
           currentPage,
           targetLang,
-          force
+          force,
+          controller.signal
         );
-        commitSavedTranslationToState(record);
+        if (!controller.signal.aborted) {
+          commitSavedTranslationToState(record);
+        }
       } catch (err) {
+        if (
+          controller.signal.aborted ||
+          (err instanceof DOMException && err.name === 'AbortError')
+        ) {
+          return;
+        }
         setTranslationError(err instanceof Error ? err.message : 'Translation failed.');
       } finally {
-        setIsTranslatingPage(false);
+        if (pageTranslateAbortRef.current === controller) {
+          pageTranslateAbortRef.current = null;
+          setIsTranslatingPage(false);
+        }
       }
     },
     [
@@ -1559,8 +1602,8 @@ export default function App() {
             return false;
           };
 
-          // Steady wave size (4 pages) with gentle pacing avoids 429 bursts and runs smoothly to 100%
-          const WAVE_SIZE = 4;
+          // Fast 6-page wave size with short pacing runs smoothly and rapidly across large books
+          const WAVE_SIZE = 6;
           const deferredFailed: ParsedPage[] = [];
 
           for (let offset = 0; offset < missingPages.length; offset += WAVE_SIZE) {
@@ -1632,7 +1675,7 @@ export default function App() {
 
             // Gentle breather between waves keeps free translation endpoints happy for 200+ consecutive pages
             if (offset + WAVE_SIZE < missingPages.length && !batchCancelRef.current) {
-              await waitWithCancel(260);
+              await waitWithCancel(120);
             }
           }
 
@@ -2176,7 +2219,7 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen flex flex-col bg-[#FAF9F5] sepia:bg-[#F4ECD8] dark:bg-[#090908] text-stone-900 sepia:text-[#3B2F23] dark:text-stone-100">
+    <div className="min-h-screen w-full max-w-full overflow-x-hidden flex flex-col bg-[#FAF9F5] sepia:bg-[#F4ECD8] dark:bg-[#090908] text-stone-900 sepia:text-[#3B2F23] dark:text-stone-100">
       {/* Top 3-Zone Navigation Bar */}
       <TopBar
         activeTab={activeTab}
@@ -2212,10 +2255,10 @@ export default function App() {
 
       {/* Reader Workspace Utility Bar */}
       {activeTab === 'reader' && (
-        <div className="no-print border-b border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#F5F3EE] sepia:bg-[#ECE2CA] dark:bg-[#141312]">
-          <div className="max-w-[1680px] mx-auto px-3 sm:px-6 py-2 flex flex-wrap items-center justify-between gap-2.5">
+        <div className="no-print w-full border-b border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#F5F3EE] sepia:bg-[#ECE2CA] dark:bg-[#141312]">
+          <div className="w-full max-w-[1680px] mx-auto px-2.5 sm:px-6 py-2 flex flex-wrap items-center justify-between gap-2">
             {/* Left controls: Sidebar toggle + Language + Engine */}
-            <div className="flex flex-wrap items-center gap-2">
+            <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 min-w-0 max-w-full">
               <button
                 type="button"
                 onClick={() => {
@@ -2226,20 +2269,20 @@ export default function App() {
                   }
                 }}
                 aria-label="Toggle chapters panel"
-                className="inline-flex items-center gap-1.5 h-8 px-2.5 rounded border border-stone-300 dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] text-xs font-medium text-stone-700 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer whitespace-nowrap"
+                className="inline-flex items-center gap-1.5 h-8 px-2 sm:px-2.5 rounded border border-stone-300 dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] text-xs font-medium text-stone-700 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer whitespace-nowrap shrink-0"
               >
                 <PanelLeft className="w-3.5 h-3.5" />
                 <span className="hidden sm:inline">Chapters</span>
               </button>
 
               {/* Target Language Selector */}
-              <div className="inline-flex items-center gap-1.5">
-                <Languages className="w-3.5 h-3.5 text-amber-700 dark:text-amber-500 hidden sm:block" />
+              <div className="inline-flex items-center gap-1.5 min-w-0">
+                <Languages className="w-3.5 h-3.5 text-amber-700 dark:text-amber-500 hidden sm:block shrink-0" />
                 <select
                   aria-label="Target translation language"
                   value={targetLang}
                   onChange={(e) => setTargetLang(e.target.value as LanguageCode)}
-                  className="h-8 px-2.5 rounded border border-stone-300 dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] text-xs font-medium text-stone-900 dark:text-stone-100 focus:outline-none focus:border-amber-700 cursor-pointer"
+                  className="h-8 max-w-[136px] sm:max-w-none px-2 sm:px-2.5 rounded border border-stone-300 dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] text-xs font-medium text-stone-900 dark:text-stone-100 focus:outline-none focus:border-amber-700 cursor-pointer truncate"
                 >
                   {LANGUAGES.map((l) => (
                     <option key={l.code} value={l.code}>
@@ -2250,11 +2293,11 @@ export default function App() {
               </div>
 
               {/* Engine Selector (Free Open Default + Optional Smart AI) */}
-              <div className="inline-flex rounded border border-stone-300 dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] p-0.5">
+              <div className="inline-flex rounded border border-stone-300 dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] p-0.5 shrink-0">
                 <button
                   type="button"
                   onClick={() => setEngine('free')}
-                  className={`h-7 px-2.5 rounded-sm text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                  className={`h-7 px-2 sm:px-2.5 rounded-sm text-[11px] sm:text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
                     engine === 'free'
                       ? 'bg-stone-900 text-stone-50 dark:bg-stone-100 dark:text-stone-950'
                       : 'text-stone-600 dark:text-stone-300 hover:text-stone-900 dark:hover:text-stone-100'
@@ -2270,7 +2313,7 @@ export default function App() {
                       ? 'Uses Gemini AI to explain diagrams/screenshots and refine audiobook flow'
                       : 'Requires GEMINI_API_KEY in Settings > Secrets'
                   }
-                  className={`inline-flex items-center gap-1 h-7 px-2.5 rounded-sm text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                  className={`inline-flex items-center gap-1 h-7 px-2 sm:px-2.5 rounded-sm text-[11px] sm:text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
                     engine === 'ai'
                       ? 'bg-amber-700 text-white'
                       : 'text-stone-600 dark:text-stone-300 hover:text-stone-900 dark:hover:text-stone-100'
@@ -2316,7 +2359,7 @@ export default function App() {
                 </button>
 
                 {showGlossaryPopover && (
-                  <div className="absolute left-0 top-10 z-40 w-80 p-4 rounded-lg border border-stone-200 dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1C1B19] shadow-lg space-y-3.5">
+                  <div className="fixed sm:absolute left-3 right-3 sm:left-0 sm:right-auto top-28 sm:top-10 z-40 sm:w-80 max-w-[calc(100vw-24px)] max-h-[75vh] overflow-y-auto p-4 rounded-lg border border-stone-200 dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1C1B19] shadow-lg space-y-3.5">
                     <div className="flex items-center justify-between">
                       <span className="text-xs font-semibold text-stone-900 dark:text-stone-100">
                         Reading &amp; Translation Preferences
@@ -2473,7 +2516,7 @@ export default function App() {
             </div>
 
             {/* Right controls: Save Book Bookmark + Page Bookmark + Fast Full-PDF Converter + Quick Translate + Theme cycle */}
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 max-w-full">
               {activeBook && (
                 <>
                   <button
@@ -2592,7 +2635,7 @@ export default function App() {
           </div>
 
           {/* Mobile Single-Column Tabs (< lg) */}
-          <div className="lg:hidden grid grid-cols-3 border-t border-stone-200 dark:border-stone-800 bg-[#FAF9F5] dark:bg-[#181715]">
+          <div className="lg:hidden w-full grid grid-cols-3 border-t border-stone-200 dark:border-stone-800 bg-[#FAF9F5] dark:bg-[#181715]">
             {[
               { id: 'pdf' as const, label: 'Original PDF' },
               { id: 'translated' as const, label: `${langOption.name} Reader` },
@@ -2602,7 +2645,7 @@ export default function App() {
                 key={tab.id}
                 type="button"
                 onClick={() => setMobilePane(tab.id)}
-                className={`h-10 text-xs font-medium border-b-2 transition-colors cursor-pointer ${
+                className={`h-10 px-1 text-xs font-medium border-b-2 truncate transition-colors cursor-pointer ${
                   mobilePane === tab.id
                     ? 'border-amber-700 dark:border-amber-500 text-stone-950 dark:text-stone-50'
                     : 'border-transparent text-stone-500 dark:text-stone-400'
@@ -2724,7 +2767,7 @@ export default function App() {
           </div>
         ) : (
           /* Split-Screen Desktop / Tabbed Mobile Reader */
-          <div className="flex-1 flex min-h-0 h-[calc(100vh-160px)]">
+          <div className="flex-1 flex min-h-0 min-h-[calc(100dvh-190px)] lg:h-[calc(100vh-160px)] w-full max-w-full">
             {/* Desktop Collapsible Chapters & Bookmarks Sidebar */}
             {sidebarOpen && (
               <div className="hidden lg:block w-[272px] shrink-0 h-full overflow-hidden">
@@ -2844,6 +2887,7 @@ export default function App() {
                   onReachPageEnd={handleReachPageEnd}
                   onGoToNextPage={handleGoToNextPage}
                   onTranslatePage={handleTranslateCurrentPage}
+                  onCancelTranslation={handleCancelPageTranslation}
                   onTranslateChapter={handleTranslateChapter}
                   onUpdateBlockText={handleUpdateBlockText}
                   onUpdateHighlights={handleUpdatePageHighlights}

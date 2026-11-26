@@ -67,6 +67,7 @@ function formatCompactCount(n?: number): string | null {
 function sourceDisplayName(source: DiscoveredBook['source']): string {
   if (source === 'internet_archive') return 'Internet Archive';
   if (source === 'open_library') return 'Open Library';
+  if (source === 'arxiv') return 'arXiv Open PDF';
   return 'Project Gutenberg';
 }
 
@@ -151,6 +152,7 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
     internetArchive: 0,
     openLibrary: 0,
     gutenberg: 0,
+    arxiv: 0,
   });
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -214,7 +216,12 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
         });
         if (!controller.signal.aborted) {
           setBooks(res.books);
-          setSourceCounts(res.sources);
+          setSourceCounts({
+            internetArchive: res.sources.internetArchive ?? 0,
+            openLibrary: res.sources.openLibrary ?? 0,
+            gutenberg: res.sources.gutenberg ?? 0,
+            arxiv: res.sources.arxiv ?? 0,
+          });
         }
       } catch (err) {
         if (err instanceof DOMException && err.name === 'AbortError') return;
@@ -279,8 +286,14 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
 
   const handleSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    const trimmed = queryInput.trim();
     setPage(1);
-    setActiveQuery(queryInput.trim());
+    setActiveQuery(trimmed);
+    if (trimmed) {
+      setSort('relevance');
+    } else if (sort === 'relevance') {
+      setSort('downloads');
+    }
   };
 
   const quickQueries = [
@@ -301,15 +314,15 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
         <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
           <div className="max-w-2xl">
             <p className="text-xs uppercase tracking-widest text-stone-500 dark:text-stone-400">
-              Internet Archive · Open Library · Project Gutenberg
+              Internet Archive · Open Library · Project Gutenberg · arXiv
             </p>
             <h1 className="mt-2 font-display text-3xl sm:text-4xl font-semibold tracking-tight text-stone-950 sepia:text-[#2E241A] dark:text-stone-50">
               Global E-Book &amp; PDF Discovery Hub
             </h1>
             <p className="mt-2 text-sm sm:text-[15px] text-stone-600 sepia:text-[#574838] dark:text-stone-400 leading-relaxed">
-              Search millions of free public-domain PDFs and classic e-books across open libraries.
-              Open any title directly in the bilingual translator, listen with synchronized narration,
-              or export a cover-preserved {targetLangOption.name} PDF.
+              Search classics from centuries ago to the latest open-access PDFs across 4 global
+              libraries. Every result opens directly for online reading, {targetLangOption.name}{' '}
+              translation, audiobook narration, bookmarking, and instant PDF download.
             </p>
           </div>
 
@@ -358,6 +371,7 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
                 onClick={() => {
                   setQueryInput('');
                   setActiveQuery('');
+                  if (sort === 'relevance') setSort('downloads');
                   setPage(1);
                 }}
                 aria-label="Clear search query"
@@ -387,6 +401,7 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
                 onClick={() => {
                   setQueryInput(term);
                   setActiveQuery(term);
+                  setSort('relevance');
                   setPage(1);
                 }}
                 className="text-stone-700 dark:text-stone-300 hover:text-amber-800 dark:hover:text-amber-400 underline-offset-4 hover:underline cursor-pointer whitespace-nowrap"
@@ -493,16 +508,20 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
               }}
               className="h-9 px-3 rounded-md border border-stone-300 sepia:border-[#D4C7AA] dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#191816] text-xs font-medium text-stone-800 dark:text-stone-200 focus:outline-none focus:border-amber-700 cursor-pointer"
             >
+              <option value="relevance">Sort: Best Match</option>
               <option value="downloads">Sort: Most Downloaded</option>
-              <option value="rating">Sort: Top Rated</option>
               <option value="latest">Sort: Latest Published</option>
+              <option value="oldest">Sort: Oldest Classics</option>
+              <option value="rating">Sort: Top Rated</option>
             </select>
           </div>
 
           <div className="text-xs text-stone-500 dark:text-stone-400 font-mono-num">
             {isLoading
-              ? 'Querying public repositories…'
-              : `${books.length} results · Archive ${sourceCounts.internetArchive} · Open Library ${sourceCounts.openLibrary} · Gutenberg ${sourceCounts.gutenberg}`}
+              ? 'Searching global libraries…'
+              : `${books.length} results · Archive ${sourceCounts.internetArchive} · Open Library ${sourceCounts.openLibrary} · Gutenberg ${sourceCounts.gutenberg}${
+                  sourceCounts.arxiv > 0 ? ` · arXiv ${sourceCounts.arxiv}` : ''
+                }`}
           </div>
         </div>
       </section>
