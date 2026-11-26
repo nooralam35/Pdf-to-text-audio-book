@@ -873,9 +873,8 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     signal?: AbortSignal,
     sentenceKind: SentenceProsodyKind = 'narration'
   ): Promise<{ url: string; source: 'ai' | 'free' }> => {
-    const useAi = aiAvailableRef.current;
     const stylePref = voiceStylePrefRef.current;
-    const cacheKey = `v3-neural::${lang}::${useAi ? `${stylePref}::${voiceProfileId}::${sentenceKind}` : 'free'}::${text}`;
+    const cacheKey = `v5-teacher-tts::${lang}::${stylePref}::${voiceProfileId}::${sentenceKind}::${text}`;
     const existing = objectUrlCacheRef.current.get(cacheKey);
     if (existing) return existing;
 
@@ -890,8 +889,8 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
       }
 
       if (!isCurrentlyOnline()) {
-        // Also check alternate free/AI key in persistent Cache Storage before falling back to local device voice
-        const fallbackKey = `v3-neural::${lang}::free::${text}`;
+        // Also check alternate fallback key in persistent Cache Storage before falling back to local device voice
+        const fallbackKey = `v5-teacher-tts::${lang}::free::${text}`;
         if (fallbackKey !== cacheKey) {
           const fallbackCached = await getCachedTtsAudioBlob(fallbackKey);
           if (fallbackCached) {
@@ -904,33 +903,32 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
         throw new Error('OFFLINE_UNCACHED');
       }
 
-      // 2. Online expressive Neural TTS synthesis + persistent offline caching
-      if (useAi) {
-        try {
-          const profile = getAiVoiceProfile(voiceProfileId);
-          const prefOption = getVoiceStylePreferenceOption(stylePref);
-          const langName = getLanguageOption(lang).name;
-          const res = await synthesizePageAudio({
-            text,
-            voiceName: profile.voiceName,
-            voiceStyle: `${prefOption.styleDirective}. ${profile.style}`,
-            languageName: langName,
-            targetLang: lang,
-            sentenceKind,
-            modelTier: profile.modelTier,
-            signal,
-          });
-          const clipSource: 'ai' | 'free' = res.ext === 'wav' ? 'ai' : 'free';
-          putCachedTtsAudioBlob(cacheKey, res.blob, clipSource).catch(() => {});
-          const url = URL.createObjectURL(res.blob);
-          return { url, source: clipSource };
-        } catch (err) {
-          if (err instanceof DOMException && err.name === 'AbortError') throw err;
-          // Fall back to Free MP3 if Studio Neural TTS is unavailable
-        }
+      // 2. Always invoke /api/tts first when online so Gemini 3.8 Neural Teacher TTS runs even before /api/health resolves
+      try {
+        const profile = getAiVoiceProfile(voiceProfileId);
+        const prefOption = getVoiceStylePreferenceOption(stylePref);
+        const langName = getLanguageOption(lang).name;
+        const res = await synthesizePageAudio({
+          text,
+          voiceName: profile.voiceName,
+          voiceStyle: `${prefOption.styleDirective}. ${profile.style}`,
+          languageName: langName,
+          targetLang: lang,
+          sentenceKind,
+          modelTier: profile.modelTier,
+          signal,
+        });
+        const clipSource: 'ai' | 'free' = res.ext === 'wav' ? 'ai' : 'free';
+        putCachedTtsAudioBlob(cacheKey, res.blob, clipSource).catch(() => {});
+        const url = URL.createObjectURL(res.blob);
+        return { url, source: clipSource };
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') throw err;
+        // Fall back to Free MP3 only if /api/tts completely failed
       }
+
       const blob = await fetchFreeTtsBlob(text, lang, signal);
-      putCachedTtsAudioBlob(cacheKey, blob, 'free').catch(() => {});
+      putCachedTtsAudioBlob(`v5-teacher-tts::${lang}::free::${text}`, blob, 'free').catch(() => {});
       return { url: URL.createObjectURL(blob), source: 'free' };
     };
 
@@ -1358,18 +1356,23 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     }
   }, [jumpRequest]);
 
+  const SILENT_UNLOCK_DATA_URI =
+    'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=';
+
   const unlockAudioElement = () => {
     getKeepAlive().unlock();
     const audio = audioRef.current;
     pitchShifterRef.current?.resume().catch(() => {});
     if (!audio || audioUnlockedRef.current) return;
     try {
-      audio.src =
-        'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=';
+      audio.src = SILENT_UNLOCK_DATA_URI;
       const p = audio.play();
       if (p && typeof p.then === 'function') {
         p.then(() => {
-          audio.pause();
+          // Only pause if real TTS audio hasn't already replaced the silent unlock URI
+          if (audio.src === SILENT_UNLOCK_DATA_URI) {
+            audio.pause();
+          }
           audioUnlockedRef.current = true;
         }).catch(() => {});
       }
@@ -1539,6 +1542,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
   };
 
   const handleVoiceProfileChange = (nextProfileId: AiVoiceProfileId) => {
+    unlockAudioElement();
     stopNeuralPreview();
     setAiVoiceProfileId(nextProfileId);
     aiVoiceProfileIdRef.current = nextProfileId;
@@ -1562,20 +1566,11 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
       return;
     }
 
-    if (aiAvailableRef.current) {
-      // With Neural AI voices active, re-synthesize current sentence in the newly chosen voice
-      if (wasPlaying && activeSentenceIndex !== null) {
-        speakFromIndex(activeSentenceIndex);
-      } else {
-        pausedInPlaceRef.current = false;
-      }
-    } else if (audioRef.current) {
-      // With Free HD voice active, immediately update acoustic timbre profile on the live audio element
-      const { effectiveRate, effectivePitch } = computeEffectiveTone('free');
-      audioRef.current.preservesPitch = true;
-      audioRef.current.playbackRate = effectiveRate;
-      const shifter = getPitchShifter();
-      shifter?.setPitch(effectivePitch);
+    // Re-synthesize current sentence immediately in the newly chosen Neural voice
+    if (wasPlaying && activeSentenceIndex !== null) {
+      speakFromIndex(activeSentenceIndex);
+    } else {
+      pausedInPlaceRef.current = false;
     }
   };
 
@@ -1593,6 +1588,27 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     stopNeuralPreview();
     if (isSpeaking) {
       stopPlayback(false);
+    }
+
+    // Synchronously create & unlock preview Audio element INSIDE the click gesture so mobile Safari/Chrome allow playback after async fetch
+    const el = previewAudioRef.current ?? new Audio();
+    el.setAttribute('playsinline', 'true');
+    el.setAttribute('webkit-playsinline', 'true');
+    previewAudioRef.current = el;
+    try {
+      el.src = SILENT_UNLOCK_DATA_URI;
+      const unlockP = el.play();
+      if (unlockP && typeof unlockP.then === 'function') {
+        unlockP
+          .then(() => {
+            if (el.src === SILENT_UNLOCK_DATA_URI) {
+              el.pause();
+            }
+          })
+          .catch(() => {});
+      }
+    } catch {
+      // ignore unlock errors
     }
 
     const profile = getAiVoiceProfile(profileId);
@@ -1618,8 +1634,6 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
       );
       if (controller.signal.aborted) return;
 
-      const el = previewAudioRef.current ?? new Audio();
-      previewAudioRef.current = el;
       el.onended = () => setPreviewingNeuralId(null);
       el.onerror = () => setPreviewingNeuralId(null);
       el.src = url;
@@ -2520,7 +2534,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
               <div
                 role="listbox"
                 aria-label="Neural TTS voice options"
-                className="absolute bottom-full left-0 mb-2 z-50 w-80 sm:w-[340px] rounded-lg border border-stone-200 sepia:border-[#D4C7AA] dark:border-stone-700 bg-[#FAF9F5] sepia:bg-[#FBF6E9] dark:bg-[#191816] shadow-2xl overflow-hidden"
+                className="fixed sm:absolute bottom-24 sm:bottom-full left-3 right-3 sm:left-0 sm:right-auto sm:mb-2 z-50 sm:w-[356px] max-w-[calc(100vw-24px)] rounded-lg border border-stone-200 sepia:border-[#D4C7AA] dark:border-stone-700 bg-[#FAF9F5] sepia:bg-[#FBF6E9] dark:bg-[#191816] shadow-2xl overflow-hidden"
               >
                 {/* Header & Style Filter Tabs */}
                 <div className="px-3.5 py-2.5 border-b border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 space-y-2">
@@ -2528,8 +2542,8 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
                     <span className="text-[11px] font-semibold uppercase tracking-wider text-stone-700 sepia:text-[#3B2F23] dark:text-stone-200">
                       Neural TTS Voices
                     </span>
-                    <span className="text-[10px] font-mono-num text-stone-500 dark:text-stone-400">
-                      {aiAvailable ? 'Studio Neural WAV' : 'HD Neural Audio'}
+                    <span className="text-[10px] font-mono-num text-amber-800 dark:text-amber-400">
+                      {aiAvailable ? 'Gemini 3.8 Neural · Teacher' : 'Neural HD Audio'}
                     </span>
                   </div>
 

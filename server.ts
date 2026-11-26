@@ -1159,6 +1159,53 @@ Follow these exact rules:
     }
   });
 
+  // Server-side LRU cache for synthesized Neural TTS clips (instant repeat playback & voice previews)
+  interface TtsCacheEntry {
+    buffer: Buffer;
+    contentType: string;
+    model: string;
+    ts: number;
+  }
+  const ttsAudioCache = new Map<string, TtsCacheEntry>();
+  const TTS_CACHE_MAX = 120;
+  const TTS_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
+
+  let cachedTtsAiClient: GoogleGenAI | null | undefined;
+  function getTtsAiClient(): GoogleGenAI | null {
+    if (cachedTtsAiClient !== undefined) return cachedTtsAiClient;
+    const apiKey = process.env.GEMINI_API_KEY?.trim();
+    if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+      cachedTtsAiClient = null;
+      return null;
+    }
+    cachedTtsAiClient = new GoogleGenAI({
+      apiKey,
+      apiVersion: 'v1beta',
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
+    return cachedTtsAiClient;
+  }
+
+  function withPromiseTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+      promise.then(
+        (val) => {
+          clearTimeout(timer);
+          resolve(val);
+        },
+        (err) => {
+          clearTimeout(timer);
+          reject(err);
+        }
+      );
+    });
+  }
+
   // Neural Studio Audiobook Synthesis Endpoint (Expressive Gemini 3.8 Neural TTS with Teacher-like Prosody + Free MP3 fallback)
   app.post('/api/tts', async (req, res) => {
     try {
@@ -1178,60 +1225,68 @@ Follow these exact rules:
       const clippedText = text.trim().slice(0, 3500);
       const safeLang =
         typeof targetLang === 'string' && ALLOWED_LANGS[targetLang] ? targetLang : 'hi';
+      const allowedVoices = new Set(['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr']);
+      const safeVoice = allowedVoices.has(voiceName) ? voiceName : 'Kore';
+      const safeTier = modelTier === 'lite' ? 'lite' : 'flash';
 
-      const apiKey = process.env.GEMINI_API_KEY?.trim();
-      const ttsAi =
-        apiKey && apiKey !== 'MY_GEMINI_API_KEY'
-          ? new GoogleGenAI({
-              apiKey,
-              apiVersion: 'v1beta',
-              httpOptions: {
-                headers: {
-                  'User-Agent': 'aistudio-build',
-                },
-              },
-            })
-          : null;
+      const baseStyle =
+        typeof voiceStyle === 'string' && voiceStyle.trim()
+          ? voiceStyle.trim().slice(0, 280)
+          : 'Warm, experienced teacher explaining a book aloud to a curious student: expressive vocal rise and fall (intonation), natural conversational rhythm, gentle emphasis on key ideas, and clear breathing pauses — never flat or monotonous';
+
+      const prosodyCueByKind: Record<string, string> = {
+        heading:
+          'Speak like an engaging teacher introducing a new chapter or section: slightly slower and welcoming, with a warm upward lift on the main topic and a poised pause at the end.',
+        question:
+          'Speak like an encouraging teacher asking an intriguing question in class: clear rising intonation toward the end, curious warmth, and inviting cadence.',
+        exclamation:
+          'Speak with genuine classroom enthusiasm, lively vocal lift, bright energy, and warm emphasis on the key takeaway.',
+        list:
+          'Speak with crisp instructional cadence: gently highlight the opening point, pause briefly after enumerations, and keep an easy-to-follow teaching rhythm.',
+        caption:
+          'Speak as if pointing to an illustration or diagram beside a student, explaining it clearly with warm conversational clarity.',
+        narration:
+          'Speak like an experienced, beloved teacher narrating aloud: natural human pitch rise-and-fall, warm emphasis on important words, subtle micro-pauses at commas and clauses, and fluid storytelling rhythm — strictly avoid flat, robotic, or monotone delivery.',
+      };
+
+      const safeKind =
+        typeof sentenceKind === 'string' && prosodyCueByKind[sentenceKind]
+          ? sentenceKind
+          : 'narration';
+
+      const ttsCacheKey = `${safeTier}::${safeVoice}::${safeLang}::${safeKind}::${baseStyle.slice(0, 120)}::${clippedText}`;
+      const cachedHit = ttsAudioCache.get(ttsCacheKey);
+      if (cachedHit && Date.now() - cachedHit.ts < TTS_CACHE_TTL_MS) {
+        // Refresh LRU position
+        ttsAudioCache.delete(ttsCacheKey);
+        ttsAudioCache.set(ttsCacheKey, cachedHit);
+        res.setHeader('Content-Type', cachedHit.contentType);
+        res.setHeader('Content-Length', String(cachedHit.buffer.length));
+        res.setHeader('X-BhashaBook-TTS-Model', cachedHit.model);
+        res.setHeader('X-BhashaBook-TTS-Cache', 'hit');
+        res.setHeader(
+          'Content-Disposition',
+          cachedHit.contentType.includes('wav')
+            ? 'attachment; filename="audiobook-page.wav"'
+            : 'attachment; filename="audiobook-page.mp3"'
+        );
+        return res.send(cachedHit.buffer);
+      }
+
+      const ttsAi = getTtsAiClient();
 
       if (ttsAi) {
-        const allowedVoices = new Set(['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr']);
-        const safeVoice = allowedVoices.has(voiceName) ? voiceName : 'Kore';
-        const baseStyle =
-          typeof voiceStyle === 'string' && voiceStyle.trim()
-            ? voiceStyle.trim().slice(0, 260)
-            : 'Warm, experienced teacher explaining a book aloud with expressive vocal rise and fall, natural conversational rhythm, and clear pauses';
-
-        const prosodyCueByKind: Record<string, string> = {
-          heading:
-            'Deliver like a warm teacher introducing a new chapter or topic: slightly unhurried, welcoming upward lift, and a poised pause at the end.',
-          question:
-            'Deliver like an engaging teacher asking a curious question to students: natural rising intonation and inviting warmth.',
-          exclamation:
-            'Deliver with genuine enthusiasm, bright vocal lift, and encouraging emphasis on the key point.',
-          list:
-            'Deliver with clear instructional rhythm, gently stressing the opening phrase and pacing smoothly.',
-          caption:
-            'Deliver as if explaining an illustration or diagram clearly to a student looking alongside you.',
-          narration:
-            'Use natural human rise-and-fall intonation, expressive phrasing, gentle stress on important ideas, and subtle breathing pauses at commas — never flat, monotone, or robotic.',
-        };
-
-        const safeKind =
-          typeof sentenceKind === 'string' && prosodyCueByKind[sentenceKind]
-            ? sentenceKind
-            : 'narration';
-
         const isIndic = ['hi', 'hinglish', 'bn', 'ta', 'te', 'mr', 'ur'].includes(safeLang);
         const languageCadence = isIndic
-          ? `Speak ${String(languageName).slice(0, 40)} with natural conversational Indian educator cadence, expressive pitch modulation, and crisp pronunciation of English technical terms.`
-          : `Speak ${String(languageName).slice(0, 40)} with natural conversational educator cadence and crisp pronunciation of technical terms.`;
+          ? `Speak ${String(languageName).slice(0, 40)} with natural, expressive Indian educator cadence, melodic rise-and-fall intonation, clear pauses at purna viram (।) and commas, and crisp pronunciation of English technical terms.`
+          : `Speak ${String(languageName).slice(0, 40)} with natural, expressive educator cadence, melodic rise-and-fall intonation, clear clause pauses, and crisp pronunciation of technical terms.`;
 
         const fullTeacherStyle = `${baseStyle}. ${prosodyCueByKind[safeKind]} ${languageCadence}`;
-        const directedPrompt = `Speak aloud in this exact voice and delivery style (${fullTeacherStyle}):\n\n${clippedText}`;
+        const directedPrompt = `Read the following passage aloud with this exact vocal delivery (${fullTeacherStyle}):\n\n${clippedText}`;
 
         // Use flagship gemini-3.8-flash-tts for rich teacher-like prosody, with automatic fallback to gemini-3.8-flash-lite-tts
         const candidateModels =
-          modelTier === 'lite'
+          safeTier === 'lite'
             ? ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts']
             : ['gemini-3.8-flash-tts', 'gemini-3.8-flash-lite-tts'];
 
@@ -1259,18 +1314,22 @@ Follow these exact rules:
 
           for (const contents of attempts) {
             try {
-              const response = await ttsAi.models.generateContent({
-                model: modelName,
-                contents,
-                config: {
-                  responseModalities: ['AUDIO'],
-                  speechConfig: {
-                    voiceConfig: {
-                      prebuiltVoiceConfig: { voiceName: safeVoice },
+              const response = await withPromiseTimeout(
+                ttsAi.models.generateContent({
+                  model: modelName,
+                  contents,
+                  config: {
+                    responseModalities: ['AUDIO'],
+                    speechConfig: {
+                      voiceConfig: {
+                        prebuiltVoiceConfig: { voiceName: safeVoice },
+                      },
                     },
                   },
-                },
-              });
+                }),
+                16000,
+                `Gemini TTS (${modelName})`
+              );
 
               const part = response.candidates?.[0]?.content?.parts?.[0];
               const base64Audio = part?.inlineData?.data;
@@ -1302,9 +1361,25 @@ Follow these exact rules:
                   header.writeUInt32LE(rawBuf.length, 40);
                   wavBuffer = Buffer.concat([header, rawBuf]);
                 }
+
+                // Store in LRU cache (skip huge multi-minute full-page downloads to keep RAM bounded)
+                if (wavBuffer.length <= 1_800_000) {
+                  if (ttsAudioCache.size >= TTS_CACHE_MAX) {
+                    const oldestKey = ttsAudioCache.keys().next().value;
+                    if (oldestKey) ttsAudioCache.delete(oldestKey);
+                  }
+                  ttsAudioCache.set(ttsCacheKey, {
+                    buffer: wavBuffer,
+                    contentType: 'audio/wav',
+                    model: modelName,
+                    ts: Date.now(),
+                  });
+                }
+
                 res.setHeader('Content-Type', 'audio/wav');
                 res.setHeader('Content-Length', String(wavBuffer.length));
                 res.setHeader('X-BhashaBook-TTS-Model', modelName);
+                res.setHeader('X-BhashaBook-TTS-Cache', 'miss');
                 res.setHeader('Content-Disposition', 'attachment; filename="audiobook-page.wav"');
                 return res.send(wavBuffer);
               }
@@ -1321,6 +1396,7 @@ Follow these exact rules:
       res.setHeader('Content-Type', 'audio/mpeg');
       res.setHeader('Content-Length', String(mp3Buffer.length));
       res.setHeader('X-BhashaBook-TTS-Model', 'free-mp3-fallback');
+      res.setHeader('X-BhashaBook-TTS-Cache', 'miss');
       res.setHeader('Content-Disposition', 'attachment; filename="audiobook-page.mp3"');
       return res.send(mp3Buffer);
     } catch (err) {

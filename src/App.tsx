@@ -2089,6 +2089,7 @@ export default function App() {
   ]);
 
   const handleClickSentence = (idx: number) => {
+    audiobookControlRef.current?.unlockAudio();
     setJumpRequest({ index: idx, nonce: Date.now() });
   };
 

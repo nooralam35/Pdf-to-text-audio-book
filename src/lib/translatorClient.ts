@@ -399,30 +399,74 @@ export async function synthesizePageAudio(params: {
   sentenceKind?: string;
   modelTier?: 'flash' | 'lite';
   signal?: AbortSignal;
-}): Promise<{ blob: Blob; ext: 'wav' | 'mp3' }> {
+}): Promise<{ blob: Blob; ext: 'wav' | 'mp3'; model: string }> {
   const { signal, ...bodyPayload } = params;
-  const response = await fetch('/api/tts', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(bodyPayload),
-    signal,
-  });
+  const maxAttempts = 2;
+  let lastError: Error | null = null;
 
-  if (!response.ok) {
-    let errMsg = `Audio synthesis failed (${response.status})`;
-    try {
-      const errBody = (await response.json()) as { error?: string };
-      if (errBody.error) errMsg = errBody.error;
-    } catch {
-      // keep default
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
     }
-    throw new Error(errMsg);
+
+    const timeoutController = new AbortController();
+    const timer = window.setTimeout(() => timeoutController.abort(), 24000);
+    const onParentAbort = () => timeoutController.abort();
+    signal?.addEventListener('abort', onParentAbort, { once: true });
+
+    try {
+      const response = await fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(bodyPayload),
+        signal: timeoutController.signal,
+      });
+
+      if (!response.ok) {
+        let errMsg = `Audio synthesis failed (${response.status})`;
+        try {
+          const errBody = (await response.json()) as { error?: string };
+          if (errBody.error) errMsg = errBody.error;
+        } catch {
+          // keep default
+        }
+        if (response.status >= 500 && attempt < maxAttempts - 1) {
+          lastError = new Error(errMsg);
+          await new Promise((r) => window.setTimeout(r, 450));
+          continue;
+        }
+        throw new Error(errMsg);
+      }
+
+      const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
+      const model = response.headers.get('x-bhashabook-tts-model') ?? '';
+      const ext: 'wav' | 'mp3' = contentType.includes('wav') ? 'wav' : 'mp3';
+      const blob = await response.blob();
+      if (blob.size === 0) {
+        throw new Error('Neural TTS returned an empty audio clip.');
+      }
+      return { blob, ext, model };
+    } catch (err) {
+      if (signal?.aborted) {
+        throw new DOMException('Aborted', 'AbortError');
+      }
+      const isTimeout = err instanceof DOMException && err.name === 'AbortError';
+      lastError = isTimeout
+        ? new Error('Neural voice generation timed out — retrying.')
+        : err instanceof Error
+        ? err
+        : new Error('Audio synthesis failed.');
+      if (attempt < maxAttempts - 1) {
+        await new Promise((r) => window.setTimeout(r, 450));
+        continue;
+      }
+    } finally {
+      window.clearTimeout(timer);
+      signal?.removeEventListener('abort', onParentAbort);
+    }
   }
 
-  const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
-  const ext: 'wav' | 'mp3' = contentType.includes('wav') ? 'wav' : 'mp3';
-  const blob = await response.blob();
-  return { blob, ext };
+  throw lastError ?? new Error('Unable to synthesize neural speech right now.');
 }
 
 // Splits translated blocks into speakable sentences supporting Latin, Devanagari (।), and Urdu/Arabic (۔ ؟)
