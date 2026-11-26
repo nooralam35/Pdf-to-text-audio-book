@@ -6,12 +6,16 @@ import {
   CloudDownload,
   Compass,
   Download,
+  Flame,
   HardDrive,
   Headphones,
   Languages,
   Loader2,
+  Minus,
+  Plus,
   RefreshCw,
   Search,
+  Target,
   Trash2,
   Upload,
   WifiOff,
@@ -19,16 +23,137 @@ import {
 } from 'lucide-react';
 import { PRELOADED_OBS_BOOK_ID } from '../lib/languages';
 import { formatStorageBytes, type ServiceWorkerStatus } from '../lib/offlineCache';
+import type { DailyReadingGoalSnapshot } from '../lib/readingGoal';
 import type { StoredBook } from '../types';
 import { PWAInstallButton } from './PWAInstallButton';
 
 type LibraryFilterTab = 'all' | 'bookmarked' | 'listened' | 'offline';
+type LibrarySearchScope = 'all' | 'title' | 'author';
+
+const GOAL_PRESETS = [10, 15, 25, 50] as const;
+
+interface CircularProgressRingProps {
+  value: number;
+  max: number;
+  size?: number;
+  strokeWidth?: number;
+  label?: string;
+  sublabel?: string;
+  ariaLabel: string;
+}
+
+const CircularProgressRing: React.FC<CircularProgressRingProps> = ({
+  value,
+  max,
+  size = 44,
+  strokeWidth = 4,
+  label,
+  sublabel,
+  ariaLabel,
+}) => {
+  const safeMax = Math.max(1, max);
+  const ratio = Math.max(0, Math.min(1, value / safeMax));
+  const radius = (size - strokeWidth) / 2;
+  const circumference = 2 * Math.PI * radius;
+  const dashOffset = circumference * (1 - ratio);
+  const completed = value >= safeMax;
+
+  return (
+    <div
+      role="progressbar"
+      aria-label={ariaLabel}
+      aria-valuemin={0}
+      aria-valuemax={safeMax}
+      aria-valuenow={Math.min(value, safeMax)}
+      className="relative inline-flex items-center justify-center shrink-0"
+      style={{ width: size, height: size }}
+    >
+      <svg
+        width={size}
+        height={size}
+        viewBox={`0 0 ${size} ${size}`}
+        className="-rotate-90"
+        aria-hidden="true"
+      >
+        <circle
+          cx={size / 2}
+          cy={size / 2}
+          r={radius}
+          fill="none"
+          strokeWidth={strokeWidth}
+          className="stroke-stone-200 sepia:stroke-[#DFD4BC] dark:stroke-stone-800"
+        />
+        <circle
+          cx={size / 2}
+          cy={size / 2}
+          r={radius}
+          fill="none"
+          strokeWidth={strokeWidth}
+          strokeDasharray={circumference}
+          strokeDashoffset={dashOffset}
+          strokeLinecap="round"
+          className={`transition-[stroke-dashoffset] duration-300 ease-out ${
+            completed
+              ? 'stroke-emerald-600 dark:stroke-emerald-400'
+              : value > 0
+              ? 'stroke-amber-700 dark:stroke-amber-500'
+              : 'stroke-transparent'
+          }`}
+        />
+      </svg>
+      <div className="absolute inset-0 flex flex-col items-center justify-center leading-none select-none font-mono-num">
+        <span
+          className={`font-semibold ${
+            size >= 56 ? 'text-xs' : 'text-[10px]'
+          } ${
+            completed
+              ? 'text-emerald-800 dark:text-emerald-300'
+              : value > 0
+              ? 'text-stone-900 sepia:text-[#2F241A] dark:text-stone-100'
+              : 'text-stone-400 dark:text-stone-500'
+          }`}
+        >
+          {label ?? `${Math.round(ratio * 100)}%`}
+        </span>
+        {sublabel && (
+          <span className="text-[9px] text-stone-500 dark:text-stone-400 mt-0.5">
+            {sublabel}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+};
+
+function renderHighlightedText(text: string, tokens: string[]): React.ReactNode {
+  if (!text || tokens.length === 0) return text;
+  const escaped = tokens
+    .filter(Boolean)
+    .map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  if (escaped.length === 0) return text;
+  const regex = new RegExp(`(${escaped.join('|')})`, 'gi');
+  const parts = text.split(regex);
+  return parts.map((part, idx) =>
+    idx % 2 === 1 ? (
+      <mark
+        key={idx}
+        className="bg-amber-200/80 dark:bg-amber-700/50 text-inherit rounded-[2px] px-0.5"
+      >
+        {part}
+      </mark>
+    ) : (
+      part
+    )
+  );
+}
 
 interface LibraryViewProps {
   books: StoredBook[];
   activeBookId: string | null;
   translatedCountsByBook: Record<string, number>;
   allLangTranslationCountsByBook: Record<string, number>;
+  dailyReadingGoal: DailyReadingGoalSnapshot;
+  onChangeDailyGoal: (pages: number) => void;
   isOnline: boolean;
   swStatus: ServiceWorkerStatus;
   cachedBookIds: Set<string>;
@@ -54,6 +179,8 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   activeBookId,
   translatedCountsByBook,
   allLangTranslationCountsByBook,
+  dailyReadingGoal,
+  onChangeDailyGoal,
   isOnline,
   swStatus,
   cachedBookIds,
@@ -74,9 +201,11 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   isUploading,
 }) => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
+  const [searchScope, setSearchScope] = useState<LibrarySearchScope>('all');
   const [activeFilter, setActiveFilter] = useState<LibraryFilterTab>('all');
 
   const isBookOfflineReady = (book: StoredBook): boolean =>
@@ -105,9 +234,12 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     [allLangTranslationCountsByBook]
   );
 
-  const filteredBooks = useMemo(() => {
+  const searchTokens = useMemo(() => {
     const trimmed = searchQuery.trim().toLowerCase();
-    const tokens = trimmed ? trimmed.split(/\s+/).filter(Boolean) : [];
+    return trimmed ? trimmed.split(/\s+/).filter(Boolean) : [];
+  }, [searchQuery]);
+
+  const filteredBooks = useMemo(() => {
     return books.filter((book) => {
       if (activeFilter === 'offline' && !isBookOfflineReady(book)) {
         return false;
@@ -122,11 +254,16 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
       ) {
         return false;
       }
-      if (tokens.length === 0) return true;
-      const haystack = `${book.title ?? ''} ${book.author ?? ''}`.toLowerCase();
-      return tokens.every((token) => haystack.includes(token));
+      if (searchTokens.length === 0) return true;
+      const haystack =
+        searchScope === 'title'
+          ? (book.title ?? '').toLowerCase()
+          : searchScope === 'author'
+          ? (book.author ?? '').toLowerCase()
+          : `${book.title ?? ''} ${book.author ?? ''}`.toLowerCase();
+      return searchTokens.every((token) => haystack.includes(token));
     });
-  }, [books, searchQuery, activeFilter, cachedBookIds]);
+  }, [books, searchTokens, searchScope, activeFilter, cachedBookIds]);
 
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
@@ -182,186 +319,234 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
         </div>
       </div>
 
-      {/* Offline Service Worker & Local Cache Summary Strip */}
-      <section
-        aria-label="Offline cache status"
-        className="rounded-lg border border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-white sepia:bg-[#FBF6E9] dark:bg-[#191816] px-4 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
-      >
-        <div className="space-y-1 min-w-0">
-          <div className="flex items-center gap-2 text-xs font-medium text-stone-900 sepia:text-[#2F241A] dark:text-stone-100">
-            {!isOnline ? (
-              <WifiOff className="w-4 h-4 text-amber-700 dark:text-amber-500 shrink-0" />
-            ) : (
-              <HardDrive className="w-4 h-4 text-amber-700 dark:text-amber-500 shrink-0" />
-            )}
-            <span className="truncate">{swStatusLabel}</span>
-          </div>
-          <p className="text-xs font-mono-num text-stone-500 sepia:text-[#6E5A47] dark:text-stone-400 pl-6">
-            {offlineReadyCount} / {books.length} {books.length === 1 ? 'PDF' : 'PDFs'} cached
-            offline · {bookmarkedCount} bookmarked · {totalCachedTranslations} translated{' '}
-            {totalCachedTranslations === 1 ? 'page' : 'pages'} saved
-            {storageUsageBytes !== null ? ` · ${formatStorageBytes(storageUsageBytes)} local storage` : ''}
-          </p>
-        </div>
+      {/* Daily Reading Goal Tracker */}
+      {(() => {
+        const { goalPages, pagesReadToday, streakDays, goalMetToday } = dailyReadingGoal;
+        const remaining = Math.max(0, goalPages - pagesReadToday);
+        const pctToday = Math.min(100, Math.round((pagesReadToday / Math.max(1, goalPages)) * 100));
 
-        <div className="flex items-center gap-2 shrink-0 pl-6 sm:pl-0">
-          <button
-            type="button"
-            disabled={!isOnline || isSyncingAllOffline || books.length === 0}
-            onClick={onSyncAllOffline}
-            title={
-              !isOnline
-                ? 'Reconnect to cache additional books offline'
-                : uncachedCount > 0
-                ? `Download and cache ${uncachedCount} remaining book(s) plus PDF viewer fonts for offline reading`
-                : 'Verify offline cache and pre-warm PDF.js fonts for offline reading'
-            }
-            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-md border border-stone-300 sepia:border-[#D4C6AA] dark:border-stone-700 bg-[#FAF9F5] sepia:bg-[#F4ECD8] dark:bg-[#22211E] hover:bg-stone-100 dark:hover:bg-stone-800 text-xs font-medium text-stone-800 sepia:text-[#3B2F23] dark:text-stone-200 disabled:opacity-45 disabled:cursor-not-allowed cursor-pointer whitespace-nowrap transition-colors"
+        return (
+          <section
+            aria-label="Daily Reading Goal"
+            className="rounded-lg border border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-white sepia:bg-[#FBF6E9] dark:bg-[#191816] px-4 sm:px-5 py-4 flex flex-col md:flex-row md:items-center justify-between gap-4"
           >
-            {isSyncingAllOffline ? (
-              <>
-                <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-700 dark:text-amber-500" />
-                <span>Caching Library…</span>
-              </>
-            ) : uncachedCount > 0 ? (
-              <>
-                <CloudDownload className="w-3.5 h-3.5 text-amber-700 dark:text-amber-500" />
-                <span>Cache All Offline ({uncachedCount})</span>
-              </>
-            ) : (
-              <>
-                <RefreshCw className="w-3.5 h-3.5 text-amber-700 dark:text-amber-500" />
-                <span>Verify Offline Cache</span>
-              </>
+            <div className="flex items-center gap-4 min-w-0">
+              <CircularProgressRing
+                value={pagesReadToday}
+                max={goalPages}
+                size={60}
+                strokeWidth={5}
+                label={`${pctToday}%`}
+                sublabel="today"
+                ariaLabel={`Daily reading goal progress: ${pagesReadToday} of ${goalPages} pages read today`}
+              />
+              <div className="min-w-0 space-y-1">
+                <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
+                  <h2 className="inline-flex items-center gap-1.5 text-sm font-semibold text-stone-950 sepia:text-[#2F241A] dark:text-stone-50">
+                    <Target className="w-4 h-4 text-amber-700 dark:text-amber-500 shrink-0" />
+                    <span>Daily Reading Goal</span>
+                  </h2>
+                  {streakDays > 0 && (
+                    <span className="inline-flex items-center gap-1 text-xs font-mono-num font-medium text-amber-800 dark:text-amber-400">
+                      <Flame className="w-3.5 h-3.5 shrink-0" />
+                      <span>{streakDays}-day streak</span>
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs text-stone-600 sepia:text-[#5B4938] dark:text-stone-400 font-mono-num">
+                  <span className="font-semibold text-stone-900 sepia:text-[#2F241A] dark:text-stone-100">
+                    {pagesReadToday} / {goalPages}
+                  </span>{' '}
+                  {pagesReadToday === 1 ? 'page' : 'pages'} read today
+                  {' · '}
+                  {goalMetToday ? (
+                    <span className="text-emerald-800 dark:text-emerald-400 font-medium">
+                      Daily goal reached
+                    </span>
+                  ) : (
+                    <span>
+                      {remaining} {remaining === 1 ? 'page' : 'pages'} left
+                    </span>
+                  )}
+                </p>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              <span className="text-[11px] font-medium text-stone-500 dark:text-stone-400 mr-0.5">
+                Target:
+              </span>
+              <div className="inline-flex items-center rounded-md border border-stone-300 sepia:border-[#D4C6AA] dark:border-stone-700 bg-[#FAF9F5] sepia:bg-[#F4ECD8] dark:bg-[#141312]">
+                <button
+                  type="button"
+                  onClick={() => onChangeDailyGoal(Math.max(1, goalPages - 5))}
+                  disabled={goalPages <= 1}
+                  aria-label="Decrease daily page goal by 5"
+                  className="h-8 w-8 inline-flex items-center justify-center text-stone-600 dark:text-stone-300 hover:text-stone-950 dark:hover:text-stone-50 disabled:opacity-40 cursor-pointer"
+                >
+                  <Minus className="w-3.5 h-3.5" />
+                </button>
+                <span className="px-2 text-xs font-mono-num font-semibold text-stone-900 sepia:text-[#2F241A] dark:text-stone-100 min-w-[3.5rem] text-center">
+                  {goalPages}p/day
+                </span>
+                <button
+                  type="button"
+                  onClick={() => onChangeDailyGoal(Math.min(300, goalPages + 5))}
+                  disabled={goalPages >= 300}
+                  aria-label="Increase daily page goal by 5"
+                  className="h-8 w-8 inline-flex items-center justify-center text-stone-600 dark:text-stone-300 hover:text-stone-950 dark:hover:text-stone-50 disabled:opacity-40 cursor-pointer"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+              <div className="inline-flex items-center gap-1">
+                {GOAL_PRESETS.map((preset) => (
+                  <button
+                    key={preset}
+                    type="button"
+                    onClick={() => onChangeDailyGoal(preset)}
+                    className={`h-8 px-2 rounded text-xs font-mono-num font-medium border transition-colors cursor-pointer ${
+                      goalPages === preset
+                        ? 'border-amber-700 bg-amber-700 text-white'
+                        : 'border-stone-300 sepia:border-[#D4C6AA] dark:border-stone-700 text-stone-600 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800'
+                    }`}
+                  >
+                    {preset}p
+                  </button>
+                ))}
+              </div>
+            </div>
+          </section>
+        );
+      })()}
+
+      {/* Prominent Library Search Bar & Shelf Filter Tabs */}
+      <section aria-label="Search and filter saved books" className="space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center gap-2.5">
+          <div className="relative flex-1">
+            <Search
+              aria-hidden="true"
+              className="w-4 h-4 text-stone-400 dark:text-stone-500 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none"
+            />
+            <input
+              ref={searchInputRef}
+              type="search"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape' && searchQuery) {
+                  setSearchQuery('');
+                }
+              }}
+              placeholder={
+                searchScope === 'title'
+                  ? 'Filter saved books by title…'
+                  : searchScope === 'author'
+                  ? 'Filter saved books by author…'
+                  : 'Search your library by title or author…'
+              }
+              aria-label="Filter library books by title or author"
+              className="w-full h-11 pl-10 pr-10 rounded-md border border-stone-300 sepia:border-[#D4C6AA] dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#191816] text-sm text-stone-900 sepia:text-[#2F241A] dark:text-stone-100 placeholder:text-stone-400 dark:placeholder:text-stone-500 focus:outline-none focus:border-amber-700 dark:focus:border-amber-500 transition-colors"
+            />
+            {hasQuery && (
+              <button
+                type="button"
+                onClick={() => {
+                  setSearchQuery('');
+                  searchInputRef.current?.focus();
+                }}
+                aria-label="Clear library search"
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 h-6 w-6 inline-flex items-center justify-center rounded text-stone-400 hover:text-stone-900 dark:hover:text-stone-100 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
             )}
-          </button>
-        </div>
-      </section>
+          </div>
 
-      {/* Drag & Drop Upload Zone */}
-      <div
-        onDragOver={(e) => {
-          e.preventDefault();
-          setIsDragging(true);
-        }}
-        onDragLeave={() => setIsDragging(false)}
-        onDrop={handleDrop}
-        className={`rounded-lg border border-dashed p-5 sm:p-6 text-center transition-colors ${
-          isDragging
-            ? 'border-amber-700 bg-amber-50/60 dark:border-amber-500 dark:bg-amber-950/20'
-            : 'border-stone-300 sepia:border-[#D4C6AA] dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#191816]'
-        }`}
-      >
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="application/pdf,.pdf"
-          onChange={(e) => {
-            const f = e.target.files?.[0];
-            if (f) onUploadPdf(f);
-            e.target.value = '';
-          }}
-          className="hidden"
-        />
-        <Upload className="w-5 h-5 mx-auto text-amber-700 dark:text-amber-500" />
-        <p className="mt-2.5 text-sm font-medium text-stone-900 sepia:text-[#2F241A] dark:text-stone-100">
-          Drop any illustrated technical guidebook or PDF here (works offline too)
-        </p>
-        <p className="mt-1 text-xs text-stone-500 sepia:text-[#6E5A47] dark:text-stone-400">
-          Automatically saves the PDF, reading progress, audio position, chapters, and cover locally.
-        </p>
-        <button
-          type="button"
-          disabled={isUploading}
-          onClick={() => fileInputRef.current?.click()}
-          className="mt-3.5 inline-flex items-center gap-2 h-9 px-4 rounded-md text-sm font-medium bg-stone-900 text-stone-50 hover:bg-stone-800 dark:bg-stone-100 dark:text-stone-950 dark:hover:bg-stone-200 disabled:opacity-50 cursor-pointer"
-        >
-          {isUploading ? 'Parsing PDF & Caching Offline…' : 'Choose PDF File'}
-        </button>
-      </div>
-
-      {/* Shelf Filter Tabs & Search Bar */}
-      {books.length > 0 && (
-        <div className="space-y-4">
           <div
-            role="tablist"
-            aria-label="Library shelf filters"
-            className="flex items-center gap-1 overflow-x-auto pb-1 border-b border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800"
+            role="group"
+            aria-label="Search field scope"
+            className="inline-flex h-11 rounded-md border border-stone-300 sepia:border-[#D4C6AA] dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#191816] p-1 shrink-0"
           >
             {(
               [
-                { id: 'all', label: `All Books (${books.length})` },
-                { id: 'bookmarked', label: `Bookmarked (${bookmarkedCount})` },
-                { id: 'listened', label: `Audio History (${listenedCount})` },
-                { id: 'offline', label: `Offline Ready (${offlineReadyCount})` },
+                { id: 'all', label: 'Title & Author' },
+                { id: 'title', label: 'Title' },
+                { id: 'author', label: 'Author' },
               ] as const
-            ).map((tab) => {
-              const active = activeFilter === tab.id;
-              return (
-                <button
-                  key={tab.id}
-                  type="button"
-                  role="tab"
-                  aria-selected={active}
-                  onClick={() => setActiveFilter(tab.id)}
-                  className={`px-3 py-2 text-xs sm:text-[13px] font-medium whitespace-nowrap shrink-0 border-b-2 transition-colors cursor-pointer ${
-                    active
-                      ? 'border-amber-700 dark:border-amber-500 text-stone-950 dark:text-stone-50'
-                      : 'border-transparent text-stone-500 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-200'
-                  }`}
-                >
-                  {tab.label}
-                </button>
-              );
-            })}
+            ).map((scope) => (
+              <button
+                key={scope.id}
+                type="button"
+                aria-pressed={searchScope === scope.id}
+                onClick={() => setSearchScope(scope.id)}
+                className={`px-2.5 rounded text-xs font-medium whitespace-nowrap transition-colors cursor-pointer ${
+                  searchScope === scope.id
+                    ? 'bg-stone-900 text-stone-50 dark:bg-stone-100 dark:text-stone-950'
+                    : 'text-stone-600 sepia:text-[#5B4938] dark:text-stone-300 hover:text-stone-950 dark:hover:text-stone-100'
+                }`}
+              >
+                {scope.label}
+              </button>
+            ))}
           </div>
+        </div>
 
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div className="relative flex-1 max-w-md">
-              <Search
-                aria-hidden="true"
-                className="w-4 h-4 text-stone-400 dark:text-stone-500 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
-              />
-              <input
-                type="search"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Escape' && searchQuery) {
-                    setSearchQuery('');
-                  }
-                }}
-                placeholder="Search saved books by title or author…"
-                aria-label="Filter library books by title or author"
-                className="w-full h-10 pl-9 pr-9 rounded-md border border-stone-300 sepia:border-[#D4C6AA] dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#191816] text-sm text-stone-900 sepia:text-[#2F241A] dark:text-stone-100 placeholder:text-stone-400 dark:placeholder:text-stone-500 focus:outline-none focus:border-amber-700 dark:focus:border-amber-500 transition-colors"
-              />
-              {hasQuery && (
-                <button
-                  type="button"
-                  onClick={() => setSearchQuery('')}
-                  aria-label="Clear book search"
-                  className="absolute right-2 top-1/2 -translate-y-1/2 h-6 w-6 inline-flex items-center justify-center rounded text-stone-400 hover:text-stone-900 dark:hover:text-stone-100 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer"
-                >
-                  <X className="w-3.5 h-3.5" />
-                </button>
-              )}
+        {books.length > 0 && (
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800">
+            <div
+              role="tablist"
+              aria-label="Library shelf filters"
+              className="flex items-center gap-1 overflow-x-auto"
+            >
+              {(
+                [
+                  { id: 'all', label: `All Books (${books.length})` },
+                  { id: 'bookmarked', label: `Bookmarked (${bookmarkedCount})` },
+                  { id: 'listened', label: `Audio History (${listenedCount})` },
+                  { id: 'offline', label: `Offline Ready (${offlineReadyCount})` },
+                ] as const
+              ).map((tab) => {
+                const active = activeFilter === tab.id;
+                return (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={active}
+                    onClick={() => setActiveFilter(tab.id)}
+                    className={`px-3 py-2 text-xs sm:text-[13px] font-medium whitespace-nowrap shrink-0 border-b-2 transition-colors cursor-pointer ${
+                      active
+                        ? 'border-amber-700 dark:border-amber-500 text-stone-950 dark:text-stone-50'
+                        : 'border-transparent text-stone-500 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-200'
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                );
+              })}
             </div>
 
-            <p className="text-xs font-mono-num text-stone-500 dark:text-stone-400">
+            <p className="text-xs font-mono-num text-stone-500 dark:text-stone-400 pb-2 sm:pb-0 whitespace-nowrap">
               {hasActiveFilter
                 ? `Showing ${filteredBooks.length} of ${books.length} ${
                     books.length === 1 ? 'book' : 'books'
                   }`
-                : `${books.length} ${books.length === 1 ? 'book' : 'books'} · sorted by most recent`}
+                : `${books.length} ${books.length === 1 ? 'book' : 'books'} · most recent`}
             </p>
           </div>
-        </div>
-      )}
+        )}
+      </section>
 
       {/* Empty Search / Filter Results State */}
       {books.length > 0 && filteredBooks.length === 0 ? (
         <div className="rounded-lg border border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-white sepia:bg-[#FBF6E9] dark:bg-[#191816] px-6 py-12 text-center">
-          <Bookmark className="w-6 h-6 mx-auto text-stone-400 dark:text-stone-500" />
+          {hasQuery ? (
+            <Search className="w-6 h-6 mx-auto text-stone-400 dark:text-stone-500" />
+          ) : (
+            <Bookmark className="w-6 h-6 mx-auto text-stone-400 dark:text-stone-500" />
+          )}
           <p className="mt-3 text-sm font-medium text-stone-900 dark:text-stone-100">
             {hasQuery
               ? `No books match “${searchQuery.trim()}”`
@@ -373,23 +558,24 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
           </p>
           <p className="mt-1 text-xs text-stone-500 dark:text-stone-400">
             {hasQuery
-              ? 'Try searching with a different title keyword or author name.'
+              ? 'Try searching with a different title keyword, author name, or switch scope to Title & Author.'
               : activeFilter === 'bookmarked'
               ? 'Click the Bookmark button on any book in Discover, Library, or Reader to save it here.'
               : activeFilter === 'listened'
               ? 'Click Listen Now on any book — your exact page and sentence position will be saved automatically.'
-              : 'Click “Cache All Offline” above while online to save your library for offline reading.'}
+              : 'Click “Cache All Offline” below while online to save your library for offline reading.'}
           </p>
           <button
             type="button"
             onClick={() => {
               setSearchQuery('');
+              setSearchScope('all');
               setActiveFilter('all');
             }}
             className="mt-4 inline-flex items-center gap-1.5 h-8 px-3.5 rounded text-xs font-medium border border-stone-300 dark:border-stone-700 text-stone-700 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer"
           >
             <X className="w-3.5 h-3.5" />
-            <span>Show All Books</span>
+            <span>{hasQuery ? 'Clear Search' : 'Show All Books'}</span>
           </button>
         </div>
       ) : (
@@ -460,7 +646,9 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                 <div className="p-4 flex-1 flex flex-col">
                   <div className="flex items-start justify-between gap-2">
                     <h2 className="font-display text-base font-semibold leading-snug text-stone-950 sepia:text-[#2F241A] dark:text-stone-50 line-clamp-2">
-                      {book.title}
+                      {searchScope !== 'author'
+                        ? renderHighlightedText(book.title, searchTokens)
+                        : book.title}
                     </h2>
                     {!isPreloaded &&
                       (confirmDeleteId === book.id ? (
@@ -498,7 +686,9 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
                   {book.author && (
                     <p className="mt-0.5 text-xs text-stone-500 sepia:text-[#6E5A47] dark:text-stone-400 truncate">
-                      {book.author}
+                      {searchScope !== 'title'
+                        ? renderHighlightedText(book.author, searchTokens)
+                        : book.author}
                     </p>
                   )}
 
@@ -561,26 +751,57 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                     )}
                   </div>
 
-                  {/* Continue Reading Progress Bar */}
+                  {/* Daily Reading Goal Circular Progress Ring + Book Reading Progress */}
                   {(() => {
                     const lastPg = Math.max(1, Math.min(book.numPages, book.lastPage || 1));
                     const pct = Math.max(
                       1,
                       Math.min(100, Math.round((lastPg / Math.max(1, book.numPages)) * 100))
                     );
+                    const bookPagesToday = dailyReadingGoal.pagesReadTodayByBook[book.id] ?? 0;
+                    const goalPages = Math.max(1, dailyReadingGoal.goalPages);
+                    const todayGoalPct = Math.min(
+                      100,
+                      Math.round((bookPagesToday / goalPages) * 100)
+                    );
                     return (
-                      <div className="mt-3 space-y-1">
-                        <div className="flex items-center justify-between text-[11px] text-stone-500 dark:text-stone-400 font-mono-num">
-                          <span>
-                            Page {lastPg} of {book.numPages}
-                          </span>
-                          <span>{pct}% read</span>
-                        </div>
-                        <div className="h-1.5 w-full rounded-full bg-stone-200 sepia:bg-[#DFD4BC] dark:bg-stone-800 overflow-hidden">
-                          <div
-                            className="h-full bg-amber-700 dark:bg-amber-500 transition-all"
-                            style={{ width: `${pct}%` }}
+                      <div className="mt-3.5 pt-3 border-t border-stone-200/70 sepia:border-[#DFD4BC]/80 dark:border-stone-800/80 flex items-center gap-3">
+                        <div
+                          title={`${bookPagesToday} of ${goalPages} daily goal pages read in "${book.title}" today (${todayGoalPct}%)`}
+                        >
+                          <CircularProgressRing
+                            value={bookPagesToday}
+                            max={goalPages}
+                            size={44}
+                            strokeWidth={4}
+                            label={`${bookPagesToday}p`}
+                            ariaLabel={`${book.title}: ${bookPagesToday} of ${goalPages} daily goal pages read today`}
                           />
+                        </div>
+
+                        <div className="flex-1 min-w-0 space-y-1.5">
+                          <div className="flex items-center justify-between gap-2 text-[11px] font-mono-num">
+                            <span
+                              className={
+                                bookPagesToday >= goalPages
+                                  ? 'font-medium text-emerald-800 dark:text-emerald-400'
+                                  : bookPagesToday > 0
+                                  ? 'font-medium text-amber-800 dark:text-amber-400'
+                                  : 'text-stone-500 dark:text-stone-400'
+                              }
+                            >
+                              Today: {bookPagesToday}/{goalPages}p
+                            </span>
+                            <span className="text-stone-500 dark:text-stone-400">
+                              p.{lastPg}/{book.numPages} ({pct}%)
+                            </span>
+                          </div>
+                          <div className="h-1.5 w-full rounded-full bg-stone-200 sepia:bg-[#DFD4BC] dark:bg-stone-800 overflow-hidden">
+                            <div
+                              className="h-full bg-amber-700 dark:bg-amber-500 transition-all"
+                              style={{ width: `${pct}%` }}
+                            />
+                          </div>
                         </div>
                       </div>
                     );
@@ -658,6 +879,104 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
           })}
         </div>
       )}
+
+      {/* Drag & Drop Upload Zone */}
+      <div
+        onDragOver={(e) => {
+          e.preventDefault();
+          setIsDragging(true);
+        }}
+        onDragLeave={() => setIsDragging(false)}
+        onDrop={handleDrop}
+        className={`rounded-lg border border-dashed p-5 sm:p-6 text-center transition-colors ${
+          isDragging
+            ? 'border-amber-700 bg-amber-50/60 dark:border-amber-500 dark:bg-amber-950/20'
+            : 'border-stone-300 sepia:border-[#D4C6AA] dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#191816]'
+        }`}
+      >
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="application/pdf,.pdf"
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) onUploadPdf(f);
+            e.target.value = '';
+          }}
+          className="hidden"
+        />
+        <Upload className="w-5 h-5 mx-auto text-amber-700 dark:text-amber-500" />
+        <p className="mt-2.5 text-sm font-medium text-stone-900 sepia:text-[#2F241A] dark:text-stone-100">
+          Drop any illustrated technical guidebook or PDF here (works offline too)
+        </p>
+        <p className="mt-1 text-xs text-stone-500 sepia:text-[#6E5A47] dark:text-stone-400">
+          Automatically saves the PDF, reading progress, audio position, chapters, and cover locally.
+        </p>
+        <button
+          type="button"
+          disabled={isUploading}
+          onClick={() => fileInputRef.current?.click()}
+          className="mt-3.5 inline-flex items-center gap-2 h-9 px-4 rounded-md text-sm font-medium bg-stone-900 text-stone-50 hover:bg-stone-800 dark:bg-stone-100 dark:text-stone-950 dark:hover:bg-stone-200 disabled:opacity-50 cursor-pointer"
+        >
+          {isUploading ? 'Parsing PDF & Caching Offline…' : 'Choose PDF File'}
+        </button>
+      </div>
+
+      {/* Offline Service Worker & Local Cache Summary Strip */}
+      <section
+        aria-label="Offline cache status"
+        className="rounded-lg border border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-white sepia:bg-[#FBF6E9] dark:bg-[#191816] px-4 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+      >
+        <div className="space-y-1 min-w-0">
+          <div className="flex items-center gap-2 text-xs font-medium text-stone-900 sepia:text-[#2F241A] dark:text-stone-100">
+            {!isOnline ? (
+              <WifiOff className="w-4 h-4 text-amber-700 dark:text-amber-500 shrink-0" />
+            ) : (
+              <HardDrive className="w-4 h-4 text-amber-700 dark:text-amber-500 shrink-0" />
+            )}
+            <span className="truncate">{swStatusLabel}</span>
+          </div>
+          <p className="text-xs font-mono-num text-stone-500 sepia:text-[#6E5A47] dark:text-stone-400 pl-6">
+            {offlineReadyCount} / {books.length} {books.length === 1 ? 'PDF' : 'PDFs'} cached
+            offline · {bookmarkedCount} bookmarked · {totalCachedTranslations} translated{' '}
+            {totalCachedTranslations === 1 ? 'page' : 'pages'} saved
+            {storageUsageBytes !== null ? ` · ${formatStorageBytes(storageUsageBytes)} local storage` : ''}
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2 shrink-0 pl-6 sm:pl-0">
+          <button
+            type="button"
+            disabled={!isOnline || isSyncingAllOffline || books.length === 0}
+            onClick={onSyncAllOffline}
+            title={
+              !isOnline
+                ? 'Reconnect to cache additional books offline'
+                : uncachedCount > 0
+                ? `Download and cache ${uncachedCount} remaining book(s) plus PDF viewer fonts for offline reading`
+                : 'Verify offline cache and pre-warm PDF.js fonts for offline reading'
+            }
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-md border border-stone-300 sepia:border-[#D4C6AA] dark:border-stone-700 bg-[#FAF9F5] sepia:bg-[#F4ECD8] dark:bg-[#22211E] hover:bg-stone-100 dark:hover:bg-stone-800 text-xs font-medium text-stone-800 sepia:text-[#3B2F23] dark:text-stone-200 disabled:opacity-45 disabled:cursor-not-allowed cursor-pointer whitespace-nowrap transition-colors"
+          >
+            {isSyncingAllOffline ? (
+              <>
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-700 dark:text-amber-500" />
+                <span>Caching Library…</span>
+              </>
+            ) : uncachedCount > 0 ? (
+              <>
+                <CloudDownload className="w-3.5 h-3.5 text-amber-700 dark:text-amber-500" />
+                <span>Cache All Offline ({uncachedCount})</span>
+              </>
+            ) : (
+              <>
+                <RefreshCw className="w-3.5 h-3.5 text-amber-700 dark:text-amber-500" />
+                <span>Verify Offline Cache</span>
+              </>
+            )}
+          </button>
+        </div>
+      </section>
     </main>
   );
 };

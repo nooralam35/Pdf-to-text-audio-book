@@ -83,6 +83,12 @@ import {
   updateBookProgress,
 } from './lib/storage';
 import {
+  getDailyReadingGoalSnapshot,
+  recordPageReadToday,
+  setDailyReadingGoalPages,
+  type DailyReadingGoalSnapshot,
+} from './lib/readingGoal';
+import {
   checkServerCapabilities,
   downloadBlob,
   splitBlocksIntoSentences,
@@ -118,6 +124,9 @@ export default function App() {
   const [cachingBookId, setCachingBookId] = useState<string | null>(null);
   const [downloadingBookId, setDownloadingBookId] = useState<string | null>(null);
   const [isSyncingAllOffline, setIsSyncingAllOffline] = useState(false);
+  const [dailyReadingGoal, setDailyReadingGoal] = useState<DailyReadingGoalSnapshot>(() =>
+    getDailyReadingGoalSnapshot()
+  );
 
   // Navigation & Reading Themes (Light Paper, Sepia, OLED Dark)
   const [activeTab, setActiveTab] = useState<ActiveTab>(() =>
@@ -259,6 +268,25 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('bhashabook-auto-preload-next', String(autoPreloadNext));
   }, [autoPreloadNext]);
+
+  // Refresh Daily Reading Goal snapshot on midnight date rollover or when opening Library
+  useEffect(() => {
+    if (activeTab === 'library') {
+      setDailyReadingGoal(getDailyReadingGoalSnapshot());
+    }
+  }, [activeTab]);
+
+  useEffect(() => {
+    const handleFocus = () => {
+      setDailyReadingGoal(getDailyReadingGoalSnapshot());
+    };
+    window.addEventListener('focus', handleFocus);
+    return () => window.removeEventListener('focus', handleFocus);
+  }, []);
+
+  const handleUpdateDailyReadingGoal = useCallback((pages: number) => {
+    setDailyReadingGoal(setDailyReadingGoalPages(pages));
+  }, []);
 
   activeBookIdRef.current = activeBook?.id ?? null;
   currentPageRef.current = currentPage;
@@ -553,6 +581,11 @@ export default function App() {
       })
       .catch(() => {});
 
+    // Record this unique page toward today's Daily Reading Goal when actively reading
+    if (activeTab === 'reader') {
+      setDailyReadingGoal(recordPageReadToday(activeBookId, currentPage));
+    }
+
     (async () => {
       // 1. Check cached translation immediately for instant offline rendering
       const cachedTr = await getTranslation(activeBookId, targetLang, currentPage);
@@ -608,7 +641,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [activeBookId, loadedPdf, currentPage, targetLang, syncUpdatedBookInState]);
+  }, [activeBookId, loadedPdf, currentPage, targetLang, activeTab, syncUpdatedBookInState]);
 
   // Upload a new PDF file from disk
   const handleUploadPdf = async (file: File) => {
@@ -2620,6 +2653,8 @@ export default function App() {
             activeBookId={activeBook?.id ?? null}
             translatedCountsByBook={translatedCountsByBook}
             allLangTranslationCountsByBook={allLangTranslationCountsByBook}
+            dailyReadingGoal={dailyReadingGoal}
+            onChangeDailyGoal={handleUpdateDailyReadingGoal}
             isOnline={isOnline}
             swStatus={swStatus}
             cachedBookIds={cachedBookIds}
