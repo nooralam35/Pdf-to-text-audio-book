@@ -115,6 +115,21 @@ function createSilentWavBlobUrl(durationSec = 4, sampleRate = 8000): string {
   return URL.createObjectURL(new Blob([buffer], { type: 'audio/wav' }));
 }
 
+let cachedSilentUnlockUrl: string | null = null;
+
+/**
+ * Returns a real, valid 250ms silent 16-bit PCM WAV Blob URL.
+ * Unlike 0-byte WAV data URIs (which mobile Safari/Chrome often reject),
+ * playing this valid PCM clip inside a tap gesture reliably unlocks an HTMLAudioElement.
+ */
+export function getSilentUnlockWavUrl(): string {
+  if (typeof window === 'undefined' || typeof Blob === 'undefined') return '';
+  if (!cachedSilentUnlockUrl) {
+    cachedSilentUnlockUrl = createSilentWavBlobUrl(0.25, 8000);
+  }
+  return cachedSilentUnlockUrl;
+}
+
 export class BackgroundAudioKeepAlive {
   private audioEl: HTMLAudioElement | null = null;
   private blobUrl: string | null = null;

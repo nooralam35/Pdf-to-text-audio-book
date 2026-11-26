@@ -1,5 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
+  AudioLines,
   Check,
   ChevronDown,
   Download,
@@ -13,13 +15,17 @@ import {
   Sparkles,
   Square,
   Timer,
+  Volume1,
   Volume2,
+  VolumeX,
+  X,
 } from 'lucide-react';
 import { ElementPitchShifter } from '../lib/audioPitchShifter';
 import {
   AudioWakeLock,
   BackgroundAudioKeepAlive,
   getCachedTtsAudioBlob,
+  getSilentUnlockWavUrl,
   putCachedTtsAudioBlob,
   registerMediaSessionHandlers,
   updateMediaSessionState,
@@ -33,11 +39,17 @@ import {
 } from '../lib/translatorClient';
 import {
   AI_VOICE_PROFILES,
+  VOICE_STYLE_PREFERENCES,
+  clampVoicePitch,
+  clampVoiceVolume,
   detectSentenceProsody,
   getAiVoiceProfile,
   getPreferredVoiceProfileForStyle,
   getVoiceStylePreferenceFromProfile,
   getVoiceStylePreferenceOption,
+  loadVoiceProfileSettings,
+  resetVoiceProfileSettings,
+  saveVoiceProfileSettings,
   type AiVoiceProfileId,
   type SentenceProsodyKind,
   type VoiceStylePreference,
@@ -51,6 +63,54 @@ import type {
 } from '../types';
 
 type SpeechEngineMode = 'hd' | 'device';
+type TtsExpressiveness = 'calm' | 'balanced' | 'expressive';
+type NeuralVoiceFilter =
+  | 'all'
+  | 'Teacher'
+  | 'Female'
+  | 'Male'
+  | 'Expressive'
+  | 'Natural'
+  | 'Calm'
+  | 'Deep';
+
+const PROSODY_LABELS: Record<SentenceProsodyKind, string> = {
+  heading: 'Heading lift',
+  question: 'Question rise',
+  exclamation: 'Emphasis',
+  list: 'Step-by-step',
+  caption: 'Illustration note',
+  narration: 'Teacher cadence',
+};
+
+function getTeacherSampleLine(lang: LanguageCode, voiceName: string): string {
+  switch (lang) {
+    case 'hi':
+      return `नमस्ते! मैं ${voiceName} हूँ। आज हम इस अध्याय को सहज उतार-चढ़ाव, स्पष्ट विराम और अनुभवी शिक्षक की लय के साथ समझेंगे — क्या आप तैयार हैं?`;
+    case 'hinglish':
+      return `Namaste! Main ${voiceName} hoon. Aaj hum is chapter ko bilkul natural rise-and-fall, clear pauses aur experienced teacher ki laya ke saath samjhenge — kya aap taiyaar hain?`;
+    case 'bn':
+      return `নমস্কার! আমি ${voiceName}। আজ আমরা এই অধ্যায়টি স্বাভাবিক সুর, স্পষ্ট বিরতি এবং একজন অভিজ্ঞ শিক্ষকের ছন্দে বুঝব — আপনি কি প্রস্তুত?`;
+    case 'ta':
+      return `வணக்கம்! நான் ${voiceName}. இன்று இந்த அத்தியாயத்தை இயல்பான ஏற்ற இறக்கத்துடனும், தெளிவான இடைவெளிகளுடனும் ஒரு அனுபவமிக்க ஆசிரியரைப் போல கற்றுக்கொள்வோம் — தொடங்கலாமா?`;
+    case 'te':
+      return `నమస్కారం! నేను ${voiceName}. ఈ రోజు ఈ అధ్యాయాన్ని సహజమైన స్వర మార్పులు, స్పష్టమైన విరామాలతో అనుభవజ్ఞుడైన ఉపాధ్యాయుడిలా అర్థం చేసుకుందాం — సిద్ధమా?`;
+    case 'mr':
+      return `नमस्कार! मी ${voiceName} आहे. आज आपण हा धडा नैसर्गिक चढ-उतार, स्पष्ट विराम आणि अनुभवी शिक्षकाच्या लयीत समजून घेऊया — तुम्ही तयार आहात का?`;
+    case 'ur':
+      return `السلام علیکم! میں ${voiceName} ہوں۔ آج ہم اس باب کو فطری اتار چڑھاؤ، واضح وقفوں اور ایک تجربہ کار استاد کے انداز میں سمجھیں گے — کیا آپ تیار ہیں؟`;
+    case 'es':
+      return `¡Hola! Soy ${voiceName}. Hoy exploraremos este capítulo con entonación natural, pausas claras y el ritmo cercano de un buen maestro — ¿listo para empezar?`;
+    case 'fr':
+      return `Bonjour ! Je suis ${voiceName}. Aujourd'hui, découvrons ce chapitre avec une intonation vivante, des pauses naturelles et le rythme d'un professeur expérimenté — prêt ?`;
+    case 'de':
+      return `Hallo! Ich bin ${voiceName}. Heute entdecken wir dieses Kapitel mit natürlicher Betonung, klaren Pausen und dem Rhythmus einer erfahrenen Lehrkraft — bereit?`;
+    case 'ar':
+      return `مرحبًا! أنا ${voiceName}. اليوم سنستكشف هذا الفصل بنبرة طبيعية ووقفات واضحة وإيقاع معلم خبير — هل أنت مستعد لنبدأ؟`;
+    default:
+      return `Hello! I'm ${voiceName}. Let's explore this chapter together with warm vocal rise and fall, thoughtful pauses, and an experienced teacher's natural rhythm — ready to begin?`;
+  }
+}
 
 function estimateSentenceBaseSeconds(text: string): number {
   const cleaned = text.trim();
@@ -154,15 +214,41 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     return getAiVoiceProfile(saved).id;
   });
   const [neuralMenuOpen, setNeuralMenuOpen] = useState(false);
-  const [neuralFilter, setNeuralFilter] = useState<
-    'all' | 'Teacher' | 'Female' | 'Male' | 'Expressive' | 'Natural'
-  >('all');
+  const [neuralFilter, setNeuralFilter] = useState<NeuralVoiceFilter>('all');
+  const [expressiveness, setExpressiveness] = useState<TtsExpressiveness>(() => {
+    if (typeof window === 'undefined') return 'expressive';
+    const saved = localStorage.getItem('bhashabook-tts-expressiveness');
+    return saved === 'calm' || saved === 'balanced' ? saved : 'expressive';
+  });
+  const [adaptiveProsody, setAdaptiveProsody] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return true;
+    const saved = localStorage.getItem('bhashabook-tts-adaptive-prosody');
+    return saved !== 'false';
+  });
   const [previewingNeuralId, setPreviewingNeuralId] = useState<AiVoiceProfileId | null>(null);
+  const [previewStatus, setPreviewStatus] = useState<'idle' | 'loading' | 'playing'>('idle');
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [liveNeuralModel, setLiveNeuralModel] = useState<string | null>(null);
+  const [activeProsodyKind, setActiveProsodyKind] = useState<SentenceProsodyKind | null>(null);
+  const [desktopMenuPos, setDesktopMenuPos] = useState<{ left: number; bottom: number } | null>(
+    null
+  );
   const neuralDropdownRef = useRef<HTMLDivElement | null>(null);
+  const neuralTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const neuralPortalRef = useRef<HTMLDivElement | null>(null);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
   const previewAbortRef = useRef<AbortController | null>(null);
+  const previewSessionRef = useRef(0);
   const [rate, setRate] = useState(1.0); // 0.5x .. 2.0x
-  const [pitch, setPitch] = useState(1.0); // 0.5 .. 1.8
+  const [pitch, setPitch] = useState<number>(() =>
+    loadVoiceProfileSettings(aiVoiceProfileId).pitch
+  ); // 0.5 .. 1.8
+  const [volume, setVolume] = useState<number>(() =>
+    loadVoiceProfileSettings(aiVoiceProfileId).volume
+  ); // 0.0 .. 1.0
+  const lastNonZeroVolumeRef = useRef<number>(
+    Math.max(0.25, loadVoiceProfileSettings(aiVoiceProfileId).volume || 1.0)
+  );
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [voicesLoaded, setVoicesLoaded] = useState(false);
   const [selectedVoiceId, setSelectedVoiceId] = useState<string>('');
@@ -239,8 +325,11 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
   } | null>(null);
   const rateRef = useRef(rate);
   const pitchRef = useRef(pitch);
+  const volumeRef = useRef(volume);
   const voiceIdRef = useRef(selectedVoiceId);
   const aiVoiceProfileIdRef = useRef<AiVoiceProfileId>(aiVoiceProfileId);
+  const expressivenessRef = useRef<TtsExpressiveness>(expressiveness);
+  const adaptiveProsodyRef = useRef<boolean>(adaptiveProsody);
   const voiceStylePrefRef = useRef<VoiceStylePreference>(voiceStylePreference);
   const prevVoiceStylePrefRef = useRef<VoiceStylePreference>(voiceStylePreference);
   const aiAvailableRef = useRef(aiAvailable);
@@ -257,8 +346,11 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
 
   rateRef.current = rate;
   pitchRef.current = pitch;
+  volumeRef.current = volume;
   voiceIdRef.current = selectedVoiceId;
   aiVoiceProfileIdRef.current = aiVoiceProfileId;
+  expressivenessRef.current = expressiveness;
+  adaptiveProsodyRef.current = adaptiveProsody;
   voiceStylePrefRef.current = voiceStylePreference;
   aiAvailableRef.current = aiAvailable;
   autoAdvanceRef.current = autoAdvance;
@@ -327,6 +419,18 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
       );
       setAiVoiceProfileId(nextProfileId);
       aiVoiceProfileIdRef.current = nextProfileId;
+      const profileSettings = loadVoiceProfileSettings(nextProfileId);
+      setPitch(profileSettings.pitch);
+      pitchRef.current = profileSettings.pitch;
+      setVolume(profileSettings.volume);
+      volumeRef.current = profileSettings.volume;
+      if (profileSettings.volume > 0) {
+        lastNonZeroVolumeRef.current = profileSettings.volume;
+      }
+      if (audioRef.current) {
+        audioRef.current.volume = profileSettings.volume;
+        audioRef.current.muted = profileSettings.volume <= 0;
+      }
     }
 
     if (isSpeakingRef.current && engineModeRef.current === 'hd' && activeSentenceIndexRef.current !== null) {
@@ -344,26 +448,64 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     }
   }, [engineMode]);
 
-  // Close the Neural TTS voice dropdown on outside click or Escape key
+  useEffect(() => {
+    try {
+      localStorage.setItem('bhashabook-tts-expressiveness', expressiveness);
+    } catch {
+      // ignore storage errors
+    }
+  }, [expressiveness]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('bhashabook-tts-adaptive-prosody', String(adaptiveProsody));
+    } catch {
+      // ignore storage errors
+    }
+  }, [adaptiveProsody]);
+
+  // Compute viewport-safe desktop popover position & close on Escape / outside pointer
   useEffect(() => {
     if (!neuralMenuOpen) return;
-    const handlePointerDown = (e: MouseEvent) => {
+
+    const updatePosition = () => {
+      const btn = neuralTriggerRef.current;
+      if (!btn) return;
+      const rect = btn.getBoundingClientRect();
+      const panelWidth = Math.min(404, window.innerWidth - 24);
+      const clampedLeft = Math.max(
+        12,
+        Math.min(rect.left, window.innerWidth - panelWidth - 12)
+      );
+      const bottom = Math.max(12, window.innerHeight - rect.top + 10);
+      setDesktopMenuPos({ left: clampedLeft, bottom });
+    };
+
+    updatePosition();
+    window.addEventListener('resize', updatePosition);
+    window.addEventListener('scroll', updatePosition, true);
+
+    const handlePointerDown = (e: PointerEvent) => {
+      const target = e.target as Node;
       if (
-        neuralDropdownRef.current &&
-        !neuralDropdownRef.current.contains(e.target as Node)
+        neuralTriggerRef.current?.contains(target) ||
+        neuralPortalRef.current?.contains(target)
       ) {
-        setNeuralMenuOpen(false);
+        return;
       }
+      setNeuralMenuOpen(false);
     };
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         setNeuralMenuOpen(false);
       }
     };
-    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('pointerdown', handlePointerDown);
     document.addEventListener('keydown', handleKeyDown);
     return () => {
-      document.removeEventListener('mousedown', handlePointerDown);
+      window.removeEventListener('resize', updatePosition);
+      window.removeEventListener('scroll', updatePosition, true);
+      document.removeEventListener('pointerdown', handlePointerDown);
       document.removeEventListener('keydown', handleKeyDown);
     };
   }, [neuralMenuOpen]);
@@ -500,7 +642,8 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
       clipSource === 'ai'
         ? pitchRef.current
         : Math.max(0.5, Math.min(1.8, pitchRef.current * profile.fallbackPitch));
-    return { effectiveRate, effectivePitch };
+    const effectiveVolume = clampVoiceVolume(volumeRef.current);
+    return { effectiveRate, effectivePitch, effectiveVolume };
   };
 
   const stopPlayback = (clearHighlight = false) => {
@@ -872,38 +1015,57 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     voiceProfileId: AiVoiceProfileId,
     signal?: AbortSignal,
     sentenceKind: SentenceProsodyKind = 'narration'
-  ): Promise<{ url: string; source: 'ai' | 'free' }> => {
+  ): Promise<{ url: string; source: 'ai' | 'free'; model: string }> => {
     const stylePref = voiceStylePrefRef.current;
-    const cacheKey = `v5-teacher-tts::${lang}::${stylePref}::${voiceProfileId}::${sentenceKind}::${text}`;
+    const expr = expressivenessRef.current;
+    const effectiveKind: SentenceProsodyKind = adaptiveProsodyRef.current
+      ? sentenceKind
+      : 'narration';
+    const cacheKey = `v6-neural-studio::${lang}::${stylePref}::${voiceProfileId}::${effectiveKind}::${expr}::${text}`;
     const existing = objectUrlCacheRef.current.get(cacheKey);
-    if (existing) return existing;
+    if (existing) {
+      return {
+        ...existing,
+        model: existing.source === 'ai' ? liveNeuralModel || 'gemini-3.8-flash-tts' : 'free-mp3-fallback',
+      };
+    }
 
     const pending = inFlightFetchRef.current.get(cacheKey);
-    if (pending) return pending;
+    if (pending) {
+      const resolved = await pending;
+      return {
+        ...resolved,
+        model: resolved.source === 'ai' ? liveNeuralModel || 'gemini-3.8-flash-tts' : 'free-mp3-fallback',
+      };
+    }
 
-    const fetchClip = async (): Promise<{ url: string; source: 'ai' | 'free' }> => {
+    const fetchClip = async (): Promise<{ url: string; source: 'ai' | 'free'; model: string }> => {
       // 1. Check persistent offline Cache Storage first so previously heard / prefetched clips play offline instantly
       const cached = await getCachedTtsAudioBlob(cacheKey);
       if (cached) {
-        return { url: URL.createObjectURL(cached.blob), source: cached.source };
+        return {
+          url: URL.createObjectURL(cached.blob),
+          source: cached.source,
+          model: cached.source === 'ai' ? 'gemini-3.8-flash-tts' : 'free-mp3-fallback',
+        };
       }
 
       if (!isCurrentlyOnline()) {
-        // Also check alternate fallback key in persistent Cache Storage before falling back to local device voice
-        const fallbackKey = `v5-teacher-tts::${lang}::free::${text}`;
+        const fallbackKey = `v6-neural-studio::${lang}::free::${text}`;
         if (fallbackKey !== cacheKey) {
           const fallbackCached = await getCachedTtsAudioBlob(fallbackKey);
           if (fallbackCached) {
             return {
               url: URL.createObjectURL(fallbackCached.blob),
               source: fallbackCached.source,
+              model: 'free-mp3-fallback',
             };
           }
         }
         throw new Error('OFFLINE_UNCACHED');
       }
 
-      // 2. Always invoke /api/tts first when online so Gemini 3.8 Neural Teacher TTS runs even before /api/health resolves
+      // 2. Always invoke /api/tts first when online so Gemini 3.8 Neural Teacher TTS runs directly
       try {
         const profile = getAiVoiceProfile(voiceProfileId);
         const prefOption = getVoiceStylePreferenceOption(stylePref);
@@ -914,27 +1076,31 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
           voiceStyle: `${prefOption.styleDirective}. ${profile.style}`,
           languageName: langName,
           targetLang: lang,
-          sentenceKind,
+          sentenceKind: effectiveKind,
           modelTier: profile.modelTier,
+          expressiveness: expr,
           signal,
         });
         const clipSource: 'ai' | 'free' = res.ext === 'wav' ? 'ai' : 'free';
+        if (res.model && res.model.startsWith('gemini-')) {
+          setLiveNeuralModel(res.model);
+        }
         putCachedTtsAudioBlob(cacheKey, res.blob, clipSource).catch(() => {});
         const url = URL.createObjectURL(res.blob);
-        return { url, source: clipSource };
+        return { url, source: clipSource, model: res.model || 'gemini-3.8-flash-tts' };
       } catch (err) {
         if (err instanceof DOMException && err.name === 'AbortError') throw err;
         // Fall back to Free MP3 only if /api/tts completely failed
       }
 
       const blob = await fetchFreeTtsBlob(text, lang, signal);
-      putCachedTtsAudioBlob(`v5-teacher-tts::${lang}::free::${text}`, blob, 'free').catch(() => {});
-      return { url: URL.createObjectURL(blob), source: 'free' };
+      putCachedTtsAudioBlob(`v6-neural-studio::${lang}::free::${text}`, blob, 'free').catch(() => {});
+      return { url: URL.createObjectURL(blob), source: 'free', model: 'free-mp3-fallback' };
     };
 
     const promise = fetchClip()
       .then((entry) => {
-        objectUrlCacheRef.current.set(cacheKey, entry);
+        objectUrlCacheRef.current.set(cacheKey, { url: entry.url, source: entry.source });
         inFlightFetchRef.current.delete(cacheKey);
         return entry;
       })
@@ -943,7 +1109,10 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
         throw err;
       });
 
-    inFlightFetchRef.current.set(cacheKey, promise);
+    inFlightFetchRef.current.set(
+      cacheKey,
+      promise.then(({ url, source }) => ({ url, source }))
+    );
     return promise;
   };
 
@@ -1046,6 +1215,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
       utter.lang = langOption.speechLang;
       utter.rate = rateRef.current;
       utter.pitch = pitchRef.current;
+      utter.volume = clampVoiceVolume(volumeRef.current);
 
       const selectedVoice = pickDeviceVoice(forceLocalVoice);
       if (selectedVoice) {
@@ -1195,6 +1365,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
         span.text,
         blockKindByIdRef.current.get(span.blockId)
       );
+      setActiveProsodyKind(adaptiveProsodyRef.current ? spanKind : 'narration');
 
       try {
         const { url: audioUrl, source: clipSource } = await getSentenceAudioUrl(
@@ -1212,7 +1383,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
         }
 
         currentClipSourceRef.current = clipSource;
-        const { effectiveRate, effectivePitch } = computeEffectiveTone(clipSource);
+        const { effectiveRate, effectivePitch, effectiveVolume } = computeEffectiveTone(clipSource);
 
         audio.onended = null;
         audio.onerror = null;
@@ -1222,6 +1393,8 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
         // Preserve pitch on HTMLAudioElement so Web Audio shifter controls pitch independently
         audio.preservesPitch = true;
         audio.playbackRate = effectiveRate;
+        audio.volume = effectiveVolume;
+        audio.muted = effectiveVolume <= 0;
 
         const shifter = getPitchShifter();
         shifter?.setActive(true);
@@ -1356,28 +1529,38 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     }
   }, [jumpRequest]);
 
-  const SILENT_UNLOCK_DATA_URI =
-    'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=';
-
-  const unlockAudioElement = () => {
-    getKeepAlive().unlock();
-    const audio = audioRef.current;
-    pitchShifterRef.current?.resume().catch(() => {});
-    if (!audio || audioUnlockedRef.current) return;
+  const unlockSingleAudioEl = (el: HTMLAudioElement | null, markMainUnlocked = false) => {
+    if (!el) return;
+    const silentUrl = getSilentUnlockWavUrl();
+    if (!silentUrl) return;
+    // Do not interrupt real audio that is already playing
+    if (!el.paused && el.src && el.src !== silentUrl) {
+      if (markMainUnlocked) audioUnlockedRef.current = true;
+      return;
+    }
     try {
-      audio.src = SILENT_UNLOCK_DATA_URI;
-      const p = audio.play();
+      el.muted = false;
+      el.src = silentUrl;
+      const p = el.play();
       if (p && typeof p.then === 'function') {
         p.then(() => {
-          // Only pause if real TTS audio hasn't already replaced the silent unlock URI
-          if (audio.src === SILENT_UNLOCK_DATA_URI) {
-            audio.pause();
+          if (el.src === silentUrl) {
+            el.pause();
+            el.currentTime = 0;
           }
-          audioUnlockedRef.current = true;
+          if (markMainUnlocked) audioUnlockedRef.current = true;
         }).catch(() => {});
       }
     } catch {
-      // ignore
+      // ignore unlock errors
+    }
+  };
+
+  const unlockAudioElement = () => {
+    getKeepAlive().unlock();
+    pitchShifterRef.current?.resume().catch(() => {});
+    if (!audioUnlockedRef.current) {
+      unlockSingleAudioEl(audioRef.current, true);
     }
   };
 
@@ -1423,11 +1606,13 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     ) {
       pausedInPlaceRef.current = false;
       getKeepAlive().start();
-      const { effectiveRate, effectivePitch } = computeEffectiveTone(
+      const { effectiveRate, effectivePitch, effectiveVolume } = computeEffectiveTone(
         currentClipSourceRef.current
       );
       audioRef.current.preservesPitch = true;
       audioRef.current.playbackRate = effectiveRate;
+      audioRef.current.volume = effectiveVolume;
+      audioRef.current.muted = effectiveVolume <= 0;
       const shifter = getPitchShifter();
       shifter?.setActive(true);
       shifter?.setPitch(effectivePitch);
@@ -1516,62 +1701,205 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     }
   };
 
+  const applyProfileAudioSettings = (profileId: AiVoiceProfileId) => {
+    const loaded = loadVoiceProfileSettings(profileId);
+    setPitch(loaded.pitch);
+    pitchRef.current = loaded.pitch;
+    setVolume(loaded.volume);
+    volumeRef.current = loaded.volume;
+    if (loaded.volume > 0) {
+      lastNonZeroVolumeRef.current = loaded.volume;
+    }
+    if (audioRef.current) {
+      audioRef.current.volume = loaded.volume;
+      audioRef.current.muted = loaded.volume <= 0;
+    }
+    if (previewAudioRef.current) {
+      previewAudioRef.current.volume = loaded.volume;
+      previewAudioRef.current.muted = loaded.volume <= 0;
+    }
+    if (engineModeRef.current === 'hd') {
+      const { effectivePitch } = computeEffectiveTone(currentClipSourceRef.current);
+      const shifter = getPitchShifter();
+      shifter?.setPitch(effectivePitch);
+    }
+  };
+
   const handlePitchChange = (newPitch: number) => {
-    const rounded = Math.round(newPitch * 20) / 20;
+    const rounded = clampVoicePitch(newPitch);
     setPitch(rounded);
     pitchRef.current = rounded;
+    saveVoiceProfileSettings(aiVoiceProfileIdRef.current, { pitch: rounded });
     if (engineMode === 'hd') {
       const { effectivePitch } = computeEffectiveTone(currentClipSourceRef.current);
       const shifter = getPitchShifter();
       shifter?.setPitch(effectivePitch);
+      shifter?.resume().catch(() => {});
     } else if (isSpeaking && activeSentenceIndex !== null) {
       speakFromIndex(activeSentenceIndex);
     }
   };
 
+  const handleVolumeChange = (newVolume: number) => {
+    const clamped = clampVoiceVolume(newVolume);
+    setVolume(clamped);
+    volumeRef.current = clamped;
+    if (clamped > 0) {
+      lastNonZeroVolumeRef.current = clamped;
+    }
+    saveVoiceProfileSettings(aiVoiceProfileIdRef.current, { volume: clamped });
+    if (audioRef.current) {
+      audioRef.current.volume = clamped;
+      audioRef.current.muted = clamped <= 0;
+    }
+    if (previewAudioRef.current) {
+      previewAudioRef.current.volume = clamped;
+      previewAudioRef.current.muted = clamped <= 0;
+    }
+    if (engineMode === 'device' && isSpeaking && activeSentenceIndex !== null) {
+      speakFromIndex(activeSentenceIndex);
+    }
+  };
+
+  const handleToggleMute = () => {
+    if (volumeRef.current > 0) {
+      lastNonZeroVolumeRef.current = volumeRef.current;
+      handleVolumeChange(0);
+    } else {
+      handleVolumeChange(lastNonZeroVolumeRef.current || activeVoiceProfile.defaultVolume || 1.0);
+    }
+  };
+
   const stopNeuralPreview = () => {
+    previewSessionRef.current++;
     if (previewAbortRef.current) {
       previewAbortRef.current.abort();
       previewAbortRef.current = null;
     }
-    if (previewAudioRef.current) {
-      previewAudioRef.current.pause();
-      previewAudioRef.current.src = '';
+    const el = previewAudioRef.current;
+    if (el) {
+      el.onended = null;
+      el.onerror = null;
+      el.onplaying = null;
+      el.pause();
+      try {
+        el.currentTime = 0;
+      } catch {
+        // ignore
+      }
+    }
+    if (speechSupported) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {
+        // ignore
+      }
     }
     setPreviewingNeuralId(null);
+    setPreviewStatus('idle');
+    setPreviewError(null);
   };
 
-  const handleVoiceProfileChange = (nextProfileId: AiVoiceProfileId) => {
+  const handleVoiceProfileChange = (nextProfileId: AiVoiceProfileId, closeAfterSelect = false) => {
     unlockAudioElement();
     stopNeuralPreview();
     setAiVoiceProfileId(nextProfileId);
     aiVoiceProfileIdRef.current = nextProfileId;
+    applyProfileAudioSettings(nextProfileId);
     const syncedPref = getVoiceStylePreferenceFromProfile(nextProfileId);
     prevVoiceStylePrefRef.current = syncedPref;
     voiceStylePrefRef.current = syncedPref;
     onVoiceStylePreferenceChange?.(syncedPref);
-    setNeuralMenuOpen(false);
+    if (closeAfterSelect) {
+      setNeuralMenuOpen(false);
+    }
 
-    const wasPlaying = isSpeaking;
-    const resumeIdx = activeSentenceIndex ?? 0;
+    const wasPlaying = isSpeakingRef.current;
+    const resumeIdx = activeSentenceIndexRef.current ?? 0;
 
     // Automatically switch narration engine to Neural HD when user chooses a Neural TTS voice
     if (engineModeRef.current !== 'hd') {
       stopPlayback(false);
       setEngineMode('hd');
       engineModeRef.current = 'hd';
-      if (wasPlaying && sentences.length > 0) {
+      if (wasPlaying && sentencesRef.current.length > 0) {
         setTimeout(() => speakFromIndex(resumeIdx), 30);
       }
       return;
     }
 
     // Re-synthesize current sentence immediately in the newly chosen Neural voice
-    if (wasPlaying && activeSentenceIndex !== null) {
-      speakFromIndex(activeSentenceIndex);
+    if (wasPlaying && activeSentenceIndexRef.current !== null) {
+      speakFromIndex(activeSentenceIndexRef.current);
     } else {
       pausedInPlaceRef.current = false;
     }
+  };
+
+  const handleStylePreferenceSelect = (nextPref: VoiceStylePreference) => {
+    unlockAudioElement();
+    stopNeuralPreview();
+    prevVoiceStylePrefRef.current = nextPref;
+    voiceStylePrefRef.current = nextPref;
+    onVoiceStylePreferenceChange?.(nextPref);
+
+    const nextProfileId = getPreferredVoiceProfileForStyle(nextPref, aiVoiceProfileIdRef.current);
+    setAiVoiceProfileId(nextProfileId);
+    aiVoiceProfileIdRef.current = nextProfileId;
+    applyProfileAudioSettings(nextProfileId);
+
+    if (engineModeRef.current !== 'hd') {
+      setEngineMode('hd');
+      engineModeRef.current = 'hd';
+    }
+    if (isSpeakingRef.current && activeSentenceIndexRef.current !== null) {
+      speakFromIndex(activeSentenceIndexRef.current);
+    } else {
+      pausedInPlaceRef.current = false;
+    }
+  };
+
+  const handleExpressivenessChange = (nextExpr: TtsExpressiveness) => {
+    unlockAudioElement();
+    setExpressiveness(nextExpr);
+    expressivenessRef.current = nextExpr;
+    if (
+      isSpeakingRef.current &&
+      engineModeRef.current === 'hd' &&
+      activeSentenceIndexRef.current !== null
+    ) {
+      speakFromIndex(activeSentenceIndexRef.current);
+    }
+  };
+
+  const handleAdaptiveProsodyToggle = () => {
+    unlockAudioElement();
+    const next = !adaptiveProsodyRef.current;
+    setAdaptiveProsody(next);
+    adaptiveProsodyRef.current = next;
+    if (
+      isSpeakingRef.current &&
+      engineModeRef.current === 'hd' &&
+      activeSentenceIndexRef.current !== null
+    ) {
+      speakFromIndex(activeSentenceIndexRef.current);
+    }
+  };
+
+  const handleStartListeningFromStudio = () => {
+    unlockAudioElement();
+    stopNeuralPreview();
+    setNeuralMenuOpen(false);
+    if (engineModeRef.current !== 'hd') {
+      setEngineMode('hd');
+      engineModeRef.current = 'hd';
+    }
+    if (isSpeakingRef.current) {
+      const resumeIdx = activeSentenceIndexRef.current ?? 0;
+      speakFromIndex(resumeIdx);
+      return;
+    }
+    handlePlayPause();
   };
 
   const handlePreviewNeuralVoice = async (
@@ -1586,43 +1914,27 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     }
 
     stopNeuralPreview();
-    if (isSpeaking) {
+    if (isSpeakingRef.current) {
       stopPlayback(false);
     }
 
-    // Synchronously create & unlock preview Audio element INSIDE the click gesture so mobile Safari/Chrome allow playback after async fetch
-    const el = previewAudioRef.current ?? new Audio();
-    el.setAttribute('playsinline', 'true');
-    el.setAttribute('webkit-playsinline', 'true');
-    previewAudioRef.current = el;
-    try {
-      el.src = SILENT_UNLOCK_DATA_URI;
-      const unlockP = el.play();
-      if (unlockP && typeof unlockP.then === 'function') {
-        unlockP
-          .then(() => {
-            if (el.src === SILENT_UNLOCK_DATA_URI) {
-              el.pause();
-            }
-          })
-          .catch(() => {});
-      }
-    } catch {
-      // ignore unlock errors
-    }
-
+    const session = ++previewSessionRef.current;
     const profile = getAiVoiceProfile(profileId);
+
+    // Synchronously unlock the mounted preview <audio> element INSIDE the tap gesture with a real 250ms silent PCM WAV
+    const el = previewAudioRef.current;
+    unlockSingleAudioEl(el, false);
+    unlockAudioElement();
+
     const controller = new AbortController();
     previewAbortRef.current = controller;
     setPreviewingNeuralId(profileId);
+    setPreviewStatus('loading');
+    setPreviewError(null);
 
-    const sampleSource =
-      sentences[activeSentenceIndex ?? 0]?.text ||
-      (effectiveAudioLang === 'hi' || effectiveAudioLang === 'hinglish'
-        ? `नमस्ते! मैं ${profile.name} हूँ — आज हम इस पाठ को बिल्कुल सहज लय और स्पष्ट उतार-चढ़ाव के साथ समझेंगे, क्या आप तैयार हैं?`
-        : `Hello! I'm ${profile.name}. Let's explore this chapter together with clear emphasis, natural rhythm, and engaging intonation — ready to begin?`);
-    const sampleText = sampleSource.slice(0, 145);
-    const sampleKind = detectSentenceProsody(sampleText);
+    // Always use a rich, expressive teacher demonstration sentence in the active language so voices compare clearly & hit server cache fast
+    const sampleText = getTeacherSampleLine(effectiveAudioLang, profile.name);
+    const sampleKind: SentenceProsodyKind = 'question';
 
     try {
       const { url, source } = await getSentenceAudioUrl(
@@ -1632,28 +1944,119 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
         controller.signal,
         sampleKind
       );
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || previewSessionRef.current !== session) return;
+      if (!el) {
+        throw new Error('Preview audio element is unavailable.');
+      }
 
-      el.onended = () => setPreviewingNeuralId(null);
-      el.onerror = () => setPreviewingNeuralId(null);
+      el.onplaying = () => {
+        if (previewSessionRef.current === session) {
+          setPreviewStatus('playing');
+        }
+      };
+      el.onended = () => {
+        if (previewSessionRef.current === session) {
+          setPreviewingNeuralId(null);
+          setPreviewStatus('idle');
+        }
+      };
+      el.onerror = () => {
+        if (previewSessionRef.current === session) {
+          setPreviewingNeuralId(null);
+          setPreviewStatus('idle');
+          setPreviewError(`Unable to play ${profile.name} audio clip in this browser.`);
+        }
+      };
+
+      const previewSettings = loadVoiceProfileSettings(profileId);
+      const previewVolume =
+        profileId === aiVoiceProfileIdRef.current
+          ? clampVoiceVolume(volumeRef.current)
+          : previewSettings.volume;
+      el.muted = previewVolume <= 0;
+      el.volume = previewVolume;
       el.src = url;
       el.preservesPitch = true;
       el.playbackRate =
         source === 'ai'
           ? rateRef.current
           : Math.max(0.5, Math.min(2.0, rateRef.current * profile.fallbackRate));
+      el.load();
       await el.play();
-    } catch (err) {
-      if (!(err instanceof DOMException && err.name === 'AbortError')) {
-        setAudioMessage(`Unable to preview ${profile.name} voice right now.`);
+      if (previewSessionRef.current === session) {
+        setPreviewStatus('playing');
       }
+    } catch (err) {
+      if (controller.signal.aborted || previewSessionRef.current !== session) return;
+
+      // Offline fallback: speak preview with local device voice instead of failing silently
+      if (!isCurrentlyOnline() && speechSupported) {
+        try {
+          window.speechSynthesis.cancel();
+          const previewSettings = loadVoiceProfileSettings(profileId);
+          const utter = new SpeechSynthesisUtterance(sampleText);
+          utter.lang = langOption.speechLang;
+          utter.rate = rateRef.current;
+          utter.pitch = previewSettings.pitch;
+          utter.volume = previewSettings.volume;
+          utter.onstart = () => {
+            if (previewSessionRef.current === session) setPreviewStatus('playing');
+          };
+          utter.onend = () => {
+            if (previewSessionRef.current === session) {
+              setPreviewingNeuralId(null);
+              setPreviewStatus('idle');
+            }
+          };
+          utter.onerror = () => {
+            if (previewSessionRef.current === session) {
+              setPreviewingNeuralId(null);
+              setPreviewStatus('idle');
+            }
+          };
+          window.speechSynthesis.speak(utter);
+          setPreviewError('Offline — previewing with device voice.');
+          return;
+        } catch {
+          // fall through to error message
+        }
+      }
+
+      const msg =
+        err instanceof DOMException && err.name === 'NotAllowedError'
+          ? `Tap Test on ${profile.name} once more to allow browser audio playback.`
+          : `Unable to preview ${profile.name} right now. Please try again.`;
+      setPreviewError(msg);
       setPreviewingNeuralId(null);
+      setPreviewStatus('idle');
     }
   };
 
   const handleResetTone = () => {
+    const defaults = resetVoiceProfileSettings(aiVoiceProfileIdRef.current);
     handleSpeedChange(1.0);
-    handlePitchChange(1.0);
+    setPitch(defaults.pitch);
+    pitchRef.current = defaults.pitch;
+    setVolume(defaults.volume);
+    volumeRef.current = defaults.volume;
+    if (defaults.volume > 0) {
+      lastNonZeroVolumeRef.current = defaults.volume;
+    }
+    if (audioRef.current) {
+      audioRef.current.volume = defaults.volume;
+      audioRef.current.muted = defaults.volume <= 0;
+    }
+    if (previewAudioRef.current) {
+      previewAudioRef.current.volume = defaults.volume;
+      previewAudioRef.current.muted = defaults.volume <= 0;
+    }
+    if (engineMode === 'hd') {
+      const { effectivePitch } = computeEffectiveTone(currentClipSourceRef.current);
+      const shifter = getPitchShifter();
+      shifter?.setPitch(effectivePitch);
+    } else if (isSpeaking && activeSentenceIndex !== null) {
+      speakFromIndex(activeSentenceIndex);
+    }
   };
 
   const handleEngineSwitch = (nextMode: SpeechEngineMode) => {
@@ -1724,6 +2127,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
       utter.lang = chosenEntry?.voice.lang || langOption.speechLang;
       utter.rate = rateRef.current;
       utter.pitch = pitchRef.current;
+      utter.volume = clampVoiceVolume(volumeRef.current);
       if (chosenEntry) {
         utter.voice = chosenEntry.voice;
       }
@@ -1752,7 +2156,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
       const effectiveLang: LanguageCode = useOriginal ? 'en' : targetLang;
       const effectiveLangOption = getLanguageOption(effectiveLang);
       const prefOption = getVoiceStylePreferenceOption(voiceStylePrefRef.current);
-      const { blob, ext } = await synthesizePageAudio({
+      const { blob, ext, model } = await synthesizePageAudio({
         text: narrationText,
         voiceName: activeVoiceProfile.voiceName,
         voiceStyle: `${prefOption.styleDirective}. ${activeVoiceProfile.style}`,
@@ -1760,7 +2164,12 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
         targetLang: effectiveLang,
         sentenceKind: 'narration',
         modelTier: activeVoiceProfile.modelTier,
+        expressiveness: expressivenessRef.current,
+        timeoutMs: 75000,
       });
+      if (model && model.startsWith('gemini-')) {
+        setLiveNeuralModel(model);
+      }
       const slug = bookTitle
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '-')
@@ -1783,7 +2192,10 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
   const canTranslateAndPlay = Boolean(parsedPage && !parsedPage.isBlank);
   const canClickListen = hasText || canTranslateAndPlay;
   const currentPos = activeSentenceIndex !== null ? activeSentenceIndex + 1 : 0;
-  const isCustomTone = Math.abs(rate - 1.0) > 0.01 || Math.abs(pitch - 1.0) > 0.01;
+  const isCustomTone =
+    Math.abs(rate - 1.0) > 0.01 ||
+    Math.abs(pitch - activeVoiceProfile.defaultPitch) > 0.01 ||
+    Math.abs(volume - activeVoiceProfile.defaultVolume) > 0.01;
 
   // Build speed-adjusted chapter audio timeline for remaining duration & interactive seek slider
   const chapterTimeline = useMemo(() => {
@@ -2127,9 +2539,12 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     rate,
   ]);
 
+  const isNeuralEngineActive = aiAvailable || Boolean(liveNeuralModel);
+
   return (
     <div className="no-print sticky bottom-0 z-20 border-t border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#FAF9F5]/95 sepia:bg-[#F4ECD8]/95 dark:bg-[#141312]/95 backdrop-blur-sm">
       <audio ref={audioRef} playsInline preload="auto" className="hidden" />
+      <audio ref={previewAudioRef} playsInline preload="auto" className="hidden" />
 
       {audioMessage && (
         <div className="px-4 py-1.5 text-xs bg-amber-50 dark:bg-amber-950/40 text-amber-900 dark:text-amber-200 border-b border-amber-200/70 dark:border-amber-900/50 flex items-center justify-between gap-2">
@@ -2376,9 +2791,10 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
           <button
             type="button"
             disabled={!hasText}
-            onClick={() =>
-              speakFromIndex(Math.max(0, (activeSentenceIndex ?? 0) - 1))
-            }
+            onClick={() => {
+              unlockAudioElement();
+              speakFromIndex(Math.max(0, (activeSentenceIndex ?? 0) - 1));
+            }}
             aria-label="Previous sentence"
             className="h-9 w-8 sm:w-9 inline-flex items-center justify-center rounded-md text-stone-600 dark:text-stone-300 hover:bg-stone-200/70 dark:hover:bg-stone-800 disabled:opacity-35 cursor-pointer"
           >
@@ -2413,11 +2829,12 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
           <button
             type="button"
             disabled={!hasText}
-            onClick={() =>
+            onClick={() => {
+              unlockAudioElement();
               speakFromIndex(
                 Math.min(sentences.length - 1, (activeSentenceIndex ?? -1) + 1)
-              )
-            }
+              );
+            }}
             aria-label="Next sentence"
             className="h-9 w-8 sm:w-9 inline-flex items-center justify-center rounded-md text-stone-600 dark:text-stone-300 hover:bg-stone-200/70 dark:hover:bg-stone-800 disabled:opacity-35 cursor-pointer"
           >
@@ -2467,7 +2884,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
             </span>
           </label>
 
-          {/* Pitch Slider */}
+          {/* Pitch Slider (persisted per voice profile) */}
           <label className="inline-flex items-center gap-1.5 text-[11px] text-stone-600 dark:text-stone-400 whitespace-nowrap">
             <span className="uppercase tracking-wider font-medium text-[10px]">Pitch</span>
             <input
@@ -2477,20 +2894,52 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
               step={0.05}
               value={pitch}
               onChange={(e) => handlePitchChange(parseFloat(e.target.value))}
-              aria-label="Playback pitch"
+              aria-label={`Playback pitch for ${activeVoiceProfile.name}`}
               className="w-16 sm:w-20 accent-amber-700 cursor-pointer"
             />
-            <span className="font-mono-num w-9 text-stone-800 dark:text-stone-200">
+            <span className="font-mono-num tabular-nums w-9 text-stone-800 dark:text-stone-200">
               {pitch.toFixed(2).replace(/0$/, '')}x
             </span>
           </label>
+
+          {/* Volume Slider with Mute Toggle (persisted per voice profile) */}
+          <div className="inline-flex items-center gap-1.5 text-[11px] text-stone-600 dark:text-stone-400 whitespace-nowrap">
+            <button
+              type="button"
+              onClick={handleToggleMute}
+              title={volume <= 0 ? 'Unmute audio' : 'Mute audio'}
+              aria-label={volume <= 0 ? 'Unmute audio' : 'Mute audio'}
+              className="h-6 w-6 inline-flex items-center justify-center rounded text-stone-600 dark:text-stone-300 hover:bg-stone-200/70 dark:hover:bg-stone-800 cursor-pointer shrink-0"
+            >
+              {volume <= 0 ? (
+                <VolumeX className="w-3.5 h-3.5 text-amber-700 dark:text-amber-400" />
+              ) : volume < 0.5 ? (
+                <Volume1 className="w-3.5 h-3.5" />
+              ) : (
+                <Volume2 className="w-3.5 h-3.5" />
+              )}
+            </button>
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.05}
+              value={volume}
+              onChange={(e) => handleVolumeChange(parseFloat(e.target.value))}
+              aria-label={`Playback volume for ${activeVoiceProfile.name}`}
+              className="w-16 sm:w-20 accent-amber-700 cursor-pointer"
+            />
+            <span className="font-mono-num tabular-nums w-8 text-stone-800 dark:text-stone-200">
+              {Math.round(volume * 100)}%
+            </span>
+          </div>
 
           {isCustomTone && (
             <button
               type="button"
               onClick={handleResetTone}
-              title="Reset speed and pitch to 1.0x"
-              aria-label="Reset speed and pitch"
+              title={`Reset speed, pitch (${activeVoiceProfile.defaultPitch.toFixed(2).replace(/0$/, '')}x), and volume (${Math.round(activeVoiceProfile.defaultVolume * 100)}%) to ${activeVoiceProfile.name} defaults`}
+              aria-label="Reset speed, pitch, and volume to voice profile defaults"
               className="h-6 px-1.5 inline-flex items-center gap-1 rounded text-[11px] text-stone-500 hover:text-stone-900 dark:text-stone-400 dark:hover:text-stone-100 hover:bg-stone-200/70 dark:hover:bg-stone-800 cursor-pointer"
             >
               <RotateCcw className="w-3 h-3" />
@@ -2498,16 +2947,21 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
             </button>
           )}
 
-          {/* Neural TTS Voice Selector Dropdown (Male, Female, Natural, Expressive — used for live Neural playback & Audio generation) */}
+          {/* Neural TTS Voice Studio Trigger + Portal Bottom Sheet / Popover */}
           <div ref={neuralDropdownRef} className="relative shrink-0">
             <button
+              ref={neuralTriggerRef}
               type="button"
-              onClick={() => setNeuralMenuOpen((prev) => !prev)}
-              aria-haspopup="listbox"
+              onClick={() => {
+                unlockAudioElement();
+                setPreviewError(null);
+                setNeuralMenuOpen((prev) => !prev);
+              }}
+              aria-haspopup="dialog"
               aria-expanded={neuralMenuOpen}
-              aria-label="Choose neural TTS voice for audiobook generation"
+              aria-label="Choose neural TTS voice and teaching style"
               title={`Neural TTS Voice: ${activeVoiceProfile.name} (${activeVoiceProfile.tagline}) — ${activeVoiceProfile.description}`}
-              className={`h-7 px-2.5 inline-flex items-center gap-1.5 rounded border text-xs transition-colors cursor-pointer whitespace-nowrap ${
+              className={`h-8 px-2.5 inline-flex items-center gap-1.5 rounded-md border text-xs transition-colors cursor-pointer whitespace-nowrap ${
                 engineMode === 'hd'
                   ? 'border-amber-700/60 dark:border-amber-500/60 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] text-stone-900 dark:text-stone-100 font-medium'
                   : 'border-stone-300 sepia:border-[#D4C7AA] dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] text-stone-700 dark:text-stone-300'
@@ -2520,9 +2974,14 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
                     : 'text-stone-400 dark:text-stone-500'
                 }`}
               />
-              <span className="truncate max-w-[150px] sm:max-w-[195px]">
+              <span className="truncate max-w-[155px] sm:max-w-[210px]">
                 {activeVoiceProfile.name} · {activeVoiceProfile.tagline}
               </span>
+              {isSpeaking && engineMode === 'hd' && activeProsodyKind && (
+                <span className="hidden xl:inline text-[10px] text-amber-800 dark:text-amber-400 font-normal">
+                  · {PROSODY_LABELS[activeProsodyKind]}
+                </span>
+              )}
               <ChevronDown
                 className={`w-3.5 h-3.5 text-stone-400 transition-transform shrink-0 ${
                   neuralMenuOpen ? 'rotate-180' : ''
@@ -2530,106 +2989,337 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
               />
             </button>
 
-            {neuralMenuOpen && (
-              <div
-                role="listbox"
-                aria-label="Neural TTS voice options"
-                className="fixed sm:absolute bottom-24 sm:bottom-full left-3 right-3 sm:left-0 sm:right-auto sm:mb-2 z-50 sm:w-[356px] max-w-[calc(100vw-24px)] rounded-lg border border-stone-200 sepia:border-[#D4C7AA] dark:border-stone-700 bg-[#FAF9F5] sepia:bg-[#FBF6E9] dark:bg-[#191816] shadow-2xl overflow-hidden"
-              >
-                {/* Header & Style Filter Tabs */}
-                <div className="px-3.5 py-2.5 border-b border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 space-y-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-[11px] font-semibold uppercase tracking-wider text-stone-700 sepia:text-[#3B2F23] dark:text-stone-200">
-                      Neural TTS Voices
-                    </span>
-                    <span className="text-[10px] font-mono-num text-amber-800 dark:text-amber-400">
-                      {aiAvailable ? 'Gemini 3.8 Neural · Teacher' : 'Neural HD Audio'}
-                    </span>
-                  </div>
+            {neuralMenuOpen &&
+              typeof document !== 'undefined' &&
+              createPortal(
+                <div className="no-print fixed inset-0 z-[70] pointer-events-none">
+                  {/* Mobile Backdrop Dimmer (tapping closes sheet cleanly) */}
+                  <div
+                    aria-hidden="true"
+                    onClick={() => {
+                      stopNeuralPreview();
+                      setNeuralMenuOpen(false);
+                    }}
+                    className="sm:hidden fixed inset-0 bg-black/45 backdrop-blur-[1px] pointer-events-auto"
+                  />
 
-                  <div className="flex items-center gap-1 flex-wrap">
-                    {(['all', 'Teacher', 'Female', 'Male', 'Expressive', 'Natural'] as const).map(
-                      (tab) => (
-                        <button
-                          key={tab}
-                          type="button"
-                          onClick={() => setNeuralFilter(tab)}
-                          className={`h-6 px-2 rounded text-[11px] font-medium transition-colors cursor-pointer ${
-                            neuralFilter === tab
-                              ? 'bg-stone-900 text-stone-50 dark:bg-stone-100 dark:text-stone-950'
-                              : 'text-stone-600 dark:text-stone-400 hover:bg-stone-200/70 dark:hover:bg-stone-800'
-                          }`}
-                        >
-                          {tab === 'all' ? 'All' : tab}
-                        </button>
-                      )
-                    )}
-                  </div>
-                </div>
+                  {/* Responsive Sheet (Bottom Sheet on Mobile, Anchored Popover on Desktop) */}
+                  <div
+                    ref={neuralPortalRef}
+                    role="dialog"
+                    aria-label="Neural TTS Voice Studio"
+                    style={
+                      desktopMenuPos && typeof window !== 'undefined' && window.innerWidth >= 640
+                        ? {
+                            left: `${desktopMenuPos.left}px`,
+                            bottom: `${desktopMenuPos.bottom}px`,
+                          }
+                        : undefined
+                    }
+                    className="pointer-events-auto fixed inset-x-0 bottom-0 sm:inset-x-auto sm:w-[404px] max-h-[84dvh] sm:max-h-[min(600px,calc(100vh-110px))] flex flex-col rounded-t-2xl sm:rounded-xl border-t sm:border border-stone-200 sepia:border-[#D4C7AA] dark:border-stone-700 bg-[#FAF9F5] sepia:bg-[#FBF6E9] dark:bg-[#191816] shadow-2xl overflow-hidden"
+                  >
+                    {/* Mobile Drag Handle */}
+                    <div className="sm:hidden pt-2.5 pb-1 flex justify-center shrink-0">
+                      <span className="w-10 h-1 rounded-full bg-stone-300 dark:bg-stone-700" />
+                    </div>
 
-                {/* Neural Voice Profile List */}
-                <div className="max-h-72 overflow-y-auto divide-y divide-stone-200/70 sepia:divide-[#DFD4BC]/80 dark:divide-stone-800/80">
-                  {filteredNeuralVoices.map((profile) => {
-                    const isSelected = profile.id === aiVoiceProfileId;
-                    const isPreviewing = previewingNeuralId === profile.id;
-
-                    return (
-                      <div
-                        key={profile.id}
-                        role="option"
-                        aria-selected={isSelected}
-                        onClick={() => handleVoiceProfileChange(profile.id)}
-                        className={`px-3.5 py-2.5 flex items-start justify-between gap-2.5 transition-colors cursor-pointer ${
-                          isSelected
-                            ? 'bg-amber-50/80 sepia:bg-[#EFE3C8] dark:bg-amber-950/25'
-                            : 'hover:bg-stone-100/80 sepia:hover:bg-[#F3E9D2] dark:hover:bg-stone-800/60'
-                        }`}
-                      >
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-1.5">
-                            <span className="text-xs font-semibold text-stone-950 sepia:text-[#2F241A] dark:text-stone-50">
-                              {profile.name}
-                            </span>
-                            <span className="text-[11px] font-medium text-amber-800 dark:text-amber-400">
-                              {profile.tagline}
-                            </span>
-                            {isSelected && (
-                              <Check className="w-3.5 h-3.5 text-amber-700 dark:text-amber-400 shrink-0" />
-                            )}
-                          </div>
-                          <p className="mt-0.5 text-[11px] leading-snug text-stone-500 sepia:text-[#6E5A47] dark:text-stone-400">
-                            {profile.description}
+                    {/* Studio Header */}
+                    <div className="px-4 pt-2 sm:pt-3 pb-2.5 border-b border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 space-y-2.5 shrink-0">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="min-w-0">
+                          <h3 className="text-sm font-semibold text-stone-950 sepia:text-[#2F241A] dark:text-stone-50 truncate">
+                            Neural Voice Studio
+                          </h3>
+                          <p className="text-[11px] text-amber-800 dark:text-amber-400 truncate">
+                            {isNeuralEngineActive
+                              ? 'Gemini 3.8 Neural · Teacher Intonation'
+                              : isOnline
+                              ? 'Gemini 3.8 Neural · Ready'
+                              : 'Offline Cached & Device Voice'}
                           </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            stopNeuralPreview();
+                            setNeuralMenuOpen(false);
+                          }}
+                          aria-label="Close voice studio"
+                          className="h-9 w-9 inline-flex items-center justify-center rounded-lg text-stone-500 hover:text-stone-950 dark:text-stone-400 dark:hover:text-stone-100 hover:bg-stone-200/70 dark:hover:bg-stone-800 cursor-pointer shrink-0"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      </div>
+
+                      {/* Delivery Style (Teacher / Narrator / Energetic) */}
+                      <div className="grid grid-cols-3 gap-1 p-1 rounded-lg bg-stone-200/70 sepia:bg-[#EBE0C7] dark:bg-stone-800/80">
+                        {VOICE_STYLE_PREFERENCES.map((opt) => {
+                          const active = voiceStylePreference === opt.id;
+                          return (
+                            <button
+                              key={opt.id}
+                              type="button"
+                              onClick={() => handleStylePreferenceSelect(opt.id)}
+                              className={`h-8 px-2 rounded-md text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                                active
+                                  ? 'bg-white sepia:bg-[#FBF6E9] dark:bg-stone-950 text-stone-950 dark:text-stone-50 shadow-xs'
+                                  : 'text-stone-600 dark:text-stone-400 hover:text-stone-950 dark:hover:text-stone-200'
+                              }`}
+                            >
+                              {opt.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      {/* Expressiveness & Adaptive Intonation Row */}
+                      <div className="flex items-center justify-between gap-2 text-[11px]">
+                        <div className="inline-flex items-center gap-1">
+                          <span className="text-stone-500 dark:text-stone-400 mr-0.5 whitespace-nowrap">
+                            Tone:
+                          </span>
+                          {(
+                            [
+                              { id: 'calm', label: 'Calm' },
+                              { id: 'balanced', label: 'Balanced' },
+                              { id: 'expressive', label: 'Teacher' },
+                            ] as const
+                          ).map((lvl) => (
+                            <button
+                              key={lvl.id}
+                              type="button"
+                              onClick={() => handleExpressivenessChange(lvl.id)}
+                              className={`h-7 px-2 rounded text-[11px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                                expressiveness === lvl.id
+                                  ? 'bg-amber-700 text-white'
+                                  : 'text-stone-600 dark:text-stone-400 hover:bg-stone-200/70 dark:hover:bg-stone-800'
+                              }`}
+                            >
+                              {lvl.label}
+                            </button>
+                          ))}
                         </div>
 
                         <button
                           type="button"
-                          onClick={(e) => handlePreviewNeuralVoice(profile.id, e)}
-                          title={
-                            isPreviewing
-                              ? `Stop ${profile.name} preview`
-                              : `Preview ${profile.name} (${profile.tagline})`
-                          }
-                          aria-label={`Preview ${profile.name} neural voice`}
-                          className={`mt-0.5 h-7 px-2 inline-flex items-center gap-1 rounded border text-[11px] font-medium shrink-0 cursor-pointer transition-colors ${
-                            isPreviewing
-                              ? 'border-amber-700 bg-amber-700 text-white'
-                              : 'border-stone-300 sepia:border-[#D4C7AA] dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#22211E] text-stone-700 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800'
+                          onClick={handleAdaptiveProsodyToggle}
+                          aria-pressed={adaptiveProsody}
+                          title="Automatically adjust vocal rise-and-fall for headings, questions, lists, and explanations"
+                          className={`h-7 px-2 rounded border text-[11px] font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                            adaptiveProsody
+                              ? 'border-amber-700/60 bg-amber-50 dark:bg-amber-950/40 text-amber-900 dark:text-amber-300'
+                              : 'border-stone-300 dark:border-stone-700 text-stone-500 dark:text-stone-400'
                           }`}
                         >
-                          {isPreviewing ? (
-                            <Loader2 className="w-3 h-3 animate-spin" />
-                          ) : (
-                            <Play className="w-3 h-3" />
-                          )}
-                          <span>{isPreviewing ? 'Stop' : 'Test'}</span>
+                          Auto-Tone: {adaptiveProsody ? 'On' : 'Off'}
                         </button>
                       </div>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
+
+                      {/* Single-Line Scrollable Voice Filter Tabs (No 2-line wrapping) */}
+                      <div className="flex items-center gap-1 overflow-x-auto pb-0.5 -mx-1 px-1">
+                        {(
+                          [
+                            'all',
+                            'Teacher',
+                            'Female',
+                            'Male',
+                            'Expressive',
+                            'Natural',
+                            'Calm',
+                            'Deep',
+                          ] as const
+                        ).map((tab) => (
+                          <button
+                            key={tab}
+                            type="button"
+                            onClick={() => setNeuralFilter(tab)}
+                            className={`h-7 px-2.5 rounded-md text-xs font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                              neuralFilter === tab
+                                ? 'bg-stone-900 text-stone-50 dark:bg-stone-100 dark:text-stone-950'
+                                : 'text-stone-600 dark:text-stone-400 hover:bg-stone-200/70 dark:hover:bg-stone-800'
+                            }`}
+                          >
+                            {tab === 'all' ? 'All' : tab}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Inline Preview Feedback Banner (Always Visible Inside Studio) */}
+                    {(previewError || previewingNeuralId) && (
+                      <div
+                        className={`px-4 py-2 text-xs border-b flex items-center justify-between gap-2 shrink-0 ${
+                          previewError
+                            ? 'bg-amber-50 dark:bg-amber-950/40 text-amber-900 dark:text-amber-200 border-amber-200/70 dark:border-amber-900/50'
+                            : 'bg-stone-100/90 sepia:bg-[#F1E6CC] dark:bg-stone-800/70 text-stone-800 dark:text-stone-200 border-stone-200 dark:border-stone-700'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          {previewError ? (
+                            <span className="truncate">{previewError}</span>
+                          ) : previewStatus === 'loading' ? (
+                            <>
+                              <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-700 dark:text-amber-400 shrink-0" />
+                              <span className="truncate">
+                                Generating {getAiVoiceProfile(previewingNeuralId).name} neural voice ({langOption.name})…
+                              </span>
+                            </>
+                          ) : (
+                            <>
+                              <AudioLines className="w-3.5 h-3.5 text-amber-700 dark:text-amber-400 shrink-0" />
+                              <span className="truncate">
+                                Playing {getAiVoiceProfile(previewingNeuralId).name} sample ({langOption.name})
+                              </span>
+                            </>
+                          )}
+                        </div>
+                        {previewingNeuralId && (
+                          <button
+                            type="button"
+                            onClick={stopNeuralPreview}
+                            className="text-xs font-medium text-amber-800 dark:text-amber-400 underline shrink-0 cursor-pointer"
+                          >
+                            Stop
+                          </button>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Scrollable Neural Voice Profile List */}
+                    <div className="flex-1 min-h-0 overflow-y-auto divide-y divide-stone-200/70 sepia:divide-[#DFD4BC]/80 dark:divide-stone-800/80">
+                      {filteredNeuralVoices.map((profile) => {
+                        const isSelected = profile.id === aiVoiceProfileId;
+                        const isPreviewing = previewingNeuralId === profile.id;
+                        const isLoadingPreview = isPreviewing && previewStatus === 'loading';
+                        const isPlayingPreview = isPreviewing && previewStatus === 'playing';
+
+                        return (
+                          <div
+                            key={profile.id}
+                            role="button"
+                            tabIndex={0}
+                            aria-pressed={isSelected}
+                            onClick={() => handleVoiceProfileChange(profile.id, false)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter' || e.key === ' ') {
+                                e.preventDefault();
+                                handleVoiceProfileChange(profile.id, false);
+                              }
+                            }}
+                            className={`px-4 py-3 flex items-center justify-between gap-3 transition-colors cursor-pointer ${
+                              isSelected
+                                ? 'bg-amber-50/90 sepia:bg-[#EFE3C8] dark:bg-amber-950/30'
+                                : 'hover:bg-stone-100/80 sepia:hover:bg-[#F3E9D2] dark:hover:bg-stone-800/60'
+                            }`}
+                          >
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                <span className="text-sm font-semibold text-stone-950 sepia:text-[#2F241A] dark:text-stone-50">
+                                  {profile.name}
+                                </span>
+                                <span className="text-xs font-medium text-amber-800 dark:text-amber-400">
+                                  {profile.tagline}
+                                </span>
+                                {isSelected && (
+                                  <Check className="w-4 h-4 text-amber-700 dark:text-amber-400 shrink-0" />
+                                )}
+                              </div>
+                              <p className="mt-0.5 text-xs leading-snug text-stone-600 sepia:text-[#6E5A47] dark:text-stone-400">
+                                {profile.description}
+                              </p>
+                              <div className="mt-1 flex items-center gap-1.5 text-[11px] font-mono-num tabular-nums text-stone-500 dark:text-stone-400">
+                                <span>
+                                  Pitch{' '}
+                                  {(isSelected ? pitch : loadVoiceProfileSettings(profile.id).pitch)
+                                    .toFixed(2)
+                                    .replace(/0$/, '')}
+                                  x
+                                </span>
+                                <span aria-hidden="true">·</span>
+                                <span>
+                                  Vol{' '}
+                                  {Math.round(
+                                    (isSelected
+                                      ? volume
+                                      : loadVoiceProfileSettings(profile.id).volume) * 100
+                                  )}
+                                  %
+                                </span>
+                              </div>
+                            </div>
+
+                            <button
+                              type="button"
+                              onClick={(e) => handlePreviewNeuralVoice(profile.id, e)}
+                              title={
+                                isPreviewing
+                                  ? `Stop ${profile.name} preview`
+                                  : `Listen to ${profile.name} (${profile.tagline}) sample`
+                              }
+                              aria-label={
+                                isPreviewing
+                                  ? `Stop ${profile.name} preview`
+                                  : `Preview ${profile.name} neural voice`
+                              }
+                              className={`min-h-[40px] min-w-[78px] px-3 inline-flex items-center justify-center gap-1.5 rounded-lg border text-xs font-medium shrink-0 cursor-pointer transition-colors whitespace-nowrap ${
+                                isPreviewing
+                                  ? 'border-amber-700 bg-amber-700 text-white'
+                                  : 'border-stone-300 sepia:border-[#D4C7AA] dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#22211E] text-stone-800 dark:text-stone-100 hover:bg-stone-100 dark:hover:bg-stone-800'
+                              }`}
+                            >
+                              {isLoadingPreview ? (
+                                <>
+                                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                  <span>Wait</span>
+                                </>
+                              ) : isPlayingPreview ? (
+                                <>
+                                  <Square className="w-3 h-3 fill-current" />
+                                  <span>Stop</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Play className="w-3.5 h-3.5" />
+                                  <span>Test</span>
+                                </>
+                              )}
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {/* Studio Footer CTA Bar */}
+                    <div className="px-4 py-3 border-t border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#F5F3EC] sepia:bg-[#F2E6CC] dark:bg-[#141312] flex items-center justify-between gap-2.5 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          stopNeuralPreview();
+                          setNeuralMenuOpen(false);
+                        }}
+                        className="h-10 px-3.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium text-stone-700 dark:text-stone-300 hover:bg-stone-200/70 dark:hover:bg-stone-800 cursor-pointer whitespace-nowrap"
+                      >
+                        Done
+                      </button>
+
+                      <button
+                        type="button"
+                        disabled={!canClickListen || waitingForTranslation}
+                        onClick={handleStartListeningFromStudio}
+                        className="flex-1 h-10 px-4 rounded-lg bg-amber-700 hover:bg-amber-800 text-white text-xs font-semibold inline-flex items-center justify-center gap-2 disabled:opacity-40 transition-colors cursor-pointer whitespace-nowrap"
+                      >
+                        <Play className="w-3.5 h-3.5 fill-current shrink-0" />
+                        <span className="truncate">
+                          {isSpeaking
+                            ? `Speaking · ${activeVoiceProfile.name}`
+                            : `Listen with ${activeVoiceProfile.name}`}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+                </div>,
+                document.body
+              )}
           </div>
 
           {/* Engine Toggle: Neural TTS vs System Voice (Web Speech API) */}

@@ -792,6 +792,7 @@ async function startServer() {
   app.use('/pdfjs/iccs', express.static(path.join(pdfjsDistDir, 'iccs'), pdfjsStaticOpts));
 
   app.get('/api/health', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     res.json({
       status: 'ok',
       aiAvailable: Boolean(getGeminiClient()),
@@ -1206,6 +1207,95 @@ Follow these exact rules:
     });
   }
 
+  function splitTextForNeuralTts(text: string, maxChunkChars = 950): string[] {
+    const normalized = text.replace(/\r\n/g, '\n').trim();
+    if (normalized.length <= maxChunkChars) return [normalized];
+
+    const paragraphs = normalized.split(/\n+/).map((p) => p.trim()).filter(Boolean);
+    const chunks: string[] = [];
+    let current = '';
+
+    const pushParagraph = (para: string) => {
+      if (para.length <= maxChunkChars) {
+        if (!current) {
+          current = para;
+        } else if (current.length + 2 + para.length <= maxChunkChars) {
+          current = `${current}\n\n${para}`;
+        } else {
+          chunks.push(current);
+          current = para;
+        }
+        return;
+      }
+      // Split long paragraph along sentence punctuation boundaries
+      const parts = para.match(/[^.!?।۔؟]+(?:[.!?।۔؟]+["'”’)\]]*|$)/g) ?? [para];
+      for (const part of parts) {
+        const s = part.trim();
+        if (!s) continue;
+        if (!current) {
+          current = s.slice(0, maxChunkChars);
+        } else if (current.length + 1 + s.length <= maxChunkChars) {
+          current = `${current} ${s}`;
+        } else {
+          chunks.push(current);
+          current = s.slice(0, maxChunkChars);
+        }
+      }
+    };
+
+    for (const p of paragraphs) {
+      pushParagraph(p);
+    }
+    if (current) chunks.push(current);
+    return chunks.length > 0 ? chunks : [normalized.slice(0, maxChunkChars)];
+  }
+
+  function buildPcmWavHeader(dataByteLength: number, sampleRate = 24000, channels = 1, bitsPerSample = 16): Buffer {
+    const header = Buffer.alloc(44);
+    const byteRate = sampleRate * channels * (bitsPerSample / 8);
+    const blockAlign = channels * (bitsPerSample / 8);
+    header.write('RIFF', 0);
+    header.writeUInt32LE(36 + dataByteLength, 4);
+    header.write('WAVE', 8);
+    header.write('fmt ', 12);
+    header.writeUInt32LE(16, 16);
+    header.writeUInt16LE(1, 20);
+    header.writeUInt16LE(channels, 22);
+    header.writeUInt32LE(sampleRate, 24);
+    header.writeUInt32LE(byteRate, 28);
+    header.writeUInt16LE(blockAlign, 32);
+    header.writeUInt16LE(bitsPerSample, 34);
+    header.write('data', 36);
+    header.writeUInt32LE(dataByteLength, 40);
+    return header;
+  }
+
+  function extractPcmFromWavOrRaw(rawBuf: Buffer, mime: string): { pcm: Buffer; sampleRate: number } {
+    const isWav =
+      rawBuf.length >= 44 &&
+      rawBuf.subarray(0, 4).toString('ascii') === 'RIFF' &&
+      rawBuf.subarray(8, 12).toString('ascii') === 'WAVE';
+
+    if (isWav) {
+      const sampleRate = rawBuf.readUInt32LE(24) || 24000;
+      let offset = 12;
+      while (offset + 8 <= rawBuf.length) {
+        const chunkId = rawBuf.subarray(offset, offset + 4).toString('ascii');
+        const chunkSize = rawBuf.readUInt32LE(offset + 4);
+        if (chunkId === 'data') {
+          const end = Math.min(rawBuf.length, offset + 8 + chunkSize);
+          return { pcm: rawBuf.subarray(offset + 8, end), sampleRate };
+        }
+        offset += 8 + chunkSize + (chunkSize % 2);
+      }
+      return { pcm: rawBuf.subarray(44), sampleRate };
+    }
+
+    const rateMatch = mime.match(/rate=(\d+)/);
+    const sampleRate = rateMatch ? Number(rateMatch[1]) : 24000;
+    return { pcm: rawBuf, sampleRate };
+  }
+
   // Neural Studio Audiobook Synthesis Endpoint (Expressive Gemini 3.8 Neural TTS with Teacher-like Prosody + Free MP3 fallback)
   app.post('/api/tts', async (req, res) => {
     try {
@@ -1217,6 +1307,7 @@ Follow these exact rules:
         targetLang = 'hi',
         sentenceKind = 'narration',
         modelTier = 'flash',
+        expressiveness = 'expressive',
       } = req.body ?? {};
       if (typeof text !== 'string' || !text.trim()) {
         return res.status(400).json({ error: 'Text is required for audio generation.' });
@@ -1228,11 +1319,20 @@ Follow these exact rules:
       const allowedVoices = new Set(['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr']);
       const safeVoice = allowedVoices.has(voiceName) ? voiceName : 'Kore';
       const safeTier = modelTier === 'lite' ? 'lite' : 'flash';
+      const safeExpressiveness =
+        expressiveness === 'calm' || expressiveness === 'balanced' ? expressiveness : 'expressive';
 
       const baseStyle =
         typeof voiceStyle === 'string' && voiceStyle.trim()
-          ? voiceStyle.trim().slice(0, 280)
+          ? voiceStyle.trim().slice(0, 520)
           : 'Warm, experienced teacher explaining a book aloud to a curious student: expressive vocal rise and fall (intonation), natural conversational rhythm, gentle emphasis on key ideas, and clear breathing pauses — never flat or monotonous';
+
+      const expressivenessCue: Record<string, string> = {
+        calm: 'Keep vocal transitions smooth, gentle, and unhurried with soft melodic intonation and comforting pauses.',
+        balanced: 'Use clear, engaging natural intonation with balanced vocal modulation and crisp punctuation pauses.',
+        expressive:
+          'Use rich, lively human pitch modulation (expressive rise and fall), warm emphasis on key words, and deliberate classroom-style breathing pauses — never monotone or flat.',
+      };
 
       const prosodyCueByKind: Record<string, string> = {
         heading:
@@ -1254,7 +1354,7 @@ Follow these exact rules:
           ? sentenceKind
           : 'narration';
 
-      const ttsCacheKey = `${safeTier}::${safeVoice}::${safeLang}::${safeKind}::${baseStyle.slice(0, 120)}::${clippedText}`;
+      const ttsCacheKey = `${safeTier}::${safeVoice}::${safeLang}::${safeKind}::${safeExpressiveness}::${baseStyle.slice(0, 140)}::${clippedText}`;
       const cachedHit = ttsAudioCache.get(ttsCacheKey);
       if (cachedHit && Date.now() - cachedHit.ts < TTS_CACHE_TTL_MS) {
         // Refresh LRU position
@@ -1281,114 +1381,138 @@ Follow these exact rules:
           ? `Speak ${String(languageName).slice(0, 40)} with natural, expressive Indian educator cadence, melodic rise-and-fall intonation, clear pauses at purna viram (।) and commas, and crisp pronunciation of English technical terms.`
           : `Speak ${String(languageName).slice(0, 40)} with natural, expressive educator cadence, melodic rise-and-fall intonation, clear clause pauses, and crisp pronunciation of technical terms.`;
 
-        const fullTeacherStyle = `${baseStyle}. ${prosodyCueByKind[safeKind]} ${languageCadence}`;
-        const directedPrompt = `Read the following passage aloud with this exact vocal delivery (${fullTeacherStyle}):\n\n${clippedText}`;
+        const fullTeacherStyle = `${baseStyle}. ${expressivenessCue[safeExpressiveness]} ${prosodyCueByKind[safeKind]} ${languageCadence}`;
 
-        // Use flagship gemini-3.8-flash-tts for rich teacher-like prosody, with automatic fallback to gemini-3.8-flash-lite-tts
         const candidateModels =
           safeTier === 'lite'
             ? ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts']
             : ['gemini-3.8-flash-tts', 'gemini-3.8-flash-lite-tts'];
 
-        for (const modelName of candidateModels) {
-          // Try native speechMetadata.style first; if rejected, retry with directed text prompt
-          const attempts = [
-            [
-              {
-                role: 'user',
-                parts: [
-                  {
-                    text: clippedText,
-                    speechMetadata: { style: fullTeacherStyle },
-                  },
-                ],
-              },
-            ],
-            [
-              {
-                role: 'user',
-                parts: [{ text: directedPrompt }],
-              },
-            ],
-          ];
+        const synthesizeSingleChunk = async (
+          chunkText: string
+        ): Promise<{ pcm: Buffer; sampleRate: number; model: string } | null> => {
+          const directedPrompt = `Read the following passage aloud with this exact vocal delivery (${fullTeacherStyle}):\n\n${chunkText}`;
+          const chunkTimeoutMs = Math.min(34000, Math.max(18000, 12000 + chunkText.length * 14));
 
-          for (const contents of attempts) {
-            try {
-              const response = await withPromiseTimeout(
-                ttsAi.models.generateContent({
-                  model: modelName,
-                  contents,
-                  config: {
-                    responseModalities: ['AUDIO'],
-                    speechConfig: {
-                      voiceConfig: {
-                        prebuiltVoiceConfig: { voiceName: safeVoice },
+          for (const modelName of candidateModels) {
+            const attempts = [
+              [
+                {
+                  role: 'user',
+                  parts: [
+                    {
+                      text: chunkText,
+                      speechMetadata: { style: fullTeacherStyle },
+                    },
+                  ],
+                },
+              ],
+              [
+                {
+                  role: 'user',
+                  parts: [{ text: directedPrompt }],
+                },
+              ],
+            ];
+
+            for (let attemptIdx = 0; attemptIdx < attempts.length; attemptIdx++) {
+              try {
+                const response = await withPromiseTimeout(
+                  ttsAi.models.generateContent({
+                    model: modelName,
+                    contents: attempts[attemptIdx],
+                    config: {
+                      responseModalities: ['AUDIO'],
+                      speechConfig: {
+                        voiceConfig: {
+                          prebuiltVoiceConfig: { voiceName: safeVoice },
+                        },
                       },
                     },
-                  },
-                }),
-                16000,
-                `Gemini TTS (${modelName})`
-              );
+                  }),
+                  chunkTimeoutMs,
+                  `Gemini TTS (${modelName})`
+                );
 
-              const part = response.candidates?.[0]?.content?.parts?.[0];
-              const base64Audio = part?.inlineData?.data;
-              if (base64Audio) {
-                const rawBuf = Buffer.from(base64Audio, 'base64');
-                const mime = (part?.inlineData?.mimeType ?? '').toLowerCase();
-                // Ensure valid RIFF/WAV header if model returned raw L16 PCM
-                const isWav =
-                  rawBuf.length >= 12 &&
-                  rawBuf.subarray(0, 4).toString('ascii') === 'RIFF' &&
-                  rawBuf.subarray(8, 12).toString('ascii') === 'WAVE';
-                let wavBuffer = rawBuf;
-                if (!isWav && (mime.includes('l16') || mime.includes('pcm') || !mime.includes('wav'))) {
-                  const rateMatch = mime.match(/rate=(\d+)/);
-                  const sampleRate = rateMatch ? Number(rateMatch[1]) : 24000;
-                  const header = Buffer.alloc(44);
-                  header.write('RIFF', 0);
-                  header.writeUInt32LE(36 + rawBuf.length, 4);
-                  header.write('WAVE', 8);
-                  header.write('fmt ', 12);
-                  header.writeUInt32LE(16, 16);
-                  header.writeUInt16LE(1, 20); // PCM
-                  header.writeUInt16LE(1, 22); // Mono
-                  header.writeUInt32LE(sampleRate, 24);
-                  header.writeUInt32LE(sampleRate * 2, 28);
-                  header.writeUInt16LE(2, 32);
-                  header.writeUInt16LE(16, 34);
-                  header.write('data', 36);
-                  header.writeUInt32LE(rawBuf.length, 40);
-                  wavBuffer = Buffer.concat([header, rawBuf]);
-                }
-
-                // Store in LRU cache (skip huge multi-minute full-page downloads to keep RAM bounded)
-                if (wavBuffer.length <= 1_800_000) {
-                  if (ttsAudioCache.size >= TTS_CACHE_MAX) {
-                    const oldestKey = ttsAudioCache.keys().next().value;
-                    if (oldestKey) ttsAudioCache.delete(oldestKey);
+                const part = response.candidates?.[0]?.content?.parts?.[0];
+                const base64Audio = part?.inlineData?.data;
+                if (base64Audio) {
+                  const rawBuf = Buffer.from(base64Audio, 'base64');
+                  const mime = (part?.inlineData?.mimeType ?? '').toLowerCase();
+                  const { pcm, sampleRate } = extractPcmFromWavOrRaw(rawBuf, mime);
+                  if (pcm.length > 0) {
+                    return { pcm, sampleRate, model: modelName };
                   }
-                  ttsAudioCache.set(ttsCacheKey, {
-                    buffer: wavBuffer,
-                    contentType: 'audio/wav',
-                    model: modelName,
-                    ts: Date.now(),
-                  });
                 }
-
-                res.setHeader('Content-Type', 'audio/wav');
-                res.setHeader('Content-Length', String(wavBuffer.length));
-                res.setHeader('X-BhashaBook-TTS-Model', modelName);
-                res.setHeader('X-BhashaBook-TTS-Cache', 'miss');
-                res.setHeader('Content-Disposition', 'attachment; filename="audiobook-page.wav"');
-                return res.send(wavBuffer);
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                // Retry directed prompt on same model if speechMetadata or INVALID_ARGUMENT caused a 400
+                if (
+                  attemptIdx === 0 &&
+                  (msg.includes('speechMetadata') ||
+                    msg.includes('INVALID_ARGUMENT') ||
+                    msg.includes('400'))
+                ) {
+                  continue;
+                }
+                break;
               }
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              // Only retry second attempt if first failed due to speechMetadata schema mismatch
-              if (!msg.includes('speechMetadata')) break;
             }
           }
+          return null;
+        };
+
+        const textChunks = splitTextForNeuralTts(clippedText, 950);
+        const pcmParts: Buffer[] = [];
+        let outputSampleRate = 24000;
+        let usedModel = candidateModels[0];
+        let allSucceeded = true;
+
+        for (let i = 0; i < textChunks.length; i++) {
+          const chunkRes = await synthesizeSingleChunk(textChunks[i]);
+          if (!chunkRes) {
+            allSucceeded = false;
+            break;
+          }
+          if (i === 0) {
+            outputSampleRate = chunkRes.sampleRate;
+            usedModel = chunkRes.model;
+          }
+          pcmParts.push(chunkRes.pcm);
+          // Add a natural 240ms teacher pause between stitched paragraph chunks
+          if (i < textChunks.length - 1) {
+            const pauseBytes = Math.round(outputSampleRate * 0.24) * 2;
+            pcmParts.push(Buffer.alloc(pauseBytes));
+          }
+        }
+
+        if (allSucceeded && pcmParts.length > 0) {
+          const mergedPcm = pcmParts.length === 1 ? pcmParts[0] : Buffer.concat(pcmParts);
+          const wavBuffer = Buffer.concat([
+            buildPcmWavHeader(mergedPcm.length, outputSampleRate, 1, 16),
+            mergedPcm,
+          ]);
+
+          // Store in LRU cache (skip huge multi-minute full-page downloads to keep RAM bounded)
+          if (wavBuffer.length <= 1_800_000) {
+            if (ttsAudioCache.size >= TTS_CACHE_MAX) {
+              const oldestKey = ttsAudioCache.keys().next().value;
+              if (oldestKey) ttsAudioCache.delete(oldestKey);
+            }
+            ttsAudioCache.set(ttsCacheKey, {
+              buffer: wavBuffer,
+              contentType: 'audio/wav',
+              model: usedModel,
+              ts: Date.now(),
+            });
+          }
+
+          res.setHeader('Content-Type', 'audio/wav');
+          res.setHeader('Content-Length', String(wavBuffer.length));
+          res.setHeader('X-BhashaBook-TTS-Model', usedModel);
+          res.setHeader('X-BhashaBook-TTS-Cache', 'miss');
+          res.setHeader('Content-Disposition', 'attachment; filename="audiobook-page.wav"');
+          return res.send(wavBuffer);
         }
       }
 

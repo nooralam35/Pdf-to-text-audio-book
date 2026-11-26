@@ -14,14 +14,21 @@ export interface ServerCapabilities {
 }
 
 export async function checkServerCapabilities(): Promise<ServerCapabilities> {
-  try {
-    const res = await fetch('/api/health');
-    if (!res.ok) return { aiAvailable: false };
-    const data = (await res.json()) as { aiAvailable?: boolean };
-    return { aiAvailable: Boolean(data.aiAvailable) };
-  } catch {
-    return { aiAvailable: false };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch('/api/health', { cache: 'no-store' });
+      if (res.ok) {
+        const data = (await res.json()) as { aiAvailable?: boolean };
+        return { aiAvailable: Boolean(data.aiAvailable) };
+      }
+    } catch {
+      // retry once below
+    }
+    if (attempt === 0) {
+      await new Promise((r) => window.setTimeout(r, 450));
+    }
   }
+  return { aiAvailable: false };
 }
 
 export interface TranslatePageParams {
@@ -398,9 +405,11 @@ export async function synthesizePageAudio(params: {
   targetLang?: LanguageCode;
   sentenceKind?: string;
   modelTier?: 'flash' | 'lite';
+  expressiveness?: 'calm' | 'balanced' | 'expressive';
+  timeoutMs?: number;
   signal?: AbortSignal;
 }): Promise<{ blob: Blob; ext: 'wav' | 'mp3'; model: string }> {
-  const { signal, ...bodyPayload } = params;
+  const { signal, timeoutMs = 26000, ...bodyPayload } = params;
   const maxAttempts = 2;
   let lastError: Error | null = null;
 
@@ -410,7 +419,7 @@ export async function synthesizePageAudio(params: {
     }
 
     const timeoutController = new AbortController();
-    const timer = window.setTimeout(() => timeoutController.abort(), 24000);
+    const timer = window.setTimeout(() => timeoutController.abort(), timeoutMs);
     const onParentAbort = () => timeoutController.abort();
     signal?.addEventListener('abort', onParentAbort, { once: true });
 

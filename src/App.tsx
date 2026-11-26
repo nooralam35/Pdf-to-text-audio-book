@@ -455,6 +455,18 @@ export default function App() {
         checkServerCapabilities()
           .then((caps) => {
             if (!cancelled) setAiAvailable(caps.aiAvailable);
+            if (!cancelled && !caps.aiAvailable) {
+              window.setTimeout(() => {
+                if (cancelled) return;
+                checkServerCapabilities()
+                  .then((retryCaps) => {
+                    if (!cancelled && retryCaps.aiAvailable) {
+                      setAiAvailable(true);
+                    }
+                  })
+                  .catch(() => {});
+              }, 2500);
+            }
           })
           .catch(() => {});
 

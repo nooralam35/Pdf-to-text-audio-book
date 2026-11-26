@@ -24,6 +24,11 @@ export type AiVoiceProfileId =
   | 'female-calm'
   | 'male-deep';
 
+export interface VoiceProfileAudioSettings {
+  pitch: number;
+  volume: number;
+}
+
 export interface AiVoiceProfile {
   id: AiVoiceProfileId;
   /** Gemini neural prebuilt voice sent to /api/tts */
@@ -38,6 +43,10 @@ export interface AiVoiceProfile {
   description: string;
   /** Expressive vocal direction passed to Gemini Neural TTS speechMetadata.style */
   style: string;
+  /** Default personalized playback pitch for this voice profile (0.5 .. 1.8) */
+  defaultPitch: number;
+  /** Default personalized playback volume for this voice profile (0.0 .. 1.0) */
+  defaultVolume: number;
   /** Subtle acoustic timbre multiplier used only when free HD fallback is active */
   fallbackPitch: number;
   fallbackRate: number;
@@ -56,6 +65,8 @@ export const AI_VOICE_PROFILES: AiVoiceProfile[] = [
       'Experienced educator with natural vocal rise-and-fall, thoughtful pauses, and engaging rhythm',
     style:
       'Warm, experienced female teacher explaining a book aloud to a student: expressive vocal rise and fall (intonation), unhurried conversational rhythm, gentle emphasis on key concepts, natural micro-pauses at punctuation, never flat or monotonous',
+    defaultPitch: 1.0,
+    defaultVolume: 1.0,
     fallbackPitch: 1.0,
     fallbackRate: 1.0,
   },
@@ -71,6 +82,8 @@ export const AI_VOICE_PROFILES: AiVoiceProfile[] = [
       'Seasoned professor with rich modulation, clear pauses, and motivating classroom cadence',
     style:
       'Seasoned, encouraging male professor teaching with natural storytelling rhythm: expressive pitch variation, warm authoritative clarity, deliberate pauses before key ideas, lively human intonation, never flat or robotic',
+    defaultPitch: 0.95,
+    defaultVolume: 1.0,
     fallbackPitch: 0.9,
     fallbackRate: 0.98,
   },
@@ -85,6 +98,8 @@ export const AI_VOICE_PROFILES: AiVoiceProfile[] = [
     description: 'Vibrant storyteller with lively intonation, warmth, and emotional phrasing',
     style:
       'Expressive, vibrant female mentor and storyteller with rich vocal inflection, dynamic rise and fall, warm curiosity, and natural conversational cadence',
+    defaultPitch: 1.05,
+    defaultVolume: 0.95,
     fallbackPitch: 1.1,
     fallbackRate: 1.03,
   },
@@ -99,6 +114,8 @@ export const AI_VOICE_PROFILES: AiVoiceProfile[] = [
     description: 'Energetic, charismatic mentor voice with vivid emphasis and natural flow',
     style:
       'Charismatic, enthusiastic male mentor explaining concepts with vivid emphasis, natural conversational rise and fall, upbeat warmth, and human breathing rhythm',
+    defaultPitch: 1.02,
+    defaultVolume: 0.95,
     fallbackPitch: 0.98,
     fallbackRate: 1.04,
   },
@@ -113,6 +130,8 @@ export const AI_VOICE_PROFILES: AiVoiceProfile[] = [
     description: 'Balanced, warm conversational voice with organic cadence for long reading',
     style:
       'Natural, warm, conversational female educator and audiobook narrator with gentle vocal rise and fall, organic phrasing pauses, and relaxed human rhythm',
+    defaultPitch: 1.0,
+    defaultVolume: 0.95,
     fallbackPitch: 1.0,
     fallbackRate: 1.0,
   },
@@ -127,6 +146,8 @@ export const AI_VOICE_PROFILES: AiVoiceProfile[] = [
     description: 'Articulate, conversational narrator with natural pauses and crisp diction',
     style:
       'Natural, articulate male educator and narrator with expressive intonation, warm conversational cadence, crisp diction, and natural breathing rhythm',
+    defaultPitch: 0.95,
+    defaultVolume: 1.0,
     fallbackPitch: 0.92,
     fallbackRate: 1.0,
   },
@@ -141,6 +162,8 @@ export const AI_VOICE_PROFILES: AiVoiceProfile[] = [
     description: 'Gentle, soothing mentor voice with melodic cadence for evening listening',
     style:
       'Soft, soothing, warm female mentor with gentle melodic rise and fall, unhurried evening storytelling cadence, and comforting pauses',
+    defaultPitch: 1.02,
+    defaultVolume: 0.85,
     fallbackPitch: 1.06,
     fallbackRate: 0.95,
   },
@@ -155,6 +178,8 @@ export const AI_VOICE_PROFILES: AiVoiceProfile[] = [
     description: 'Resonant lecture and documentary baritone with deliberate rhetorical cadence',
     style:
       'Deep, resonant male lecturer and documentary narrator with thoughtful vocal modulation, deliberate rhetorical pauses, and compelling rhythm',
+    defaultPitch: 0.9,
+    defaultVolume: 1.0,
     fallbackPitch: 0.84,
     fallbackRate: 0.95,
   },
@@ -172,6 +197,97 @@ export function getAiVoiceProfile(id: string | null | undefined): AiVoiceProfile
   if (!id) return AI_VOICE_PROFILES[0];
   const mappedId = LEGACY_VOICE_MAP[id] ?? id;
   return AI_VOICE_PROFILES.find((v) => v.id === mappedId) ?? AI_VOICE_PROFILES[0];
+}
+
+const VOICE_PROFILE_AUDIO_STORAGE_KEY = 'bhashabook-voice-profile-audio-v1';
+
+export function clampVoicePitch(pitch: number): number {
+  if (!Number.isFinite(pitch)) return 1.0;
+  return Math.max(0.5, Math.min(1.8, Math.round(pitch * 20) / 20));
+}
+
+export function clampVoiceVolume(volume: number): number {
+  if (!Number.isFinite(volume)) return 1.0;
+  return Math.max(0, Math.min(1, Math.round(volume * 100) / 100));
+}
+
+function readAllVoiceProfileAudioSettings(): Partial<
+  Record<AiVoiceProfileId, Partial<VoiceProfileAudioSettings>>
+> {
+  if (typeof window === 'undefined') return {};
+  try {
+    const raw = localStorage.getItem(VOICE_PROFILE_AUDIO_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+export function loadVoiceProfileSettings(
+  profileId: AiVoiceProfileId
+): VoiceProfileAudioSettings {
+  const profile = getAiVoiceProfile(profileId);
+  const all = readAllVoiceProfileAudioSettings();
+  const saved = all[profile.id];
+  return {
+    pitch:
+      typeof saved?.pitch === 'number'
+        ? clampVoicePitch(saved.pitch)
+        : profile.defaultPitch,
+    volume:
+      typeof saved?.volume === 'number'
+        ? clampVoiceVolume(saved.volume)
+        : profile.defaultVolume,
+  };
+}
+
+export function saveVoiceProfileSettings(
+  profileId: AiVoiceProfileId,
+  settings: Partial<VoiceProfileAudioSettings>
+): VoiceProfileAudioSettings {
+  const profile = getAiVoiceProfile(profileId);
+  const current = loadVoiceProfileSettings(profile.id);
+  const next: VoiceProfileAudioSettings = {
+    pitch:
+      typeof settings.pitch === 'number'
+        ? clampVoicePitch(settings.pitch)
+        : current.pitch,
+    volume:
+      typeof settings.volume === 'number'
+        ? clampVoiceVolume(settings.volume)
+        : current.volume,
+  };
+  if (typeof window !== 'undefined') {
+    try {
+      const all = readAllVoiceProfileAudioSettings();
+      all[profile.id] = next;
+      localStorage.setItem(VOICE_PROFILE_AUDIO_STORAGE_KEY, JSON.stringify(all));
+    } catch {
+      // ignore storage errors
+    }
+  }
+  return next;
+}
+
+export function resetVoiceProfileSettings(
+  profileId: AiVoiceProfileId
+): VoiceProfileAudioSettings {
+  const profile = getAiVoiceProfile(profileId);
+  if (typeof window !== 'undefined') {
+    try {
+      const all = readAllVoiceProfileAudioSettings();
+      delete all[profile.id];
+      localStorage.setItem(VOICE_PROFILE_AUDIO_STORAGE_KEY, JSON.stringify(all));
+    } catch {
+      // ignore storage errors
+    }
+  }
+  return {
+    pitch: profile.defaultPitch,
+    volume: profile.defaultVolume,
+  };
 }
 
 export function detectSentenceProsody(
