@@ -33,8 +33,14 @@ import {
 } from '../lib/translatorClient';
 import {
   AI_VOICE_PROFILES,
+  detectSentenceProsody,
   getAiVoiceProfile,
+  getPreferredVoiceProfileForStyle,
+  getVoiceStylePreferenceFromProfile,
+  getVoiceStylePreferenceOption,
   type AiVoiceProfileId,
+  type SentenceProsodyKind,
+  type VoiceStylePreference,
 } from '../lib/voiceProfiles';
 import type {
   ChapterItem,
@@ -72,6 +78,7 @@ export interface AudiobookControlHandle {
   unlockAudio: () => void;
   pausePlayback: () => void;
   playCurrentPage: () => void;
+  playFromSentence: (sentenceIndex: number, targetPage?: number) => void;
   queueChapterPlayback: (targetPage: number, endPage: number, chapterTitle: string) => void;
 }
 
@@ -102,6 +109,8 @@ interface AudiobookBarProps {
   aiAvailable: boolean;
   narrationSource: 'translated' | 'original';
   onNarrationSourceChange: (src: 'translated' | 'original') => void;
+  voiceStylePreference?: VoiceStylePreference;
+  onVoiceStylePreferenceChange?: (pref: VoiceStylePreference) => void;
 }
 
 export const AudiobookBar: React.FC<AudiobookBarProps> = ({
@@ -131,6 +140,8 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
   aiAvailable,
   narrationSource,
   onNarrationSourceChange,
+  voiceStylePreference = 'teacher',
+  onVoiceStylePreferenceChange,
 }) => {
   const [engineMode, setEngineMode] = useState<SpeechEngineMode>(() => {
     if (typeof window === 'undefined') return 'hd';
@@ -138,13 +149,13 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     return saved === 'device' ? 'device' : 'hd';
   });
   const [aiVoiceProfileId, setAiVoiceProfileId] = useState<AiVoiceProfileId>(() => {
-    if (typeof window === 'undefined') return 'female-natural';
+    if (typeof window === 'undefined') return 'female-teacher';
     const saved = localStorage.getItem('bhashabook-ai-voice-profile');
     return getAiVoiceProfile(saved).id;
   });
   const [neuralMenuOpen, setNeuralMenuOpen] = useState(false);
   const [neuralFilter, setNeuralFilter] = useState<
-    'all' | 'Female' | 'Male' | 'Natural' | 'Expressive'
+    'all' | 'Teacher' | 'Female' | 'Male' | 'Expressive' | 'Natural'
   >('all');
   const [previewingNeuralId, setPreviewingNeuralId] = useState<AiVoiceProfileId | null>(null);
   const neuralDropdownRef = useRef<HTMLDivElement | null>(null);
@@ -164,11 +175,18 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
   const [sleepSecondsLeft, setSleepSecondsLeft] = useState<number>(0);
   const [sentenceProgress, setSentenceProgress] = useState(0); // 0..1 within active sentence
   const [scrubSec, setScrubSec] = useState<number | null>(null);
+  const [hoverSec, setHoverSec] = useState<number | null>(null);
   const scrubSecRef = useRef<number | null>(null);
+  const isDraggingTimelineRef = useRef(false);
+  const timelineTrackRef = useRef<HTMLDivElement | null>(null);
   const pendingSeekRef = useRef<{
     targetPage: number;
     fraction: number;
     autoPlay: boolean;
+  } | null>(null);
+  const pendingSentenceStartRef = useRef<{
+    targetPage: number;
+    sentenceIndex: number;
   } | null>(null);
   const sentenceStartedAtRef = useRef<number>(0);
 
@@ -178,6 +196,21 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     () => getAiVoiceProfile(aiVoiceProfileId),
     [aiVoiceProfileId]
   );
+
+  // Map blockId -> block kind so Neural TTS applies heading/caption/list/question prosody automatically
+  const blockKindById = useMemo(() => {
+    const map = new Map<string, string>();
+    const sourceBlocks =
+      narrationSource === 'original' ? parsedPage?.blocks : translatedPage?.blocks ?? parsedPage?.blocks;
+    if (sourceBlocks) {
+      for (const b of sourceBlocks) {
+        map.set(b.id, b.kind);
+      }
+    }
+    return map;
+  }, [narrationSource, parsedPage, translatedPage]);
+  const blockKindByIdRef = useRef(blockKindById);
+  blockKindByIdRef.current = blockKindById;
 
   // Persistent HTML5 Audio element + independent Web Audio pitch shifter + background continuity
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -208,6 +241,8 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
   const pitchRef = useRef(pitch);
   const voiceIdRef = useRef(selectedVoiceId);
   const aiVoiceProfileIdRef = useRef<AiVoiceProfileId>(aiVoiceProfileId);
+  const voiceStylePrefRef = useRef<VoiceStylePreference>(voiceStylePreference);
+  const prevVoiceStylePrefRef = useRef<VoiceStylePreference>(voiceStylePreference);
   const aiAvailableRef = useRef(aiAvailable);
   const autoAdvanceRef = useRef(autoAdvance);
   const sentencesRef = useRef(sentences);
@@ -224,6 +259,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
   pitchRef.current = pitch;
   voiceIdRef.current = selectedVoiceId;
   aiVoiceProfileIdRef.current = aiVoiceProfileId;
+  voiceStylePrefRef.current = voiceStylePreference;
   aiAvailableRef.current = aiAvailable;
   autoAdvanceRef.current = autoAdvance;
   sentencesRef.current = sentences;
@@ -277,6 +313,28 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
       // ignore storage errors
     }
   }, [aiVoiceProfileId]);
+
+  // Sync active neural voice profile when user updates Voice Preference in the Glossary popover
+  useEffect(() => {
+    if (prevVoiceStylePrefRef.current === voiceStylePreference) return;
+    prevVoiceStylePrefRef.current = voiceStylePreference;
+
+    const currentPref = getVoiceStylePreferenceFromProfile(aiVoiceProfileIdRef.current);
+    if (currentPref !== voiceStylePreference) {
+      const nextProfileId = getPreferredVoiceProfileForStyle(
+        voiceStylePreference,
+        aiVoiceProfileIdRef.current
+      );
+      setAiVoiceProfileId(nextProfileId);
+      aiVoiceProfileIdRef.current = nextProfileId;
+    }
+
+    if (isSpeakingRef.current && engineModeRef.current === 'hd' && activeSentenceIndexRef.current !== null) {
+      speakFromIndex(activeSentenceIndexRef.current);
+    } else {
+      pausedInPlaceRef.current = false;
+    }
+  }, [voiceStylePreference]);
 
   useEffect(() => {
     try {
@@ -710,6 +768,40 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     }
   }, [pageNumber, sentences, isTranslatingPage, parsedPage, translatedPage, narrationSource, isOnline]);
 
+  // Resume playback at an exact saved sentence index once the destination page & sentences finish loading
+  useEffect(() => {
+    const pending = pendingSentenceStartRef.current;
+    if (!pending || pending.targetPage !== pageNumber) return;
+    if (isTranslatingPage) return;
+
+    if (
+      sentences.length > 0 &&
+      (narrationSource === 'original' ||
+        (translatedPage && translatedPage.pageNumber === pageNumber))
+    ) {
+      const clampedIdx = Math.min(sentences.length - 1, Math.max(0, pending.sentenceIndex));
+      pendingSentenceStartRef.current = null;
+      speakFromIndex(clampedIdx);
+      return;
+    }
+
+    if (parsedPage && parsedPage.pageNumber === pageNumber) {
+      if (parsedPage.isBlank) {
+        pendingSentenceStartRef.current = null;
+        return;
+      }
+      if (!translatedPage && narrationSource === 'translated') {
+        if (!isCurrentlyOnline()) {
+          setAudioMessage('Offline mode — resuming original text.');
+          onNarrationSourceChange('original');
+        } else {
+          setWaitingForTranslation(true);
+          onRequestTranslatePage();
+        }
+      }
+    }
+  }, [pageNumber, sentences, isTranslatingPage, parsedPage, translatedPage, narrationSource, isOnline]);
+
   // Handle chapter audio start queued from the Chapter List Play button
   useEffect(() => {
     const pending = pendingChapterPlayRef.current;
@@ -778,10 +870,12 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     text: string,
     lang: LanguageCode,
     voiceProfileId: AiVoiceProfileId,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    sentenceKind: SentenceProsodyKind = 'narration'
   ): Promise<{ url: string; source: 'ai' | 'free' }> => {
     const useAi = aiAvailableRef.current;
-    const cacheKey = `${lang}::${useAi ? voiceProfileId : 'free'}::${text}`;
+    const stylePref = voiceStylePrefRef.current;
+    const cacheKey = `v3-neural::${lang}::${useAi ? `${stylePref}::${voiceProfileId}::${sentenceKind}` : 'free'}::${text}`;
     const existing = objectUrlCacheRef.current.get(cacheKey);
     if (existing) return existing;
 
@@ -797,7 +891,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
 
       if (!isCurrentlyOnline()) {
         // Also check alternate free/AI key in persistent Cache Storage before falling back to local device voice
-        const fallbackKey = `${lang}::free::${text}`;
+        const fallbackKey = `v3-neural::${lang}::free::${text}`;
         if (fallbackKey !== cacheKey) {
           const fallbackCached = await getCachedTtsAudioBlob(fallbackKey);
           if (fallbackCached) {
@@ -810,17 +904,20 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
         throw new Error('OFFLINE_UNCACHED');
       }
 
-      // 2. Online synthesis + persistent offline caching
+      // 2. Online expressive Neural TTS synthesis + persistent offline caching
       if (useAi) {
         try {
           const profile = getAiVoiceProfile(voiceProfileId);
+          const prefOption = getVoiceStylePreferenceOption(stylePref);
           const langName = getLanguageOption(lang).name;
           const res = await synthesizePageAudio({
             text,
             voiceName: profile.voiceName,
-            voiceStyle: profile.style,
+            voiceStyle: `${prefOption.styleDirective}. ${profile.style}`,
             languageName: langName,
             targetLang: lang,
+            sentenceKind,
+            modelTier: profile.modelTier,
             signal,
           });
           const clipSource: 'ai' | 'free' = res.ext === 'wav' ? 'ai' : 'free';
@@ -829,7 +926,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
           return { url, source: clipSource };
         } catch (err) {
           if (err instanceof DOMException && err.name === 'AbortError') throw err;
-          // Fall back to Free MP3 if Studio AI TTS is unavailable
+          // Fall back to Free MP3 if Studio Neural TTS is unavailable
         }
       }
       const blob = await fetchFreeTtsBlob(text, lang, signal);
@@ -1082,20 +1179,32 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
         for (let ahead = 1; ahead <= 4; ahead++) {
           const nextSpan = currentList[idx + ahead];
           if (!nextSpan) break;
+          const nextKind = detectSentenceProsody(
+            nextSpan.text,
+            blockKindByIdRef.current.get(nextSpan.blockId)
+          );
           getSentenceAudioUrl(
             nextSpan.text,
             targetLangRef.current,
-            aiVoiceProfileIdRef.current
+            aiVoiceProfileIdRef.current,
+            undefined,
+            nextKind
           ).catch(() => {});
         }
       }
+
+      const spanKind = detectSentenceProsody(
+        span.text,
+        blockKindByIdRef.current.get(span.blockId)
+      );
 
       try {
         const { url: audioUrl, source: clipSource } = await getSentenceAudioUrl(
           span.text,
           targetLangRef.current,
           aiVoiceProfileIdRef.current,
-          controller.signal
+          controller.signal,
+          spanKind
         );
         if (playSessionRef.current !== session) return;
 
@@ -1213,8 +1322,16 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
   useEffect(() => {
     if (waitingForTranslation && !isTranslatingPage && sentences.length > 0) {
       setWaitingForTranslation(false);
+      const pendingSentence = pendingSentenceStartRef.current;
       const pending = pendingSeekRef.current;
-      if (pending && pending.targetPage === pageNumber) {
+      if (pendingSentence && pendingSentence.targetPage === pageNumber) {
+        pendingSentenceStartRef.current = null;
+        const clampedIdx = Math.min(
+          sentences.length - 1,
+          Math.max(0, pendingSentence.sentenceIndex)
+        );
+        speakFromIndex(clampedIdx);
+      } else if (pending && pending.targetPage === pageNumber) {
         pendingSeekRef.current = null;
         const targetIdx = Math.min(
           sentences.length - 1,
@@ -1331,6 +1448,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
       },
       pausePlayback: () => {
         pendingChapterPlayRef.current = null;
+        pendingSentenceStartRef.current = null;
         pendingAutoContinueRef.current = false;
         setWaitingForTranslation(false);
         if (engineModeRef.current === 'hd' && audioRef.current && !isLoadingSentence) {
@@ -1343,14 +1461,38 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
       },
       playCurrentPage: () => {
         pendingChapterPlayRef.current = null;
+        pendingSentenceStartRef.current = null;
         setAutoAdvance(true);
         autoAdvanceRef.current = true;
         if (!isSpeaking) {
           handlePlayPause();
         }
       },
+      playFromSentence: (sentenceIndex, targetPage) => {
+        unlockAudioElement();
+        pendingChapterPlayRef.current = null;
+        setAutoAdvance(true);
+        autoAdvanceRef.current = true;
+        const destPage = targetPage ?? pageNumberRef.current;
+        const safeIdx = Math.max(0, sentenceIndex);
+        if (
+          destPage === pageNumberRef.current &&
+          sentencesRef.current.length > 0 &&
+          (narrationSource === 'original' ||
+            (translatedPage && translatedPage.pageNumber === destPage))
+        ) {
+          pendingSentenceStartRef.current = null;
+          speakFromIndex(Math.min(sentencesRef.current.length - 1, safeIdx));
+        } else {
+          pendingSentenceStartRef.current = {
+            targetPage: destPage,
+            sentenceIndex: safeIdx,
+          };
+        }
+      },
       queueChapterPlayback: (targetPage, endPage, chapterTitle) => {
         unlockAudioElement();
+        pendingSentenceStartRef.current = null;
         setAutoAdvance(true);
         autoAdvanceRef.current = true;
         pendingChapterPlayRef.current = { targetPage, endPage, title: chapterTitle };
@@ -1400,6 +1542,10 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     stopNeuralPreview();
     setAiVoiceProfileId(nextProfileId);
     aiVoiceProfileIdRef.current = nextProfileId;
+    const syncedPref = getVoiceStylePreferenceFromProfile(nextProfileId);
+    prevVoiceStylePrefRef.current = syncedPref;
+    voiceStylePrefRef.current = syncedPref;
+    onVoiceStylePreferenceChange?.(syncedPref);
     setNeuralMenuOpen(false);
 
     const wasPlaying = isSpeaking;
@@ -1456,17 +1602,19 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
 
     const sampleSource =
       sentences[activeSentenceIndex ?? 0]?.text ||
-      (effectiveAudioLang === 'hi'
-        ? `नमस्ते, मैं ${profile.name} हूँ — आपकी ऑडियोबुक की आवाज़।`
-        : `Hello, I am ${profile.name}, your ${profile.gender.toLowerCase()} ${profile.category.toLowerCase()} audiobook narrator.`);
-    const sampleText = sampleSource.slice(0, 110);
+      (effectiveAudioLang === 'hi' || effectiveAudioLang === 'hinglish'
+        ? `नमस्ते! मैं ${profile.name} हूँ — आज हम इस पाठ को बिल्कुल सहज लय और स्पष्ट उतार-चढ़ाव के साथ समझेंगे, क्या आप तैयार हैं?`
+        : `Hello! I'm ${profile.name}. Let's explore this chapter together with clear emphasis, natural rhythm, and engaging intonation — ready to begin?`);
+    const sampleText = sampleSource.slice(0, 145);
+    const sampleKind = detectSentenceProsody(sampleText);
 
     try {
       const { url, source } = await getSentenceAudioUrl(
         sampleText,
         effectiveAudioLang,
         profileId,
-        controller.signal
+        controller.signal,
+        sampleKind
       );
       if (controller.signal.aborted) return;
 
@@ -1589,12 +1737,15 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     try {
       const effectiveLang: LanguageCode = useOriginal ? 'en' : targetLang;
       const effectiveLangOption = getLanguageOption(effectiveLang);
+      const prefOption = getVoiceStylePreferenceOption(voiceStylePrefRef.current);
       const { blob, ext } = await synthesizePageAudio({
         text: narrationText,
         voiceName: activeVoiceProfile.voiceName,
-        voiceStyle: activeVoiceProfile.style,
+        voiceStyle: `${prefOption.styleDirective}. ${activeVoiceProfile.style}`,
         languageName: effectiveLangOption.name,
         targetLang: effectiveLang,
+        sentenceKind: 'narration',
+        modelTier: activeVoiceProfile.modelTier,
       });
       const slug = bookTitle
         .toLowerCase()
@@ -1736,6 +1887,11 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
       if (sentences.length === 0) {
         if (canTranslateAndPlay && !isTranslatingPage) {
           pendingSeekRef.current = { targetPage: pageNumber, fraction, autoPlay: true };
+          if (!isCurrentlyOnline() && narrationSource === 'translated') {
+            setAudioMessage('Offline mode — reading original text.');
+            onNarrationSourceChange('original');
+            return;
+          }
           setWaitingForTranslation(true);
           onRequestTranslatePage();
         }
@@ -1782,11 +1938,51 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
       pendingSeekRef.current = {
         targetPage: seg.pageNumber,
         fraction,
-        autoPlay: isSpeaking || activeSentenceIndex !== null,
+        autoPlay: true,
       };
       onSeekToPage(seg.pageNumber);
     }
   };
+
+  const resolveTimelinePoint = (targetSec: number) => {
+    const clampedSec = Math.max(0, Math.min(chapterTimeline.totalSec, targetSec));
+    const percent = Math.min(100, Math.max(0, (clampedSec / Math.max(1, chapterTimeline.totalSec)) * 100));
+    const seg =
+      chapterTimeline.pages.find(
+        (p) => clampedSec >= p.startSec && clampedSec <= p.startSec + p.durationSec
+      ) ?? chapterTimeline.pages[chapterTimeline.pages.length - 1];
+    const targetPage = seg?.pageNumber ?? pageNumber;
+
+    let sentencePreview: string | null = null;
+    if (seg && targetPage === pageNumber && sentences.length > 0) {
+      const offsetInPage = Math.max(0, clampedSec - seg.startSec);
+      let accum = 0;
+      for (let i = 0; i < chapterTimeline.sentenceDurationsSec.length; i++) {
+        const dur = chapterTimeline.sentenceDurationsSec[i];
+        if (offsetInPage <= accum + dur || i === chapterTimeline.sentenceDurationsSec.length - 1) {
+          const text = sentences[i]?.text?.trim() ?? '';
+          if (text) {
+            sentencePreview = text.length > 56 ? `${text.slice(0, 56).trim()}…` : text;
+          }
+          break;
+        }
+        accum += dur;
+      }
+    }
+
+    return { sec: clampedSec, percent, pageNumber: targetPage, sentencePreview };
+  };
+
+  const clientXToTimelineSec = (clientX: number): number | null => {
+    const track = timelineTrackRef.current;
+    if (!track) return null;
+    const rect = track.getBoundingClientRect();
+    if (rect.width <= 0) return null;
+    const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+    return ratio * chapterTimeline.totalSec;
+  };
+
+  const isTimelineDisabled = !canClickListen && chapterTimeline.pages.length <= 1;
 
   const displayedElapsedSec = scrubSec !== null ? scrubSec : chapterTimeline.elapsedSec;
   const displayedRemainingSec = Math.max(0, chapterTimeline.totalSec - displayedElapsedSec);
@@ -1794,12 +1990,25 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     100,
     Math.max(0, (displayedElapsedSec / Math.max(1, chapterTimeline.totalSec)) * 100)
   );
-  const scrubTargetPage =
-    scrubSec !== null
-      ? chapterTimeline.pages.find(
-          (p) => scrubSec >= p.startSec && scrubSec <= p.startSec + p.durationSec
-        )?.pageNumber ?? pageNumber
-      : null;
+  const activePageSeg = chapterTimeline.pages.find((p) => p.pageNumber === pageNumber) ?? null;
+  const previewSec = scrubSec !== null ? scrubSec : hoverSec;
+  const previewInfo = previewSec !== null ? resolveTimelinePoint(previewSec) : null;
+  const scrubTargetPage = previewInfo?.pageNumber ?? null;
+
+  // Sentence tick positions for single-page timelines (keeps the visual rhythm scannable without clutter)
+  const sentenceTickPercents = useMemo(() => {
+    if (chapterTimeline.pages.length !== 1) return [];
+    const count = chapterTimeline.sentenceDurationsSec.length;
+    if (count < 2 || count > 36) return [];
+    const total = Math.max(1, chapterTimeline.totalSec);
+    const ticks: number[] = [];
+    let accum = 0;
+    for (let i = 0; i < count - 1; i++) {
+      accum += chapterTimeline.sentenceDurationsSec[i];
+      ticks.push((accum / total) * 100);
+    }
+    return ticks;
+  }, [chapterTimeline]);
 
   const sleepDisplay =
     sleepSecondsLeft > 0
@@ -1921,35 +2130,161 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
         </div>
       )}
 
-      {/* Chapter Audio Progress Indicator & Interactive Seek Slider */}
+      {/* Visual Chapter Audio Timeline & Click-to-Seek Progress Bar */}
       <div className="border-b border-stone-200/70 sepia:border-[#DFD4BC]/80 dark:border-stone-800/80">
         <div className="max-w-[1680px] mx-auto px-3 sm:px-6 pt-1.5 pb-1 flex items-center gap-2.5 sm:gap-3">
           {/* Elapsed Time & Chapter Context */}
           <div className="flex items-center gap-2 shrink-0 min-w-0">
-            <span className="font-mono-num text-[11px] font-medium text-stone-700 dark:text-stone-300 w-10 sm:w-11 text-right">
+            <span className="font-mono-num tabular-nums text-[11px] font-medium text-stone-700 dark:text-stone-300 w-10 sm:w-11 text-right">
               {formatAudioDuration(displayedElapsedSec)}
             </span>
             <span
               title={chapterTimeline.chapterLabel}
-              className="hidden md:inline-block text-[11px] text-stone-500 dark:text-stone-400 truncate max-w-[170px]"
+              className="hidden md:inline-block text-[11px] text-stone-500 dark:text-stone-400 truncate max-w-[180px]"
             >
-              {scrubTargetPage !== null && scrubTargetPage !== pageNumber
-                ? `Jump to Page ${scrubTargetPage}`
+              {scrubSec !== null && scrubTargetPage !== null && scrubTargetPage !== pageNumber
+                ? `Seek to Page ${scrubTargetPage}`
                 : chapterTimeline.chapterLabel}
             </span>
           </div>
 
-          {/* Interactive Progress Track + Accessible Range Scrubber */}
-          <div className="relative flex-1 h-5 flex items-center group">
-            {/* Base Track */}
-            <div className="w-full h-1.5 rounded-full bg-stone-200/90 sepia:bg-[#DFD4BC] dark:bg-stone-800 overflow-hidden relative">
-              {/* Filled Progress */}
+          {/* Interactive Visual Timeline Rail (Click-to-Seek, Drag-to-Scrub, Keyboard Accessible) */}
+          <div
+            ref={timelineTrackRef}
+            role="slider"
+            tabIndex={isTimelineDisabled ? -1 : 0}
+            aria-label={`Seek chapter audio timeline (${chapterTimeline.chapterLabel})`}
+            aria-disabled={isTimelineDisabled}
+            aria-valuemin={0}
+            aria-valuemax={Math.round(chapterTimeline.totalSec)}
+            aria-valuenow={Math.round(displayedElapsedSec)}
+            aria-valuetext={`${formatAudioDuration(displayedElapsedSec)} of ${formatAudioDuration(chapterTimeline.totalSec)}, ${formatAudioDuration(displayedRemainingSec)} remaining in ${chapterTimeline.chapterLabel}`}
+            onPointerDown={(e) => {
+              if (isTimelineDisabled || e.button !== 0) return;
+              const nextSec = clientXToTimelineSec(e.clientX);
+              if (nextSec === null) return;
+              e.preventDefault();
+              isDraggingTimelineRef.current = true;
+              setScrubSec(nextSec);
+              scrubSecRef.current = nextSec;
+              try {
+                e.currentTarget.setPointerCapture(e.pointerId);
+              } catch {
+                // ignore pointer capture fallback
+              }
+            }}
+            onPointerMove={(e) => {
+              if (isTimelineDisabled) return;
+              const nextSec = clientXToTimelineSec(e.clientX);
+              if (nextSec === null) return;
+              if (isDraggingTimelineRef.current) {
+                setScrubSec(nextSec);
+                scrubSecRef.current = nextSec;
+              } else {
+                setHoverSec(nextSec);
+              }
+            }}
+            onPointerUp={(e) => {
+              if (!isDraggingTimelineRef.current) return;
+              isDraggingTimelineRef.current = false;
+              const releaseSec = clientXToTimelineSec(e.clientX) ?? scrubSecRef.current;
+              setScrubSec(null);
+              scrubSecRef.current = null;
+              try {
+                if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+                  e.currentTarget.releasePointerCapture(e.pointerId);
+                }
+              } catch {
+                // ignore
+              }
+              if (releaseSec !== null) {
+                commitSeek(releaseSec);
+              }
+            }}
+            onPointerCancel={() => {
+              isDraggingTimelineRef.current = false;
+              setScrubSec(null);
+              scrubSecRef.current = null;
+            }}
+            onPointerLeave={() => {
+              if (!isDraggingTimelineRef.current) {
+                setHoverSec(null);
+              }
+            }}
+            onKeyDown={(e) => {
+              if (isTimelineDisabled) return;
+              const base = chapterTimeline.elapsedSec;
+              let target: number | null = null;
+              if (e.key === 'ArrowRight' || e.key === 'ArrowUp') target = base + 5;
+              else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') target = base - 5;
+              else if (e.key === 'PageUp') target = base + 15;
+              else if (e.key === 'PageDown') target = base - 15;
+              else if (e.key === 'Home') target = 0;
+              else if (e.key === 'End') target = chapterTimeline.totalSec;
+              if (target !== null) {
+                e.preventDefault();
+                commitSeek(target);
+              }
+            }}
+            className={`relative flex-1 h-6 flex items-center select-none touch-none group focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-700/60 dark:focus-visible:ring-amber-400/60 rounded ${
+              isTimelineDisabled ? 'opacity-45 cursor-not-allowed' : 'cursor-pointer'
+            }`}
+          >
+            {/* Floating Hover / Scrub Preview Tooltip */}
+            {previewInfo && !isTimelineDisabled && (
+              <div
+                style={{
+                  left: `${Math.min(92, Math.max(8, previewInfo.percent))}%`,
+                }}
+                className="pointer-events-none absolute -top-9 -translate-x-1/2 z-30 max-w-[260px] px-2.5 py-1 rounded-md bg-stone-900 dark:bg-stone-100 text-stone-50 dark:text-stone-900 shadow-md text-[11px] leading-tight whitespace-nowrap flex items-center gap-1.5"
+              >
+                <span className="font-mono-num tabular-nums font-semibold">
+                  {formatAudioDuration(previewInfo.sec)}
+                </span>
+                {chapterTimeline.pages.length > 1 && (
+                  <span className="text-stone-300 dark:text-stone-600">
+                    · p.{previewInfo.pageNumber}
+                  </span>
+                )}
+                {previewInfo.sentencePreview && (
+                  <span className="hidden sm:inline text-stone-300 dark:text-stone-600 truncate max-w-[165px]">
+                    · {previewInfo.sentencePreview}
+                  </span>
+                )}
+              </div>
+            )}
+
+            {/* Base Timeline Track */}
+            <div className="w-full h-1.5 group-hover:h-2 transition-[height] duration-150 rounded-full bg-stone-200/90 sepia:bg-[#DFD4BC] dark:bg-stone-800 overflow-hidden relative">
+              {/* Highlight Current Page Band inside Multi-Page Chapter */}
+              {activePageSeg && chapterTimeline.pages.length > 1 && (
+                <div
+                  aria-hidden="true"
+                  style={{
+                    left: `${(activePageSeg.startSec / Math.max(1, chapterTimeline.totalSec)) * 100}%`,
+                    width: `${(activePageSeg.durationSec / Math.max(1, chapterTimeline.totalSec)) * 100}%`,
+                  }}
+                  className="absolute top-0 bottom-0 bg-amber-700/15 dark:bg-amber-400/15 pointer-events-none"
+                />
+              )}
+
+              {/* Subtle Hover Target Fill */}
+              {hoverSec !== null && scrubSec === null && previewInfo && (
+                <div
+                  aria-hidden="true"
+                  style={{ width: `${previewInfo.percent}%` }}
+                  className="absolute inset-y-0 left-0 bg-stone-400/35 dark:bg-stone-500/35 pointer-events-none"
+                />
+              )}
+
+              {/* Filled Chapter Progress */}
               <div
                 style={{ width: `${progressPercent}%` }}
-                className="h-full bg-amber-700 dark:bg-amber-500 transition-[width] duration-150 ease-out"
+                className="relative h-full bg-amber-700 dark:bg-amber-500 transition-[width] duration-150 ease-out"
               />
-              {/* Subtle Page Boundary Ticks for Multi-Page Chapters */}
-              {chapterTimeline.pages.length > 1 && chapterTimeline.pages.length <= 24 && (
+
+              {/* Multi-Page Chapter Segment Boundary Ticks */}
+              {chapterTimeline.pages.length > 1 && chapterTimeline.pages.length <= 28 && (
                 <>
                   {chapterTimeline.pages.slice(1).map((seg) => (
                     <span
@@ -1958,74 +2293,48 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
                       style={{
                         left: `${(seg.startSec / Math.max(1, chapterTimeline.totalSec)) * 100}%`,
                       }}
-                      className="absolute top-0 bottom-0 w-px bg-white/75 dark:bg-black/50 pointer-events-none"
+                      className="absolute top-0 bottom-0 w-px bg-[#FAF9F5]/90 sepia:bg-[#F4ECD8]/90 dark:bg-[#141312]/75 pointer-events-none"
+                    />
+                  ))}
+                </>
+              )}
+
+              {/* Single-Page Sentence Rhythm Ticks */}
+              {sentenceTickPercents.length > 0 && (
+                <>
+                  {sentenceTickPercents.map((pct, i) => (
+                    <span
+                      key={i}
+                      aria-hidden="true"
+                      style={{ left: `${pct}%` }}
+                      className="absolute top-0 bottom-0 w-px bg-stone-400/35 dark:bg-stone-600/40 pointer-events-none"
                     />
                   ))}
                 </>
               )}
             </div>
 
-            {/* Visual Scrubber Thumb */}
+            {/* Hover Guide Hairline */}
+            {hoverSec !== null && scrubSec === null && previewInfo && !isTimelineDisabled && (
+              <span
+                aria-hidden="true"
+                style={{ left: `${previewInfo.percent}%` }}
+                className="absolute top-1 bottom-1 w-0.5 -translate-x-1/2 rounded-full bg-stone-600/70 dark:bg-stone-300/70 pointer-events-none"
+              />
+            )}
+
+            {/* Visual Playhead / Scrubber Thumb */}
             <span
               aria-hidden="true"
               style={{ left: `${progressPercent}%` }}
-              className={`absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-3 h-3 rounded-full bg-amber-700 dark:bg-amber-400 ring-2 ring-[#FAF9F5] sepia:ring-[#F4ECD8] dark:ring-[#141312] shadow-sm pointer-events-none transition-transform ${
-                scrubSec !== null ? 'scale-125' : 'group-hover:scale-115'
+              className={`absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-3.5 h-3.5 rounded-full bg-amber-700 dark:bg-amber-400 ring-2 ring-[#FAF9F5] sepia:ring-[#F4ECD8] dark:ring-[#141312] shadow-sm pointer-events-none transition-transform duration-150 ${
+                scrubSec !== null ? 'scale-125' : 'scale-95 group-hover:scale-115'
               }`}
-            />
-
-            {/* Native Accessible Range Input Overlay */}
-            <input
-              type="range"
-              min={0}
-              max={chapterTimeline.totalSec}
-              step={0.5}
-              value={displayedElapsedSec}
-              disabled={!canClickListen && chapterTimeline.pages.length <= 1}
-              aria-label={`Seek chapter audio (${chapterTimeline.chapterLabel})`}
-              aria-valuetext={`${formatAudioDuration(displayedElapsedSec)} elapsed, ${formatAudioDuration(displayedRemainingSec)} remaining in chapter`}
-              onChange={(e) => {
-                const next = parseFloat(e.target.value);
-                if (Number.isFinite(next)) {
-                  setScrubSec(next);
-                  scrubSecRef.current = next;
-                }
-              }}
-              onPointerUp={() => {
-                if (scrubSecRef.current !== null) {
-                  const target = scrubSecRef.current;
-                  setScrubSec(null);
-                  scrubSecRef.current = null;
-                  commitSeek(target);
-                }
-              }}
-              onTouchEnd={() => {
-                if (scrubSecRef.current !== null) {
-                  const target = scrubSecRef.current;
-                  setScrubSec(null);
-                  scrubSecRef.current = null;
-                  commitSeek(target);
-                }
-              }}
-              onKeyUp={(e) => {
-                if (
-                  ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(
-                    e.key
-                  ) &&
-                  scrubSecRef.current !== null
-                ) {
-                  const target = scrubSecRef.current;
-                  setScrubSec(null);
-                  scrubSecRef.current = null;
-                  commitSeek(target);
-                }
-              }}
-              className="absolute inset-0 w-full h-full opacity-0 cursor-pointer disabled:cursor-not-allowed"
             />
           </div>
 
-          {/* Remaining Chapter Duration */}
-          <div className="flex items-center gap-1.5 shrink-0 font-mono-num text-[11px] whitespace-nowrap">
+          {/* Remaining Duration, Total Duration & Chapter Progress */}
+          <div className="flex items-center gap-1.5 shrink-0 font-mono-num tabular-nums text-[11px] whitespace-nowrap">
             <span
               title={`Remaining duration in "${chapterTimeline.chapterLabel}" at ${rate.toFixed(2).replace(/0$/, '')}x speed`}
               className="font-medium text-stone-700 dark:text-stone-300"
@@ -2033,7 +2342,10 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
               -{formatAudioDuration(displayedRemainingSec)}
             </span>
             <span className="hidden sm:inline text-stone-400 dark:text-stone-500">
-              left
+              / {formatAudioDuration(chapterTimeline.totalSec)}
+            </span>
+            <span className="hidden md:inline text-stone-400 dark:text-stone-500">
+              · {Math.round(progressPercent)}%
             </span>
             {chapterTimeline.endPage > chapterTimeline.startPage && (
               <span className="hidden lg:inline text-stone-400 dark:text-stone-500">
@@ -2222,20 +2534,22 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
                   </div>
 
                   <div className="flex items-center gap-1 flex-wrap">
-                    {(['all', 'Female', 'Male', 'Natural', 'Expressive'] as const).map((tab) => (
-                      <button
-                        key={tab}
-                        type="button"
-                        onClick={() => setNeuralFilter(tab)}
-                        className={`h-6 px-2 rounded text-[11px] font-medium transition-colors cursor-pointer ${
-                          neuralFilter === tab
-                            ? 'bg-stone-900 text-stone-50 dark:bg-stone-100 dark:text-stone-950'
-                            : 'text-stone-600 dark:text-stone-400 hover:bg-stone-200/70 dark:hover:bg-stone-800'
-                        }`}
-                      >
-                        {tab === 'all' ? 'All' : tab}
-                      </button>
-                    ))}
+                    {(['all', 'Teacher', 'Female', 'Male', 'Expressive', 'Natural'] as const).map(
+                      (tab) => (
+                        <button
+                          key={tab}
+                          type="button"
+                          onClick={() => setNeuralFilter(tab)}
+                          className={`h-6 px-2 rounded text-[11px] font-medium transition-colors cursor-pointer ${
+                            neuralFilter === tab
+                              ? 'bg-stone-900 text-stone-50 dark:bg-stone-100 dark:text-stone-950'
+                              : 'text-stone-600 dark:text-stone-400 hover:bg-stone-200/70 dark:hover:bg-stone-800'
+                          }`}
+                        >
+                          {tab === 'all' ? 'All' : tab}
+                        </button>
+                      )
+                    )}
                   </div>
                 </div>
 

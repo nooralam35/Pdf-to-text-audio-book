@@ -341,6 +341,8 @@ export async function synthesizePageAudio(params: {
   voiceStyle?: string;
   languageName: string;
   targetLang?: LanguageCode;
+  sentenceKind?: string;
+  modelTier?: 'flash' | 'lite';
   signal?: AbortSignal;
 }): Promise<{ blob: Blob; ext: 'wav' | 'mp3' }> {
   const { signal, ...bodyPayload } = params;

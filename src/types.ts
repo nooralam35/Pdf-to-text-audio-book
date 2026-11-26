@@ -133,6 +133,14 @@ export interface StoredBook {
   pageHeight?: number;
   annotations?: Record<number, PageAnnotationLayer>;
   bookmarks?: number[];
+  isBookmarked?: boolean;
+  bookmarkedAt?: number;
+  lastOpenedAt?: number;
+  lastAudioPage?: number;
+  lastSentenceIndex?: number;
+  lastNarrationSource?: 'translated' | 'original';
+  lastTargetLang?: LanguageCode;
+  discoveredBookId?: string;
   externalSource?: BookSearchSource;
   externalUrl?: string;
 }

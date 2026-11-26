@@ -53,6 +53,11 @@ import {
   PRELOADED_OBS_BOOK_URL,
 } from './lib/languages';
 import {
+  getVoiceStylePreferenceOption,
+  VOICE_STYLE_PREFERENCES,
+  type VoiceStylePreference,
+} from './lib/voiceProfiles';
+import {
   detectChapters,
   extractPageContent,
   loadPdfFromBuffer,
@@ -74,7 +79,8 @@ import {
   saveParsedPage,
   saveTranslation,
   toggleBookBookmark,
-  updateBookLastPage,
+  toggleBookSavedBookmark,
+  updateBookProgress,
 } from './lib/storage';
 import {
   checkServerCapabilities,
@@ -110,6 +116,7 @@ export default function App() {
     Record<string, number>
   >({});
   const [cachingBookId, setCachingBookId] = useState<string | null>(null);
+  const [downloadingBookId, setDownloadingBookId] = useState<string | null>(null);
   const [isSyncingAllOffline, setIsSyncingAllOffline] = useState(false);
 
   // Navigation & Reading Themes (Light Paper, Sepia, OLED Dark)
@@ -160,7 +167,20 @@ export default function App() {
   const [customTermsInput, setCustomTermsInput] = useState(
     'OBS, Scene, Source, Plugin, Bitrate, NDI, SRT, Audio Mixer'
   );
+  const [voiceStylePreference, setVoiceStylePreference] = useState<VoiceStylePreference>(() => {
+    if (typeof window === 'undefined') return 'teacher';
+    const saved = localStorage.getItem('bhashabook-voice-style-preference');
+    return saved === 'narrator' || saved === 'energetic' ? saved : 'teacher';
+  });
   const [showGlossaryPopover, setShowGlossaryPopover] = useState(false);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('bhashabook-voice-style-preference', voiceStylePreference);
+    } catch {
+      // ignore storage errors
+    }
+  }, [voiceStylePreference]);
 
   // Page Parsed & Translated Records
   const [parsedPage, setParsedPage] = useState<ParsedPage | null>(null);
@@ -203,6 +223,9 @@ export default function App() {
   const [pendingPostLoadAction, setPendingPostLoadAction] = useState<{
     bookId: string;
     action: 'translate' | 'listen';
+    targetPage?: number;
+    sentenceIndex?: number;
+    narrationSource?: 'translated' | 'original';
   } | null>(null);
   const [chapterSummaryModal, setChapterSummaryModal] = useState<ChapterSummaryResult | null>(null);
   const [summarizingChapterId, setSummarizingChapterId] = useState<string | null>(null);
@@ -282,9 +305,16 @@ export default function App() {
     return unsubscribe;
   }, []);
 
+  const booksCacheSignature = useMemo(
+    () => books.map((b) => `${b.id}:${b.pdfData && b.pdfData.byteLength > 0 ? 1 : 0}`).join('|'),
+    [books]
+  );
+  const booksRef = useRef(books);
+  booksRef.current = books;
+
   useEffect(() => {
-    refreshOfflineInspection(books);
-  }, [books, swStatus, translatedCountsByBook, refreshOfflineInspection]);
+    refreshOfflineInspection(booksRef.current);
+  }, [booksCacheSignature, swStatus, translatedCountsByBook, refreshOfflineInspection]);
 
   useEffect(() => {
     if (isOnline && swStatus === 'active') {
@@ -292,9 +322,28 @@ export default function App() {
     }
   }, [isOnline, swStatus]);
 
+  // Keep in-memory Library list & activeBook synchronized and ordered by most recently used
+  const syncUpdatedBookInState = useCallback((updated: StoredBook, syncActive = true) => {
+    setBooks((prev) => {
+      const exists = prev.some((b) => b.id === updated.id);
+      const next = exists
+        ? prev.map((b) => (b.id === updated.id ? updated : b))
+        : [updated, ...prev];
+      return [...next].sort(
+        (a, b) => (b.lastOpenedAt ?? b.addedAt) - (a.lastOpenedAt ?? a.addedAt)
+      );
+    });
+    if (syncActive) {
+      setActiveBook((curr) => (curr && curr.id === updated.id ? updated : curr));
+    }
+  }, []);
+
   // Open a StoredBook into the active PDF.js instance (offline-first: IndexedDB -> SW Cache -> Network)
   const openStoredBook = useCallback(
-    async (book: StoredBook) => {
+    async (
+      book: StoredBook,
+      options?: { pageOverride?: number; restoreAudioState?: boolean }
+    ) => {
       setAppBanner(null);
       let pdfDoc: LoadedPdf;
       if (book.pdfData && book.pdfData.byteLength > 0) {
@@ -313,8 +362,7 @@ export default function App() {
           // Persist into Service Worker cache & IndexedDB in background so future offline opens work immediately
           cacheBookForOffline(book)
             .then((cached) => {
-              setBooks((prev) => prev.map((b) => (b.id === cached.id ? cached : b)));
-              setActiveBook((prev) => (prev && prev.id === cached.id ? cached : prev));
+              syncUpdatedBookInState(cached);
             })
             .catch(() => {});
         } else {
@@ -322,16 +370,52 @@ export default function App() {
         }
       }
 
+      const targetPage = Math.max(
+        1,
+        Math.min(
+          book.numPages,
+          options?.pageOverride ??
+            (options?.restoreAudioState ? book.lastAudioPage ?? book.lastPage : book.lastPage) ??
+            1
+        )
+      );
+
+      const now = Date.now();
+      const updatedBook =
+        (await updateBookProgress(book.id, {
+          lastPage: targetPage,
+          lastOpenedAt: now,
+        }).catch(() => undefined)) ?? { ...book, lastPage: targetPage, lastOpenedAt: now };
+
       setLoadedPdf((prev) => {
         if (prev && prev !== pdfDoc) {
           prev.cleanup().catch(() => {});
         }
         return pdfDoc;
       });
-      setActiveBook(book);
-      setCurrentPage(Math.max(1, Math.min(book.numPages, book.lastPage || 1)));
+      setActiveBook(updatedBook);
+      syncUpdatedBookInState(updatedBook);
+      setCurrentPage(targetPage);
+
+      if (options?.restoreAudioState) {
+        if (updatedBook.lastTargetLang) {
+          setTargetLang(updatedBook.lastTargetLang);
+        }
+        if (updatedBook.lastNarrationSource) {
+          setNarrationSource(updatedBook.lastNarrationSource);
+        }
+      }
+
+      if (
+        updatedBook.lastAudioPage === targetPage &&
+        typeof updatedBook.lastSentenceIndex === 'number'
+      ) {
+        setActiveSentenceIndex(updatedBook.lastSentenceIndex);
+      } else {
+        setActiveSentenceIndex(null);
+      }
     },
-    []
+    [syncUpdatedBookInState]
   );
 
   // Boot: check server capabilities + load IndexedDB library or preload attached OBS Superuser Guidebook
@@ -425,56 +509,68 @@ export default function App() {
   }, []);
 
   // Load all cached translations for the active book + target language
+  const activeBookId = activeBook?.id ?? null;
   useEffect(() => {
-    if (!activeBook) return;
+    if (!activeBookId) return;
     let cancelled = false;
-    listTranslationsForBookLang(activeBook.id, targetLang).then((rows) => {
+    listTranslationsForBookLang(activeBookId, targetLang).then((rows) => {
       if (!cancelled) {
         setBookTranslations(rows);
         setTranslatedCountsByBook((prev) => ({
           ...prev,
-          [activeBook.id]: rows.length,
+          [activeBookId]: rows.length,
         }));
       }
     });
     return () => {
       cancelled = true;
     };
-  }, [activeBook, targetLang]);
+  }, [activeBookId, targetLang]);
 
-  // Refresh library counts when language changes
+  // Refresh library counts when book list membership or language changes
+  const bookIdsKey = useMemo(() => books.map((b) => b.id).sort().join('|'), [books]);
   useEffect(() => {
-    if (books.length > 0) {
-      refreshLibraryCounts(books, targetLang);
+    if (booksRef.current.length > 0) {
+      refreshLibraryCounts(booksRef.current, targetLang);
     }
-  }, [books, targetLang, refreshLibraryCounts]);
+  }, [bookIdsKey, targetLang, refreshLibraryCounts]);
 
-  // Load parsed page + cached translation (or attach to an in-flight auto-save prefetch) whenever activeBook / page / targetLang changes
+  // Load parsed page + cached translation (or attach to an in-flight auto-save prefetch) whenever activeBookId / page / targetLang changes
   useEffect(() => {
-    if (!activeBook || !loadedPdf) return;
+    if (!activeBookId || !loadedPdf) return;
     let cancelled = false;
 
     setTranslationError(null);
-    updateBookLastPage(activeBook.id, currentPage).catch(() => {});
+    updateBookProgress(activeBookId, {
+      lastPage: currentPage,
+      lastTargetLang: targetLang,
+      lastOpenedAt: Date.now(),
+    })
+      .then((updated) => {
+        if (!cancelled && updated) {
+          syncUpdatedBookInState(updated, false);
+        }
+      })
+      .catch(() => {});
 
     (async () => {
       // 1. Check cached translation immediately for instant offline rendering
-      const cachedTr = await getTranslation(activeBook.id, targetLang, currentPage);
+      const cachedTr = await getTranslation(activeBookId, targetLang, currentPage);
       if (!cancelled) {
         setTranslatedPage(cachedTr ?? null);
       }
 
       // 2. Check cached parsed page or extract fresh from PDF.js
-      let parsed = await getParsedPage(activeBook.id, currentPage);
+      let parsed = await getParsedPage(activeBookId, currentPage);
       if (!parsed) {
         try {
           parsed = await extractPageContent(loadedPdf, currentPage);
-          await saveParsedPage(activeBook.id, parsed);
+          await saveParsedPage(activeBookId, parsed);
         } catch {
           parsed = {
             pageNumber: currentPage,
-            width: activeBook.pageWidth || 432,
-            height: activeBook.pageHeight || 648,
+            width: activeBook?.pageWidth || 432,
+            height: activeBook?.pageHeight || 648,
             blocks: [],
             figures: [],
             isBlank: true,
@@ -487,7 +583,7 @@ export default function App() {
 
       // 3. If a background auto-translation for this exact page is already in flight, attach cleanly without duplicating the request
       if (!cachedTr) {
-        const key = makeTranslationKey(activeBook.id, targetLang, currentPage);
+        const key = makeTranslationKey(activeBookId, targetLang, currentPage);
         const pending = inFlightTranslationsRef.current.get(key);
         if (pending && !cancelled) {
           setIsTranslatingPage(true);
@@ -512,7 +608,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [activeBook, loadedPdf, currentPage, targetLang]);
+  }, [activeBookId, loadedPdf, currentPage, targetLang, syncUpdatedBookInState]);
 
   // Upload a new PDF file from disk
   const handleUploadPdf = async (file: File) => {
@@ -542,7 +638,9 @@ export default function App() {
         chapters,
         pdfData: buffer,
         addedAt: Date.now(),
+        lastOpenedAt: Date.now(),
         lastPage: startPage,
+        lastTargetLang: targetLang,
         pageWidth: vp1.width,
         pageHeight: vp1.height,
       };
@@ -650,16 +748,159 @@ export default function App() {
     }
   }, [books, isSyncingAllOffline, refreshOfflineInspection]);
 
-  // Load, translate, listen, or download a book directly from the Global E-Book Discovery Hub
+  // Toggle Book-level Bookmark / Save (distinct from page bookmarks)
+  const handleToggleBookSavedBookmark = useCallback(
+    async (bookId: string) => {
+      const updated = await toggleBookSavedBookmark(bookId);
+      if (updated) {
+        syncUpdatedBookInState(updated);
+        setAppBanner(
+          updated.isBookmarked
+            ? `Bookmarked “${updated.title}” in My Library.`
+            : `Removed “${updated.title}” from Bookmarks.`
+        );
+      }
+    },
+    [syncUpdatedBookInState]
+  );
+
+  // Resume listening directly from any Library card at its exact saved page & sentence
+  const handleListenStoredBook = useCallback(
+    async (book: StoredBook) => {
+      audiobookControlRef.current?.unlockAudio();
+      const resumePage = Math.max(
+        1,
+        Math.min(book.numPages, book.lastAudioPage ?? book.lastPage ?? 1)
+      );
+      const resumeSentence = book.lastSentenceIndex ?? 0;
+      try {
+        await openStoredBook(book, { pageOverride: resumePage, restoreAudioState: true });
+        setActiveTab('reader');
+        setMobilePane('translated');
+        setPendingPostLoadAction({
+          bookId: book.id,
+          action: 'listen',
+          targetPage: resumePage,
+          sentenceIndex: resumeSentence,
+          narrationSource: book.lastNarrationSource,
+        });
+      } catch (err) {
+        setAppBanner(
+          err instanceof Error ? err.message : 'Unable to start audio for this book.'
+        );
+      }
+    },
+    [openStoredBook]
+  );
+
+  // Open & translate directly from any Library card
+  const handleTranslateStoredBook = useCallback(
+    async (book: StoredBook) => {
+      try {
+        await openStoredBook(book);
+        setActiveTab('reader');
+        setMobilePane('translated');
+        setPendingPostLoadAction({ bookId: book.id, action: 'translate' });
+      } catch (err) {
+        setAppBanner(
+          err instanceof Error ? err.message : 'Unable to open this book for translation.'
+        );
+      }
+    },
+    [openStoredBook]
+  );
+
+  // Download PDF directly from any Library card (offline-first from IndexedDB / SW Cache)
+  const handleDownloadStoredBook = useCallback(
+    async (book: StoredBook) => {
+      if (downloadingBookId) return;
+      setDownloadingBookId(book.id);
+      setAppBanner(null);
+      try {
+        let buffer: ArrayBuffer | null =
+          book.pdfData && book.pdfData.byteLength > 0 ? book.pdfData : null;
+        if (!buffer) {
+          buffer = await getCachedBookBufferFromSW(book);
+        }
+        if (!buffer && book.sourceUrl) {
+          const resp = await fetch(book.sourceUrl);
+          if (!resp.ok) throw new Error(`Could not fetch PDF (${resp.status}).`);
+          buffer = await resp.arrayBuffer();
+        }
+        if (!buffer) {
+          throw new Error('PDF file data is not cached locally yet.');
+        }
+        const safeName =
+          book.fileName && book.fileName.toLowerCase().endsWith('.pdf')
+            ? book.fileName
+            : `${book.title.replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 60)}.pdf`;
+        downloadBlob(new Blob([buffer], { type: 'application/pdf' }), safeName);
+        const updated = await updateBookProgress(book.id, { lastOpenedAt: Date.now() }).catch(
+          () => undefined
+        );
+        if (updated) syncUpdatedBookInState(updated);
+        setAppBanner(`Downloaded “${book.title}” (${safeName}).`);
+      } catch (err) {
+        setAppBanner(
+          err instanceof Error ? err.message : 'Unable to download this PDF right now.'
+        );
+      } finally {
+        setDownloadingBookId(null);
+      }
+    },
+    [downloadingBookId, syncUpdatedBookInState]
+  );
+
+  // Load, translate, listen, bookmark, or download a book from Global E-Book Discovery Hub
+  // Every interaction automatically creates/updates its record in My Library and preserves resume history
   const handleActionDiscoveredBook = async (
     book: DiscoveredBook,
     action: DiscoverBookAction
   ) => {
     setAppBanner(null);
+    const storedId = `discover-${book.source}-${book.identifier
+      .replace(/[^a-zA-Z0-9_-]/g, '')
+      .slice(0, 40)}`;
+
+    // Reuse existing Library record so reading/listening progress, bookmarks & translations are preserved
+    const existing = books.find(
+      (b) => b.discoveredBookId === book.id || b.id === storedId
+    );
+    if (existing) {
+      if (action === 'bookmark') {
+        await handleToggleBookSavedBookmark(existing.id);
+        return;
+      }
+      if (action === 'download') {
+        await handleDownloadStoredBook(existing);
+        return;
+      }
+      if (action === 'listen') {
+        await handleListenStoredBook(existing);
+        return;
+      }
+      if (action === 'translate') {
+        await handleTranslateStoredBook(existing);
+        return;
+      }
+      try {
+        await openStoredBook(existing);
+        setActiveTab('reader');
+      } catch (err) {
+        setAppBanner(
+          err instanceof Error ? err.message : 'Unable to open this saved book.'
+        );
+      }
+      return;
+    }
+
     setLoadingBookAction({
       bookId: book.id,
       action,
-      status: `Preparing "${book.title}"…`,
+      status:
+        action === 'bookmark'
+          ? `Bookmarking & saving "${book.title}" to My Library…`
+          : `Preparing "${book.title}"…`,
     });
 
     try {
@@ -667,16 +908,10 @@ export default function App() {
         setLoadingBookAction({ bookId: book.id, action, status });
       });
 
-      if (action === 'download') {
-        downloadBlob(new Blob([buffer], { type: 'application/pdf' }), fileName);
-        setAppBanner(`Downloaded "${book.title}" (${fileName}).`);
-        return;
-      }
-
       setLoadingBookAction({
         bookId: book.id,
         action,
-        status: `Parsing pages, cover & chapters for "${book.title}"…`,
+        status: `Saving record, chapters & cover for "${book.title}" in My Library…`,
       });
 
       const pdf = await loadPdfFromBuffer(buffer);
@@ -696,9 +931,10 @@ export default function App() {
           ? 2
           : 1;
 
-      const storedId = `discover-${book.source}-${book.identifier.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40)}`;
+      const now = Date.now();
       const newBook: StoredBook = {
         id: storedId,
+        discoveredBookId: book.id,
         title: book.title || detectedTitle || 'Public Domain E-Book',
         author: book.author || detectedAuthor || '',
         fileName,
@@ -706,8 +942,12 @@ export default function App() {
         coverDataUrl: coverRes.dataUrl,
         chapters,
         pdfData: buffer,
-        addedAt: Date.now(),
+        addedAt: now,
+        lastOpenedAt: now,
         lastPage: startPage,
+        lastTargetLang: targetLang,
+        isBookmarked: action === 'bookmark',
+        bookmarkedAt: action === 'bookmark' ? now : undefined,
         pageWidth: vp1.width,
         pageHeight: vp1.height,
         externalSource: book.source,
@@ -719,16 +959,39 @@ export default function App() {
       const all = await listBooks();
       setBooks(all);
 
+      if (action === 'download') {
+        pdf.cleanup().catch(() => {});
+        downloadBlob(new Blob([buffer], { type: 'application/pdf' }), fileName);
+        setAppBanner(
+          `Downloaded “${newBook.title}” (${fileName}) and saved its record in My Library.`
+        );
+        return;
+      }
+
+      if (action === 'bookmark') {
+        pdf.cleanup().catch(() => {});
+        setAppBanner(
+          `Bookmarked “${newBook.title}” — saved in My Library for reading, listening & PDF download.`
+        );
+        return;
+      }
+
       setLoadedPdf((prev) => {
         if (prev && prev !== pdf) prev.cleanup().catch(() => {});
         return pdf;
       });
       setActiveBook(newBook);
       setCurrentPage(startPage);
+      setActiveSentenceIndex(null);
       setActiveTab('reader');
 
       if (action === 'translate' || action === 'listen') {
-        setPendingPostLoadAction({ bookId: storedId, action });
+        setPendingPostLoadAction({
+          bookId: storedId,
+          action,
+          targetPage: startPage,
+          sentenceIndex: 0,
+        });
       }
     } catch (err) {
       setAppBanner(
@@ -746,10 +1009,9 @@ export default function App() {
     if (!activeBook) return;
     const updated = await toggleBookBookmark(activeBook.id, currentPage);
     if (updated) {
-      setActiveBook(updated);
-      setBooks((prev) => prev.map((b) => (b.id === updated.id ? updated : b)));
+      syncUpdatedBookInState(updated);
     }
-  }, [activeBook, currentPage]);
+  }, [activeBook, currentPage, syncUpdatedBookInState]);
 
   // One-Click Chapter Summarizer & Key Takeaways
   const handleSummarizeChapter = useCallback(
@@ -1618,13 +1880,49 @@ export default function App() {
     );
   }, [narrationSource, parsedPage, translatedPage]);
 
-  // Execute queued Translate or Listen action right after opening a book from the Discovery Hub
+  // Continuously save exact audio listening position (page, sentence, source, language) to Library record
+  useEffect(() => {
+    if (!activeBookId || activeSentenceIndex === null) return;
+    let cancelled = false;
+    updateBookProgress(activeBookId, {
+      lastPage: currentPage,
+      lastAudioPage: currentPage,
+      lastSentenceIndex: activeSentenceIndex,
+      lastNarrationSource: narrationSource,
+      lastTargetLang: targetLang,
+      lastOpenedAt: Date.now(),
+    })
+      .then((updated) => {
+        if (!cancelled && updated) {
+          syncUpdatedBookInState(updated, false);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activeBookId,
+    currentPage,
+    activeSentenceIndex,
+    narrationSource,
+    targetLang,
+    syncUpdatedBookInState,
+  ]);
+
+  // Execute queued Translate or Listen (with exact sentence resume) right after opening a book from Discover or Library
   useEffect(() => {
     if (!pendingPostLoadAction || !activeBook || !loadedPdf) return;
     if (activeBook.id !== pendingPostLoadAction.bookId) return;
+    if (
+      pendingPostLoadAction.targetPage !== undefined &&
+      currentPage !== pendingPostLoadAction.targetPage
+    ) {
+      return;
+    }
     if (!parsedPage || parsedPage.pageNumber !== currentPage) return;
 
-    const action = pendingPostLoadAction.action;
+    const { action, sentenceIndex = 0, narrationSource: preferredSource } = pendingPostLoadAction;
     setPendingPostLoadAction(null);
 
     if (action === 'translate') {
@@ -1632,15 +1930,45 @@ export default function App() {
         handleTranslateCurrentPage(false);
       }
     } else if (action === 'listen') {
-      if (translatedPage) {
+      const hasCurrentTranslation = Boolean(
+        translatedPage && translatedPage.pageNumber === currentPage
+      );
+      if (preferredSource === 'original') {
+        setNarrationSource('original');
+        setTimeout(
+          () => audiobookControlRef.current?.playFromSentence(sentenceIndex, currentPage),
+          80
+        );
+      } else if (hasCurrentTranslation) {
         setNarrationSource('translated');
-        setTimeout(() => audiobookControlRef.current?.playCurrentPage(), 80);
+        setTimeout(
+          () => audiobookControlRef.current?.playFromSentence(sentenceIndex, currentPage),
+          80
+        );
+      } else if (preferredSource === 'translated' && isOnline && !parsedPage.isBlank) {
+        setNarrationSource('translated');
+        setTimeout(
+          () => audiobookControlRef.current?.playFromSentence(sentenceIndex, currentPage),
+          100
+        );
       } else if (!parsedPage.isBlank) {
         setNarrationSource('original');
-        setTimeout(() => audiobookControlRef.current?.playCurrentPage(), 120);
+        setTimeout(
+          () => audiobookControlRef.current?.playFromSentence(sentenceIndex, currentPage),
+          120
+        );
       }
     }
-  }, [pendingPostLoadAction, activeBook, loadedPdf, parsedPage, translatedPage, currentPage, handleTranslateCurrentPage]);
+  }, [
+    pendingPostLoadAction,
+    activeBook,
+    loadedPdf,
+    parsedPage,
+    translatedPage,
+    currentPage,
+    isOnline,
+    handleTranslateCurrentPage,
+  ]);
 
   // Audiobook lookahead: auto-translate & auto-save next page when narration approaches the last 2 sentences
   useEffect(() => {
@@ -2033,6 +2361,46 @@ export default function App() {
                       </label>
                     </div>
 
+                    {/* AI Audiobook Voice Preference */}
+                    <div className="pt-2 border-t border-stone-200 dark:border-stone-800 space-y-1.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[11px] font-medium text-stone-500 dark:text-stone-400">
+                          Voice Preference
+                        </span>
+                        <span className="text-[10px] text-stone-400 dark:text-stone-500">
+                          AI Audiobook Style
+                        </span>
+                      </div>
+                      <div
+                        role="radiogroup"
+                        aria-label="Audiobook AI voice style preference"
+                        className="grid grid-cols-3 gap-1.5 text-xs font-medium"
+                      >
+                        {VOICE_STYLE_PREFERENCES.map((opt) => {
+                          const isActive = voiceStylePreference === opt.id;
+                          return (
+                            <button
+                              key={opt.id}
+                              type="button"
+                              role="radio"
+                              aria-checked={isActive}
+                              onClick={() => setVoiceStylePreference(opt.id)}
+                              className={`h-8 rounded border transition-colors cursor-pointer whitespace-nowrap ${
+                                isActive
+                                  ? 'border-amber-700 bg-amber-700 text-white'
+                                  : 'border-stone-300 dark:border-stone-700 text-stone-700 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800'
+                              }`}
+                            >
+                              {opt.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <p className="text-[11px] leading-snug text-stone-500 dark:text-stone-400">
+                        {getVoiceStylePreferenceOption(voiceStylePreference).description}
+                      </p>
+                    </div>
+
                     <div className="pt-2 border-t border-stone-200 dark:border-stone-800 space-y-2.5">
                       <label className="flex items-start gap-2 text-xs text-stone-700 dark:text-stone-300 cursor-pointer">
                         <input
@@ -2071,26 +2439,60 @@ export default function App() {
               </div>
             </div>
 
-            {/* Right controls: Bookmark + Fast Full-PDF Converter + Quick Translate + Theme cycle */}
+            {/* Right controls: Save Book Bookmark + Page Bookmark + Fast Full-PDF Converter + Quick Translate + Theme cycle */}
             <div className="flex items-center gap-2">
               {activeBook && (
-                <button
-                  type="button"
-                  onClick={handleToggleCurrentPageBookmark}
-                  title={
-                    isCurrentPageBookmarked
-                      ? `Remove bookmark on Page ${currentPage}`
-                      : `Bookmark Page ${currentPage}`
-                  }
-                  aria-label={isCurrentPageBookmarked ? 'Remove page bookmark' : 'Bookmark current page'}
-                  className={`h-8 w-8 inline-flex items-center justify-center rounded border transition-colors cursor-pointer ${
-                    isCurrentPageBookmarked
-                      ? 'border-amber-700 bg-amber-700 text-white'
-                      : 'border-stone-300 dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] text-stone-600 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800'
-                  }`}
-                >
-                  <Bookmark className={`w-3.5 h-3.5 ${isCurrentPageBookmarked ? 'fill-current' : ''}`} />
-                </button>
+                <>
+                  <button
+                    type="button"
+                    onClick={() => handleToggleBookSavedBookmark(activeBook.id)}
+                    title={
+                      activeBook.isBookmarked
+                        ? 'Bookmarked in My Library — click to remove'
+                        : 'Bookmark this book in My Library'
+                    }
+                    aria-label={
+                      activeBook.isBookmarked ? 'Remove book bookmark' : 'Bookmark this book'
+                    }
+                    className={`inline-flex items-center gap-1.5 h-8 px-2.5 rounded border text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                      activeBook.isBookmarked
+                        ? 'border-amber-700 bg-amber-700 text-white'
+                        : 'border-stone-300 dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] text-stone-700 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800'
+                    }`}
+                  >
+                    <Bookmark
+                      className={`w-3.5 h-3.5 ${activeBook.isBookmarked ? 'fill-current' : ''}`}
+                    />
+                    <span className="hidden md:inline">
+                      {activeBook.isBookmarked ? 'Bookmarked' : 'Save Book'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleToggleCurrentPageBookmark}
+                    title={
+                      isCurrentPageBookmarked
+                        ? `Remove page mark on Page ${currentPage}`
+                        : `Mark Page ${currentPage}`
+                    }
+                    aria-label={
+                      isCurrentPageBookmarked
+                        ? 'Remove current page mark'
+                        : 'Mark current page'
+                    }
+                    className={`h-8 px-2 inline-flex items-center justify-center gap-1 rounded border text-[11px] font-mono-num transition-colors cursor-pointer whitespace-nowrap ${
+                      isCurrentPageBookmarked
+                        ? 'border-stone-900 bg-stone-900 text-stone-50 dark:border-stone-100 dark:bg-stone-100 dark:text-stone-950'
+                        : 'border-stone-300 dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] text-stone-600 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800'
+                    }`}
+                  >
+                    <Bookmark
+                      className={`w-3 h-3 ${isCurrentPageBookmarked ? 'fill-current' : ''}`}
+                    />
+                    <span>p.{currentPage}</span>
+                  </button>
+                </>
               )}
 
               {batchProgress ? (
@@ -2199,6 +2601,7 @@ export default function App() {
         {activeTab === 'discover' ? (
           <DiscoverView
             targetLang={targetLang}
+            savedBooks={books}
             onActionBook={handleActionDiscoveredBook}
             loadingBookAction={loadingBookAction}
             onUploadPdf={handleUploadPdf}
@@ -2222,6 +2625,7 @@ export default function App() {
             cachedBookIds={cachedBookIds}
             storageUsageBytes={storageUsageBytes}
             cachingBookId={cachingBookId}
+            downloadingBookId={downloadingBookId}
             isSyncingAllOffline={isSyncingAllOffline}
             onSelectBook={async (book) => {
               try {
@@ -2235,6 +2639,10 @@ export default function App() {
                 );
               }
             }}
+            onListenBook={handleListenStoredBook}
+            onTranslateBook={handleTranslateStoredBook}
+            onDownloadBook={handleDownloadStoredBook}
+            onToggleBookBookmark={handleToggleBookSavedBookmark}
             onUploadPdf={handleUploadPdf}
             onDeleteBook={handleDeleteBook}
             onCacheBookOffline={handleCacheBookOffline}
@@ -2488,6 +2896,8 @@ export default function App() {
           aiAvailable={aiAvailable}
           narrationSource={narrationSource}
           onNarrationSourceChange={setNarrationSource}
+          voiceStylePreference={voiceStylePreference}
+          onVoiceStylePreferenceChange={setVoiceStylePreference}
         />
       )}
 

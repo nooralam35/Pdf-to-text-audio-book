@@ -1063,7 +1063,7 @@ Follow these exact rules:
     }
   });
 
-  // Audiobook Download Synthesis Endpoint (Gemini Studio WAV with automatic Free MP3 fallback)
+  // Neural Studio Audiobook Synthesis Endpoint (Expressive Gemini 3.8 Neural TTS with Teacher-like Prosody + Free MP3 fallback)
   app.post('/api/tts', async (req, res) => {
     try {
       const {
@@ -1072,6 +1072,8 @@ Follow these exact rules:
         voiceStyle,
         languageName = 'Hindi',
         targetLang = 'hi',
+        sentenceKind = 'narration',
+        modelTier = 'flash',
       } = req.body ?? {};
       if (typeof text !== 'string' || !text.trim()) {
         return res.status(400).json({ error: 'Text is required for audio generation.' });
@@ -1081,57 +1083,148 @@ Follow these exact rules:
       const safeLang =
         typeof targetLang === 'string' && ALLOWED_LANGS[targetLang] ? targetLang : 'hi';
 
-      const ai = getGeminiClient();
-      if (ai) {
-        try {
-          const allowedVoices = new Set(['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr']);
-          const safeVoice = allowedVoices.has(voiceName) ? voiceName : 'Kore';
-          const safeStyle =
-            typeof voiceStyle === 'string' && voiceStyle.trim()
-              ? voiceStyle.trim().slice(0, 180)
-              : 'Clear, warm, natural technical audiobook narrator';
+      const apiKey = process.env.GEMINI_API_KEY?.trim();
+      const ttsAi =
+        apiKey && apiKey !== 'MY_GEMINI_API_KEY'
+          ? new GoogleGenAI({
+              apiKey,
+              apiVersion: 'v1beta',
+              httpOptions: {
+                headers: {
+                  'User-Agent': 'aistudio-build',
+                },
+              },
+            })
+          : null;
 
-          const response = await ai.models.generateContent({
-            model: 'gemini-3.8-flash-lite-tts',
-            contents: [
+      if (ttsAi) {
+        const allowedVoices = new Set(['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr']);
+        const safeVoice = allowedVoices.has(voiceName) ? voiceName : 'Kore';
+        const baseStyle =
+          typeof voiceStyle === 'string' && voiceStyle.trim()
+            ? voiceStyle.trim().slice(0, 260)
+            : 'Warm, experienced teacher explaining a book aloud with expressive vocal rise and fall, natural conversational rhythm, and clear pauses';
+
+        const prosodyCueByKind: Record<string, string> = {
+          heading:
+            'Deliver like a warm teacher introducing a new chapter or topic: slightly unhurried, welcoming upward lift, and a poised pause at the end.',
+          question:
+            'Deliver like an engaging teacher asking a curious question to students: natural rising intonation and inviting warmth.',
+          exclamation:
+            'Deliver with genuine enthusiasm, bright vocal lift, and encouraging emphasis on the key point.',
+          list:
+            'Deliver with clear instructional rhythm, gently stressing the opening phrase and pacing smoothly.',
+          caption:
+            'Deliver as if explaining an illustration or diagram clearly to a student looking alongside you.',
+          narration:
+            'Use natural human rise-and-fall intonation, expressive phrasing, gentle stress on important ideas, and subtle breathing pauses at commas — never flat, monotone, or robotic.',
+        };
+
+        const safeKind =
+          typeof sentenceKind === 'string' && prosodyCueByKind[sentenceKind]
+            ? sentenceKind
+            : 'narration';
+
+        const isIndic = ['hi', 'hinglish', 'bn', 'ta', 'te', 'mr', 'ur'].includes(safeLang);
+        const languageCadence = isIndic
+          ? `Speak ${String(languageName).slice(0, 40)} with natural conversational Indian educator cadence, expressive pitch modulation, and crisp pronunciation of English technical terms.`
+          : `Speak ${String(languageName).slice(0, 40)} with natural conversational educator cadence and crisp pronunciation of technical terms.`;
+
+        const fullTeacherStyle = `${baseStyle}. ${prosodyCueByKind[safeKind]} ${languageCadence}`;
+        const directedPrompt = `Speak aloud in this exact voice and delivery style (${fullTeacherStyle}):\n\n${clippedText}`;
+
+        // Use flagship gemini-3.8-flash-tts for rich teacher-like prosody, with automatic fallback to gemini-3.8-flash-lite-tts
+        const candidateModels =
+          modelTier === 'lite'
+            ? ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts']
+            : ['gemini-3.8-flash-tts', 'gemini-3.8-flash-lite-tts'];
+
+        for (const modelName of candidateModels) {
+          // Try native speechMetadata.style first; if rejected, retry with directed text prompt
+          const attempts = [
+            [
               {
                 role: 'user',
                 parts: [
                   {
                     text: clippedText,
-                    speechMetadata: {
-                      style: `${safeStyle} speaking ${String(languageName).slice(0, 40)} with crisp pronunciation of English technical terms`,
-                    },
+                    speechMetadata: { style: fullTeacherStyle },
                   },
                 ],
               },
             ],
-            config: {
-              responseModalities: ['AUDIO'],
-              speechConfig: {
-                voiceConfig: {
-                  prebuiltVoiceConfig: { voiceName: safeVoice },
-                },
+            [
+              {
+                role: 'user',
+                parts: [{ text: directedPrompt }],
               },
-            },
-          });
+            ],
+          ];
 
-          const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-          if (base64Audio) {
-            const wavBuffer = Buffer.from(base64Audio, 'base64');
-            res.setHeader('Content-Type', 'audio/wav');
-            res.setHeader('Content-Length', String(wavBuffer.length));
-            res.setHeader('Content-Disposition', 'attachment; filename="audiobook-page.wav"');
-            return res.send(wavBuffer);
+          for (const contents of attempts) {
+            try {
+              const response = await ttsAi.models.generateContent({
+                model: modelName,
+                contents,
+                config: {
+                  responseModalities: ['AUDIO'],
+                  speechConfig: {
+                    voiceConfig: {
+                      prebuiltVoiceConfig: { voiceName: safeVoice },
+                    },
+                  },
+                },
+              });
+
+              const part = response.candidates?.[0]?.content?.parts?.[0];
+              const base64Audio = part?.inlineData?.data;
+              if (base64Audio) {
+                const rawBuf = Buffer.from(base64Audio, 'base64');
+                const mime = (part?.inlineData?.mimeType ?? '').toLowerCase();
+                // Ensure valid RIFF/WAV header if model returned raw L16 PCM
+                const isWav =
+                  rawBuf.length >= 12 &&
+                  rawBuf.subarray(0, 4).toString('ascii') === 'RIFF' &&
+                  rawBuf.subarray(8, 12).toString('ascii') === 'WAVE';
+                let wavBuffer = rawBuf;
+                if (!isWav && (mime.includes('l16') || mime.includes('pcm') || !mime.includes('wav'))) {
+                  const rateMatch = mime.match(/rate=(\d+)/);
+                  const sampleRate = rateMatch ? Number(rateMatch[1]) : 24000;
+                  const header = Buffer.alloc(44);
+                  header.write('RIFF', 0);
+                  header.writeUInt32LE(36 + rawBuf.length, 4);
+                  header.write('WAVE', 8);
+                  header.write('fmt ', 12);
+                  header.writeUInt32LE(16, 16);
+                  header.writeUInt16LE(1, 20); // PCM
+                  header.writeUInt16LE(1, 22); // Mono
+                  header.writeUInt32LE(sampleRate, 24);
+                  header.writeUInt32LE(sampleRate * 2, 28);
+                  header.writeUInt16LE(2, 32);
+                  header.writeUInt16LE(16, 34);
+                  header.write('data', 36);
+                  header.writeUInt32LE(rawBuf.length, 40);
+                  wavBuffer = Buffer.concat([header, rawBuf]);
+                }
+                res.setHeader('Content-Type', 'audio/wav');
+                res.setHeader('Content-Length', String(wavBuffer.length));
+                res.setHeader('X-BhashaBook-TTS-Model', modelName);
+                res.setHeader('Content-Disposition', 'attachment; filename="audiobook-page.wav"');
+                return res.send(wavBuffer);
+              }
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              // Only retry second attempt if first failed due to speechMetadata schema mismatch
+              if (!msg.includes('speechMetadata')) break;
+            }
           }
-        } catch {
-          // Gracefully fall back to free MP3 synthesis below
         }
       }
 
       const mp3Buffer = await synthesizeFreeTtsMp3(clippedText, safeLang);
       res.setHeader('Content-Type', 'audio/mpeg');
       res.setHeader('Content-Length', String(mp3Buffer.length));
+      res.setHeader('X-BhashaBook-TTS-Model', 'free-mp3-fallback');
       res.setHeader('Content-Disposition', 'attachment; filename="audiobook-page.mp3"');
       return res.send(mp3Buffer);
     } catch (err) {
@@ -1723,24 +1816,23 @@ Follow these exact rules:
           if (items.length >= 12) break;
         }
 
-        // Only fall back to reference-only catalog records if user typed a specific query and 0 public IA editions exist
+        // If strict query yielded none, retry broader Open Library search but still require public IA PDF access
         if (items.length === 0 && rawQuery) {
           const fallbackDocs = await fetchOlDocs(false);
           for (const d of fallbackDocs) {
             if (!d.key || !d.title) continue;
             const isPublicIa =
               d.ebook_access === 'public' && Array.isArray(d.ia) && d.ia.length > 0;
-            const iaId = isPublicIa ? d.ia![0] : undefined;
+            if (!isPublicIa) continue;
+            const iaId = d.ia![0];
             const coverUrl = d.cover_i
               ? `https://covers.openlibrary.org/b/id/${d.cover_i}-L.jpg`
-              : iaId
-              ? `https://archive.org/services/img/${encodeURIComponent(iaId)}`
-              : undefined;
+              : `https://archive.org/services/img/${encodeURIComponent(iaId)}`;
 
             items.push({
               id: `ol:${d.key}`,
               source: 'open_library',
-              identifier: iaId || d.key,
+              identifier: iaId,
               title: String(d.title).trim(),
               author:
                 Array.isArray(d.author_name) && d.author_name.length > 0
@@ -1759,15 +1851,12 @@ Follow these exact rules:
                   : undefined,
               subjects: Array.isArray(d.subject) ? d.subject.slice(0, 5) : [],
               coverUrl,
-              pdfUrl: iaId
-                ? `https://archive.org/download/${encodeURIComponent(iaId)}/${encodeURIComponent(iaId)}.pdf`
-                : undefined,
-              readOnlineUrl: iaId
-                ? `https://archive.org/details/${encodeURIComponent(iaId)}`
-                : `https://openlibrary.org${d.key}`,
-              format: iaId ? 'PDF' : 'Read Online',
+              pdfUrl: `https://archive.org/download/${encodeURIComponent(iaId)}/${encodeURIComponent(iaId)}.pdf`,
+              readOnlineUrl: `https://archive.org/details/${encodeURIComponent(iaId)}`,
+              format: 'PDF',
               isbn: Array.isArray(d.isbn) ? d.isbn[0] : undefined,
             });
+            if (items.length >= 12) break;
           }
         }
 
@@ -1815,6 +1904,7 @@ Follow these exact rules:
             formats['text/plain; charset=us-ascii'] ||
             formats['text/plain'] ||
             undefined;
+          if (!textUrl) continue;
           const epubUrl = formats['application/epub+zip'] || undefined;
           const htmlUrl =
             formats['text/html'] ||
@@ -1965,7 +2055,10 @@ Follow these exact rules:
         }
       }
 
-      let combined = Array.from(mergedMap.values());
+      // Only surface books that support ALL in-app facilities: Read, Translate, Listen, Bookmark & Download PDF
+      let combined = Array.from(mergedMap.values()).filter((b) =>
+        Boolean(b.pdfUrl || b.textUrl)
+      );
 
       // Apply format filter
       if (format === 'pdf') {
@@ -1973,7 +2066,7 @@ Follow these exact rules:
       } else if (format === 'text') {
         combined = combined.filter((b) => Boolean(b.textUrl || b.epubUrl));
       } else if (format === 'online') {
-        combined = combined.filter((b) => Boolean(b.pdfUrl || b.textUrl || b.readOnlineUrl));
+        combined = combined.filter((b) => Boolean(b.pdfUrl || b.textUrl));
       }
 
       // Sort merged catalog
@@ -1984,23 +2077,21 @@ Follow these exact rules:
         if (sort === 'latest') {
           return (b.year ?? 0) - (a.year ?? 0) || (b.downloads ?? 0) - (a.downloads ?? 0);
         }
-        // Prioritize immediately readable PDF/Text items alongside download volume
-        const aReadable = a.pdfUrl || a.textUrl ? 1 : 0;
-        const bReadable = b.pdfUrl || b.textUrl ? 1 : 0;
-        if (aReadable !== bReadable) return bReadable - aReadable;
         return (b.downloads ?? 0) - (a.downloads ?? 0);
       });
+
+      const slice = combined.slice(0, 30);
 
       return res.json({
         query: rawQuery,
         page: pageNum,
         total: combined.length,
         sources: {
-          internetArchive: iaResults.length,
-          openLibrary: olResults.length,
-          gutenberg: gutenResults.length,
+          internetArchive: slice.filter((b) => b.source === 'internet_archive').length,
+          openLibrary: slice.filter((b) => b.source === 'open_library').length,
+          gutenberg: slice.filter((b) => b.source === 'gutenberg').length,
         },
-        books: combined.slice(0, 30),
+        books: slice,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Book search failed.';

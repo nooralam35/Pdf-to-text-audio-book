@@ -78,16 +78,56 @@ export async function getBook(bookId: string): Promise<StoredBook | undefined> {
 export async function listBooks(): Promise<StoredBook[]> {
   const db = await getDb();
   const all = await db.getAllFromIndex('books', 'by-added');
-  return all.reverse();
+  return all.sort(
+    (a, b) => (b.lastOpenedAt ?? b.addedAt) - (a.lastOpenedAt ?? a.addedAt)
+  );
+}
+
+export interface BookProgressPatch {
+  lastPage?: number;
+  lastOpenedAt?: number;
+  lastAudioPage?: number;
+  lastSentenceIndex?: number;
+  lastNarrationSource?: 'translated' | 'original';
+  lastTargetLang?: LanguageCode;
+  isBookmarked?: boolean;
+  bookmarkedAt?: number;
+}
+
+export async function updateBookProgress(
+  bookId: string,
+  patch: BookProgressPatch
+): Promise<StoredBook | undefined> {
+  const db = await getDb();
+  const existing = await db.get('books', bookId);
+  if (!existing) return undefined;
+  const updated: StoredBook = {
+    ...existing,
+    ...patch,
+  };
+  await db.put('books', updated);
+  return updated;
 }
 
 export async function updateBookLastPage(bookId: string, lastPage: number): Promise<void> {
+  await updateBookProgress(bookId, { lastPage, lastOpenedAt: Date.now() });
+}
+
+export async function toggleBookSavedBookmark(
+  bookId: string
+): Promise<StoredBook | undefined> {
   const db = await getDb();
   const existing = await db.get('books', bookId);
-  if (existing) {
-    existing.lastPage = lastPage;
-    await db.put('books', existing);
-  }
+  if (!existing) return undefined;
+  const nextBookmarked = !existing.isBookmarked;
+  const updated: StoredBook = {
+    ...existing,
+    isBookmarked: nextBookmarked,
+    bookmarkedAt: nextBookmarked ? Date.now() : undefined,
+    lastOpenedAt: Date.now(),
+  };
+  await db.put('books', updated);
+  return updated;
 }
 
 export async function toggleBookBookmark(

@@ -1,5 +1,6 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Bookmark,
   BookOpen,
   ChevronLeft,
   ChevronRight,
@@ -21,12 +22,14 @@ import type {
   BookSortBy,
   DiscoveredBook,
   LanguageCode,
+  StoredBook,
 } from '../types';
 
-export type DiscoverBookAction = 'read' | 'translate' | 'listen' | 'download';
+export type DiscoverBookAction = 'read' | 'translate' | 'listen' | 'download' | 'bookmark';
 
 interface DiscoverViewProps {
   targetLang: LanguageCode;
+  savedBooks?: StoredBook[];
   onActionBook: (book: DiscoveredBook, action: DiscoverBookAction) => Promise<void>;
   loadingBookAction: { bookId: string; action: DiscoverBookAction; status: string } | null;
   onUploadPdf: (file: File) => void;
@@ -129,6 +132,7 @@ const BookCoverFrame: React.FC<{
 
 export const DiscoverView: React.FC<DiscoverViewProps> = ({
   targetLang,
+  savedBooks = [],
   onActionBook,
   loadingBookAction,
   onUploadPdf,
@@ -160,6 +164,28 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
   const abortRef = useRef<AbortController | null>(null);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
   const targetLangOption = getLanguageOption(targetLang);
+
+  const savedBooksLookup = useMemo(() => {
+    const byDiscoveredId = new Map<string, StoredBook>();
+    const byStoredId = new Map<string, StoredBook>();
+    for (const b of savedBooks) {
+      if (b.discoveredBookId) byDiscoveredId.set(b.discoveredBookId, b);
+      byStoredId.set(b.id, b);
+    }
+    return { byDiscoveredId, byStoredId };
+  }, [savedBooks]);
+
+  const findSavedBook = useCallback(
+    (book: DiscoveredBook): StoredBook | undefined => {
+      const direct = savedBooksLookup.byDiscoveredId.get(book.id);
+      if (direct) return direct;
+      const legacyStoredId = `discover-${book.source}-${book.identifier
+        .replace(/[^a-zA-Z0-9_-]/g, '')
+        .slice(0, 40)}`;
+      return savedBooksLookup.byStoredId.get(legacyStoredId);
+    },
+    [savedBooksLookup]
+  );
 
   const runSearch = useCallback(
     async (opts: {
@@ -438,7 +464,6 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
                   { id: 'all', label: 'All Formats' },
                   { id: 'pdf', label: 'PDF' },
                   { id: 'text', label: 'EPUB / Text' },
-                  { id: 'online', label: 'Read Online' },
                 ] as const
               ).map((fmt) => (
                 <button
@@ -565,13 +590,24 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
             {books.map((book) => {
               const downloadsLabel = formatCompactCount(book.downloads);
-              const canImportInApp = Boolean(book.pdfUrl || book.textUrl);
               const isThisBookLoading = loadingBookAction?.bookId === book.id;
+              const savedMatch = findSavedBook(book);
+              const isSavedBookmark = Boolean(savedMatch?.isBookmarked);
+              const hasReadingResume = Boolean(savedMatch && (savedMatch.lastPage ?? 1) > 1);
+              const hasAudioResume = Boolean(
+                savedMatch &&
+                  (savedMatch.lastAudioPage !== undefined ||
+                    savedMatch.lastSentenceIndex !== undefined)
+              );
 
               return (
                 <article
                   key={book.id}
-                  className="flex flex-col rounded-lg border border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-white sepia:bg-[#FBF6E9] dark:bg-[#191816] p-4 transition-colors hover:border-stone-300 dark:hover:border-stone-700"
+                  className={`flex flex-col rounded-lg border bg-white sepia:bg-[#FBF6E9] dark:bg-[#191816] p-4 transition-colors ${
+                    isSavedBookmark
+                      ? 'border-amber-700/55 dark:border-amber-500/55'
+                      : 'border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 hover:border-stone-300 dark:hover:border-stone-700'
+                  }`}
                 >
                   {/* Top Split: Cover + Editorial Metadata */}
                   <div className="flex gap-4 flex-1">
@@ -585,9 +621,40 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
                     </button>
 
                     <div className="min-w-0 flex-1 flex flex-col">
-                      <p className="text-[11px] text-stone-500 dark:text-stone-400 truncate">
-                        {sourceDisplayName(book.source)} · {book.format}
-                      </p>
+                      <div className="flex items-start justify-between gap-2">
+                        <p className="text-[11px] text-stone-500 dark:text-stone-400 truncate pt-0.5">
+                          {sourceDisplayName(book.source)} · {book.format}
+                        </p>
+
+                        <button
+                          type="button"
+                          disabled={isBusyGlobal}
+                          onClick={() => onActionBook(book, 'bookmark')}
+                          title={
+                            isSavedBookmark
+                              ? 'Bookmarked in My Library — click to remove bookmark'
+                              : 'Bookmark & save this book to My Library'
+                          }
+                          aria-label={
+                            isSavedBookmark
+                              ? `Remove ${book.title} bookmark`
+                              : `Bookmark ${book.title} to My Library`
+                          }
+                          className={`shrink-0 h-7 w-7 inline-flex items-center justify-center rounded border transition-colors cursor-pointer disabled:opacity-50 ${
+                            isSavedBookmark
+                              ? 'border-amber-700 bg-amber-700 text-white'
+                              : 'border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-700 text-stone-500 dark:text-stone-400 hover:text-amber-800 dark:hover:text-amber-400 hover:border-amber-700/50'
+                          }`}
+                        >
+                          {isThisBookLoading && loadingBookAction?.action === 'bookmark' ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <Bookmark
+                              className={`w-3.5 h-3.5 ${isSavedBookmark ? 'fill-current' : ''}`}
+                            />
+                          )}
+                        </button>
+                      </div>
 
                       <button
                         type="button"
@@ -603,7 +670,17 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
                         {book.author}
                       </p>
 
-                      <div className="mt-auto pt-3 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] text-stone-500 dark:text-stone-400 font-mono-num">
+                      {savedMatch && (
+                        <p className="mt-1.5 text-[11px] font-mono-num text-amber-800 dark:text-amber-400 truncate">
+                          {isSavedBookmark ? 'Bookmarked' : 'In Library'}
+                          {' · '}p.{savedMatch.lastPage || 1}/{savedMatch.numPages}
+                          {hasAudioResume
+                            ? ` · Audio p.${savedMatch.lastAudioPage ?? savedMatch.lastPage ?? 1}`
+                            : ''}
+                        </p>
+                      )}
+
+                      <div className="mt-auto pt-2.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] text-stone-500 dark:text-stone-400 font-mono-num">
                         <span>{book.language}</span>
                         {book.pageCount && (
                           <>
@@ -636,92 +713,78 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
                     </div>
                   </div>
 
-                  {/* 4-in-1 Quick-Action Buttons */}
-                  {canImportInApp ? (
-                    <div className="mt-4 pt-3.5 border-t border-stone-200/80 sepia:border-[#DFD4BC] dark:border-stone-800/80 grid grid-cols-2 gap-2">
-                      <button
-                        type="button"
-                        disabled={isBusyGlobal}
-                        onClick={() => onActionBook(book, 'read')}
-                        title="Open directly in BhashaBook Reader"
-                        className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 bg-stone-900 text-stone-50 hover:bg-stone-800 dark:bg-stone-100 dark:text-stone-950 dark:hover:bg-stone-200 disabled:opacity-50 transition-colors cursor-pointer whitespace-nowrap"
-                      >
-                        {isThisBookLoading && loadingBookAction?.action === 'read' ? (
-                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        ) : (
-                          <BookOpen className="w-3.5 h-3.5" />
-                        )}
-                        <span>Read Online</span>
-                      </button>
-
-                      <button
-                        type="button"
-                        disabled={isBusyGlobal}
-                        onClick={() => onActionBook(book, 'translate')}
-                        title={`Load & translate into ${targetLangOption.name}`}
-                        className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 bg-amber-700 hover:bg-amber-800 text-white disabled:opacity-50 transition-colors cursor-pointer whitespace-nowrap"
-                      >
-                        {isThisBookLoading && loadingBookAction?.action === 'translate' ? (
-                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        ) : (
-                          <Languages className="w-3.5 h-3.5" />
-                        )}
-                        <span>Translate &amp; Read</span>
-                      </button>
-
-                      <button
-                        type="button"
-                        disabled={isBusyGlobal}
-                        onClick={() => onActionBook(book, 'listen')}
-                        title="Open & start synchronized audiobook narration"
-                        className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 border border-stone-300 sepia:border-[#D4C7AA] dark:border-stone-700 text-stone-800 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 disabled:opacity-50 transition-colors cursor-pointer whitespace-nowrap"
-                      >
-                        {isThisBookLoading && loadingBookAction?.action === 'listen' ? (
-                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        ) : (
-                          <Headphones className="w-3.5 h-3.5" />
-                        )}
-                        <span>Listen Now</span>
-                      </button>
-
-                      <button
-                        type="button"
-                        disabled={isBusyGlobal}
-                        onClick={() => onActionBook(book, 'download')}
-                        title="Download PDF to your device"
-                        className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 border border-stone-300 sepia:border-[#D4C7AA] dark:border-stone-700 text-stone-800 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 disabled:opacity-50 transition-colors cursor-pointer whitespace-nowrap"
-                      >
-                        {isThisBookLoading && loadingBookAction?.action === 'download' ? (
-                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        ) : (
-                          <Download className="w-3.5 h-3.5" />
-                        )}
-                        <span>Download PDF</span>
-                      </button>
-                    </div>
-                  ) : (
-                    <div className="mt-4 pt-3.5 border-t border-stone-200/80 sepia:border-[#DFD4BC] dark:border-stone-800/80 grid grid-cols-2 gap-2">
-                      {safeExternalUrl(book.readOnlineUrl) && (
-                        <a
-                          href={safeExternalUrl(book.readOnlineUrl)}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 bg-stone-900 text-stone-50 hover:bg-stone-800 dark:bg-stone-100 dark:text-stone-950 dark:hover:bg-stone-200 transition-colors whitespace-nowrap"
-                        >
-                          <ExternalLink className="w-3.5 h-3.5" />
-                          <span>Read on Source</span>
-                        </a>
-                      )}
-                      <button
-                        type="button"
-                        onClick={() => setSelectedBook(book)}
-                        className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 border border-stone-300 sepia:border-[#D4C7AA] dark:border-stone-700 text-stone-800 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 transition-colors cursor-pointer whitespace-nowrap"
-                      >
+                  {/* All-Facilities 4-in-1 Action Buttons (Guaranteed on Every Book Shown) */}
+                  <div className="mt-4 pt-3.5 border-t border-stone-200/80 sepia:border-[#DFD4BC] dark:border-stone-800/80 grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      disabled={isBusyGlobal}
+                      onClick={() => onActionBook(book, 'read')}
+                      title={
+                        hasReadingResume
+                          ? `Continue reading from Page ${savedMatch?.lastPage}`
+                          : 'Open directly in BhashaBook Reader & save to Library'
+                      }
+                      className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 bg-stone-900 text-stone-50 hover:bg-stone-800 dark:bg-stone-100 dark:text-stone-950 dark:hover:bg-stone-200 disabled:opacity-50 transition-colors cursor-pointer whitespace-nowrap"
+                    >
+                      {isThisBookLoading && loadingBookAction?.action === 'read' ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
                         <BookOpen className="w-3.5 h-3.5" />
-                        <span>Book Details</span>
-                      </button>
-                    </div>
-                  )}
+                      )}
+                      <span>
+                        {hasReadingResume ? `Continue p.${savedMatch?.lastPage}` : 'Read Online'}
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={isBusyGlobal}
+                      onClick={() => onActionBook(book, 'translate')}
+                      title={`Load & translate into ${targetLangOption.name}`}
+                      className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 bg-amber-700 hover:bg-amber-800 text-white disabled:opacity-50 transition-colors cursor-pointer whitespace-nowrap"
+                    >
+                      {isThisBookLoading && loadingBookAction?.action === 'translate' ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <Languages className="w-3.5 h-3.5" />
+                      )}
+                      <span>Translate &amp; Read</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={isBusyGlobal}
+                      onClick={() => onActionBook(book, 'listen')}
+                      title={
+                        hasAudioResume
+                          ? `Resume audio from Page ${savedMatch?.lastAudioPage ?? savedMatch?.lastPage ?? 1}, Line ${(savedMatch?.lastSentenceIndex ?? 0) + 1}`
+                          : 'Open & start synchronized audiobook narration'
+                      }
+                      className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 border border-stone-300 sepia:border-[#D4C7AA] dark:border-stone-700 text-stone-800 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 disabled:opacity-50 transition-colors cursor-pointer whitespace-nowrap"
+                    >
+                      {isThisBookLoading && loadingBookAction?.action === 'listen' ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <Headphones className="w-3.5 h-3.5" />
+                      )}
+                      <span>{hasAudioResume ? 'Resume Audio' : 'Listen Now'}</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={isBusyGlobal}
+                      onClick={() => onActionBook(book, 'download')}
+                      title="Download PDF to your device & keep a record in My Library"
+                      className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 border border-stone-300 sepia:border-[#D4C7AA] dark:border-stone-700 text-stone-800 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 disabled:opacity-50 transition-colors cursor-pointer whitespace-nowrap"
+                    >
+                      {isThisBookLoading && loadingBookAction?.action === 'download' ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <Download className="w-3.5 h-3.5" />
+                      )}
+                      <span>Download PDF</span>
+                    </button>
+                  </div>
                 </article>
               );
             })}
@@ -865,10 +928,12 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
                 )}
               </div>
 
-              {/* Modal 4-in-1 Actions */}
-              <div className="pt-4 border-t border-stone-200 dark:border-stone-800 flex flex-wrap items-center gap-2.5">
-                {Boolean(selectedBook.pdfUrl || selectedBook.textUrl) ? (
-                  <>
+              {/* Modal All-Facilities Actions */}
+              {(() => {
+                const modalSaved = findSavedBook(selectedBook);
+                const modalBookmarked = Boolean(modalSaved?.isBookmarked);
+                return (
+                  <div className="pt-4 border-t border-stone-200 dark:border-stone-800 flex flex-wrap items-center gap-2.5">
                     <button
                       type="button"
                       disabled={isBusyGlobal}
@@ -877,10 +942,14 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
                         setSelectedBook(null);
                         await onActionBook(target, 'read');
                       }}
-                      className="h-9 px-4 rounded-md text-xs font-medium inline-flex items-center gap-1.5 bg-stone-900 text-white hover:bg-stone-800 dark:bg-stone-100 dark:text-stone-950 cursor-pointer"
+                      className="h-9 px-4 rounded-md text-xs font-medium inline-flex items-center gap-1.5 bg-stone-900 text-white hover:bg-stone-800 dark:bg-stone-100 dark:text-stone-950 cursor-pointer whitespace-nowrap"
                     >
                       <BookOpen className="w-3.5 h-3.5" />
-                      <span>Read Online</span>
+                      <span>
+                        {modalSaved && (modalSaved.lastPage ?? 1) > 1
+                          ? `Continue p.${modalSaved.lastPage}`
+                          : 'Read Online'}
+                      </span>
                     </button>
 
                     <button
@@ -891,7 +960,7 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
                         setSelectedBook(null);
                         await onActionBook(target, 'translate');
                       }}
-                      className="h-9 px-4 rounded-md text-xs font-medium inline-flex items-center gap-1.5 bg-amber-700 hover:bg-amber-800 text-white cursor-pointer"
+                      className="h-9 px-4 rounded-md text-xs font-medium inline-flex items-center gap-1.5 bg-amber-700 hover:bg-amber-800 text-white cursor-pointer whitespace-nowrap"
                     >
                       <Languages className="w-3.5 h-3.5" />
                       <span>Translate to {targetLangOption.name}</span>
@@ -905,10 +974,14 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
                         setSelectedBook(null);
                         await onActionBook(target, 'listen');
                       }}
-                      className="h-9 px-4 rounded-md text-xs font-medium inline-flex items-center gap-1.5 border border-stone-300 dark:border-stone-700 text-stone-800 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer"
+                      className="h-9 px-4 rounded-md text-xs font-medium inline-flex items-center gap-1.5 border border-stone-300 dark:border-stone-700 text-stone-800 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer whitespace-nowrap"
                     >
                       <Headphones className="w-3.5 h-3.5" />
-                      <span>Listen Now</span>
+                      <span>
+                        {modalSaved?.lastSentenceIndex !== undefined
+                          ? 'Resume Audio'
+                          : 'Listen Now'}
+                      </span>
                     </button>
 
                     <button
@@ -919,30 +992,45 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
                         setSelectedBook(null);
                         await onActionBook(target, 'download');
                       }}
-                      className="h-9 px-4 rounded-md text-xs font-medium inline-flex items-center gap-1.5 border border-stone-300 dark:border-stone-700 text-stone-800 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer"
+                      className="h-9 px-4 rounded-md text-xs font-medium inline-flex items-center gap-1.5 border border-stone-300 dark:border-stone-700 text-stone-800 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer whitespace-nowrap"
                     >
                       <Download className="w-3.5 h-3.5" />
                       <span>Download PDF</span>
                     </button>
-                  </>
-                ) : (
-                  <p className="text-xs text-stone-500 dark:text-stone-400">
-                    This catalog entry does not include a direct open-access PDF file.
-                  </p>
-                )}
 
-                {safeExternalUrl(selectedBook.readOnlineUrl) && (
-                  <a
-                    href={safeExternalUrl(selectedBook.readOnlineUrl)}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="ml-auto inline-flex items-center gap-1 text-xs text-stone-500 hover:text-amber-800 dark:text-stone-400 dark:hover:text-amber-400 hover:underline"
-                  >
-                    <span>Source Record</span>
-                    <ExternalLink className="w-3.5 h-3.5" />
-                  </a>
-                )}
-              </div>
+                    <button
+                      type="button"
+                      disabled={isBusyGlobal}
+                      onClick={async () => {
+                        const target = selectedBook;
+                        await onActionBook(target, 'bookmark');
+                      }}
+                      className={`h-9 px-3.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5 border transition-colors cursor-pointer whitespace-nowrap ${
+                        modalBookmarked
+                          ? 'border-amber-700 bg-amber-700 text-white'
+                          : 'border-stone-300 dark:border-stone-700 text-stone-800 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800'
+                      }`}
+                    >
+                      <Bookmark
+                        className={`w-3.5 h-3.5 ${modalBookmarked ? 'fill-current' : ''}`}
+                      />
+                      <span>{modalBookmarked ? 'Bookmarked' : 'Bookmark'}</span>
+                    </button>
+
+                    {safeExternalUrl(selectedBook.readOnlineUrl) && (
+                      <a
+                        href={safeExternalUrl(selectedBook.readOnlineUrl)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="ml-auto inline-flex items-center gap-1 text-xs text-stone-500 hover:text-amber-800 dark:text-stone-400 dark:hover:text-amber-400 hover:underline whitespace-nowrap"
+                      >
+                        <span>Source Record</span>
+                        <ExternalLink className="w-3.5 h-3.5" />
+                      </a>
+                    )}
+                  </div>
+                );
+              })()}
             </div>
           </div>
         </div>
