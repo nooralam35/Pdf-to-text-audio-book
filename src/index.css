@@ -44,7 +44,8 @@
 
 .lang-hi,
 .lang-sa,
-.lang-mr {
+.lang-mr,
+.lang-ne {
   font-family: var(--font-indic-hi);
   line-height: 1.9;
 }
@@ -74,6 +75,16 @@
   line-height: 1.9;
 }
 
+.lang-kn,
+.lang-ml,
+.lang-or,
+.lang-th,
+.lang-zh,
+.lang-ja,
+.lang-ko {
+  line-height: 1.9;
+}
+
 .lang-ur {
   font-family: var(--font-indic-ur);
   line-height: 2.25;
@@ -81,9 +92,16 @@
   text-align: right;
 }
 
-.lang-ar {
+.lang-ar,
+.lang-fa {
   font-family: var(--font-indic-ar);
   line-height: 2.05;
+  direction: rtl;
+  text-align: right;
+}
+
+.lang-he {
+  line-height: 1.9;
   direction: rtl;
   text-align: right;
 }

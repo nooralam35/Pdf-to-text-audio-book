@@ -3,7 +3,9 @@ import {
   Bookmark,
   BookMarked,
   Check,
+  Clock,
   FileText,
+  Gauge,
   Languages,
   Loader2,
   Pause,
@@ -12,6 +14,14 @@ import {
   Volume2,
   X,
 } from 'lucide-react';
+import {
+  DEFAULT_BASELINE_WPM,
+  DEFAULT_WORDS_PER_PAGE,
+  estimateChapterFinishTime,
+  formatReadingDuration,
+  type ChapterReadingEstimate,
+  type ReadingSpeedSnapshot,
+} from '../lib/readingSpeed';
 import type { ChapterItem } from '../types';
 
 interface ChapterSidebarProps {
@@ -30,6 +40,10 @@ interface ChapterSidebarProps {
   summarizingChapterId?: string | null;
   isBatchTranslating: boolean;
   onCloseMobile?: () => void;
+  readingSpeed?: ReadingSpeedSnapshot;
+  chapterReadingEstimate?: ChapterReadingEstimate | null;
+  pageWordCounts?: Record<number, number>;
+  fallbackWordsPerPage?: number;
 }
 
 export const ChapterSidebar: React.FC<ChapterSidebarProps> = ({
@@ -48,6 +62,10 @@ export const ChapterSidebar: React.FC<ChapterSidebarProps> = ({
   summarizingChapterId = null,
   isBatchTranslating,
   onCloseMobile,
+  readingSpeed,
+  chapterReadingEstimate = null,
+  pageWordCounts = {},
+  fallbackWordsPerPage = DEFAULT_WORDS_PER_PAGE,
 }) => {
   const [query, setQuery] = useState('');
   const [sidebarView, setSidebarView] = useState<'chapters' | 'bookmarks'>('chapters');
@@ -92,6 +110,31 @@ export const ChapterSidebar: React.FC<ChapterSidebarProps> = ({
             <p className="mt-0.5 text-xs text-stone-500 dark:text-stone-400 font-mono-num">
               {chapters.length} sections · {totalTranslated}/{numPages} translated
             </p>
+            {readingSpeed && (
+              <div
+                className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-stone-600 sepia:text-[#5B4B3A] dark:text-stone-400"
+                title={
+                  readingSpeed.isMeasured
+                    ? `Measured from ${readingSpeed.sampleCount} recent page turns`
+                    : 'Estimated baseline pace — updates automatically as you turn pages'
+                }
+              >
+                <span className="inline-flex items-center gap-1 font-mono-num font-medium text-stone-700 dark:text-stone-200">
+                  <Gauge className="w-3 h-3 text-amber-700 dark:text-amber-500 shrink-0" />
+                  {readingSpeed.isMeasured ? '' : '~'}
+                  {readingSpeed.averageWpm} WPM
+                </span>
+                {chapterReadingEstimate && (
+                  <>
+                    <span className="text-stone-300 dark:text-stone-600">·</span>
+                    <span className="inline-flex items-center gap-1 font-mono-num text-amber-800 dark:text-amber-400 font-medium">
+                      <Clock className="w-3 h-3 shrink-0" />
+                      ~{formatReadingDuration(chapterReadingEstimate.remainingMinutes)} left
+                    </span>
+                  </>
+                )}
+              </div>
+            )}
           </div>
           {onCloseMobile && (
             <button
@@ -208,6 +251,17 @@ export const ChapterSidebar: React.FC<ChapterSidebarProps> = ({
               if (translatedPageNumbers.has(p)) doneCount++;
             }
             const isComplete = doneCount === pageCount;
+            const effectiveWpm = readingSpeed?.averageWpm ?? DEFAULT_BASELINE_WPM;
+            const chapterEst =
+              isActive && chapterReadingEstimate && chapterReadingEstimate.chapterId === ch.id
+                ? chapterReadingEstimate
+                : estimateChapterFinishTime({
+                    chapter: ch,
+                    currentPage: ch.startPage,
+                    wpm: effectiveWpm,
+                    knownPageWordCounts: pageWordCounts,
+                    fallbackWordsPerPage,
+                  });
 
             return (
               <div
@@ -256,6 +310,28 @@ export const ChapterSidebar: React.FC<ChapterSidebarProps> = ({
                           `${doneCount}/${pageCount} done`
                         )}
                       </span>
+                      {chapterEst && (
+                        <>
+                          <span>·</span>
+                          <span
+                            className={
+                              isActive
+                                ? 'inline-flex items-center gap-0.5 text-amber-800 dark:text-amber-400 font-medium'
+                                : 'inline-flex items-center gap-0.5 text-stone-500 dark:text-stone-400'
+                            }
+                            title={
+                              isActive
+                                ? `~${formatReadingDuration(chapterEst.remainingMinutes)} remaining in this chapter at ${effectiveWpm} WPM`
+                                : `Estimated ~${formatReadingDuration(chapterEst.totalMinutes)} to read this chapter at ${effectiveWpm} WPM`
+                            }
+                          >
+                            <Clock className="w-2.5 h-2.5 shrink-0" />
+                            {isActive
+                              ? `~${formatReadingDuration(chapterEst.remainingMinutes)} left`
+                              : `~${formatReadingDuration(chapterEst.totalMinutes)}`}
+                          </span>
+                        </>
+                      )}
                       {isThisChapterPlaying && (
                         <>
                           <span>·</span>

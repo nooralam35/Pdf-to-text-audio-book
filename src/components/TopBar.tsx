@@ -1,33 +1,14 @@
 import React, { useRef } from 'react';
-import {
-  BookOpen,
-  CheckCircle2,
-  Clock,
-  CloudOff,
-  CloudUpload,
-  RefreshCw,
-  Upload,
-} from 'lucide-react';
-import type { ServiceWorkerStatus } from '../lib/offlineCache';
+import { BookOpen, Upload } from 'lucide-react';
 import { openDevDebugPanel } from '../lib/devErrorLog';
 
 export type ActiveTab = 'discover' | 'reader' | 'library' | 'export';
-
-export interface LibrarySyncStatusInfo {
-  swStatus: ServiceWorkerStatus;
-  isOnline: boolean;
-  totalBooks: number;
-  cachedBooks: number;
-  isSyncing: boolean;
-  onSyncAction: () => void;
-}
 
 interface TopBarProps {
   activeTab: ActiveTab;
   onSelectTab: (tab: ActiveTab) => void;
   onUploadPdf: (file: File) => void;
   isUploading?: boolean;
-  librarySync?: LibrarySyncStatusInfo;
 }
 
 export const TopBar: React.FC<TopBarProps> = ({
@@ -35,7 +16,6 @@ export const TopBar: React.FC<TopBarProps> = ({
   onSelectTab,
   onUploadPdf,
   isUploading = false,
-  librarySync,
 }) => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const devTapStateRef = useRef<{ count: number; lastTapAt: number }>({
@@ -92,86 +72,6 @@ export const TopBar: React.FC<TopBarProps> = ({
     { id: 'export', label: 'Export PDF' },
   ];
 
-  // Derive clear, accessible library sync state from Service Worker & offline cache status
-  const syncVisual = (() => {
-    if (!librarySync) return null;
-    const { swStatus, isOnline, totalBooks, cachedBooks, isSyncing } = librarySync;
-    const pendingBooks = Math.max(0, totalBooks - cachedBooks);
-
-    if (isSyncing) {
-      return {
-        shortLabel: 'Syncing…',
-        fullLabel: 'Syncing Library…',
-        tooltip: 'Caching library books and reader assets via Service Worker for offline access.',
-        toneClass:
-          'border-amber-300/80 sepia:border-[#C9B387] dark:border-amber-700/70 bg-amber-50/80 sepia:bg-[#EDE1C5] dark:bg-amber-950/30 text-amber-900 sepia:text-[#6B3A10] dark:text-amber-300',
-        Icon: RefreshCw,
-        spin: true,
-      };
-    }
-
-    if (swStatus === 'registering') {
-      return {
-        shortLabel: 'Pending',
-        fullLabel: 'Sync Pending',
-        tooltip: 'Offline Service Worker is initializing. Library sync will verify shortly.',
-        toneClass:
-          'border-amber-300/80 sepia:border-[#C9B387] dark:border-amber-700/70 bg-amber-50/70 sepia:bg-[#EDE1C5] dark:bg-amber-950/25 text-amber-900 sepia:text-[#6B3A10] dark:text-amber-300',
-        Icon: Clock,
-        spin: false,
-      };
-    }
-
-    if (swStatus === 'error' || swStatus === 'unsupported') {
-      return {
-        shortLabel: swStatus === 'error' ? 'Sync Issue' : 'Local Only',
-        fullLabel: swStatus === 'error' ? 'Sync Pending' : 'Browser Storage',
-        tooltip:
-          swStatus === 'error'
-            ? `Service Worker registration encountered an issue (${cachedBooks}/${totalBooks} books stored locally). Click to inspect Library.`
-            : `Service Worker unavailable in this browser (${cachedBooks}/${totalBooks} books stored locally). Click to inspect Library.`,
-        toneClass:
-          'border-stone-300 sepia:border-[#D4C6AA] dark:border-stone-700 bg-stone-100/80 sepia:bg-[#EAE0C8] dark:bg-stone-900 text-stone-700 sepia:text-[#5C4936] dark:text-stone-300',
-        Icon: CloudOff,
-        spin: false,
-      };
-    }
-
-    // swStatus === 'active'
-    if (pendingBooks > 0) {
-      return {
-        shortLabel: `Pending · ${pendingBooks}`,
-        fullLabel: `Sync Pending (${pendingBooks})`,
-        tooltip: isOnline
-          ? `${cachedBooks} of ${totalBooks} library books synced offline. Click to sync the remaining ${pendingBooks} ${
-              pendingBooks === 1 ? 'book' : 'books'
-            }.`
-          : `Offline: ${cachedBooks} of ${totalBooks} library books synced. Reconnect to sync ${pendingBooks} pending ${
-              pendingBooks === 1 ? 'book' : 'books'
-            }.`,
-        toneClass:
-          'border-amber-300 sepia:border-[#C9B387] dark:border-amber-700/80 bg-amber-50/85 sepia:bg-[#EFE2C6] dark:bg-amber-950/35 text-amber-900 sepia:text-[#6B3A10] dark:text-amber-300 hover:bg-amber-100/80 dark:hover:bg-amber-900/40',
-        Icon: CloudUpload,
-        spin: false,
-      };
-    }
-
-    return {
-      shortLabel: 'Synced',
-      fullLabel: totalBooks > 0 ? 'Library Synced' : 'Offline Ready',
-      tooltip:
-        totalBooks > 0
-          ? `Service Worker active — all ${totalBooks} library ${
-              totalBooks === 1 ? 'book is' : 'books are'
-            } synced for offline reading. Click to view Library.`
-          : 'Service Worker active and ready to sync library books for offline reading.',
-      toneClass:
-        'border-emerald-300/80 sepia:border-[#A9C2A8] dark:border-emerald-800/80 bg-emerald-50/75 sepia:bg-[#E7EBD8] dark:bg-emerald-950/30 text-emerald-800 sepia:text-[#2A593C] dark:text-emerald-300 hover:bg-emerald-100/70 dark:hover:bg-emerald-900/35',
-      Icon: CheckCircle2,
-      spin: false,
-    };
-  })();
-
   return (
     <header className="no-print sticky top-0 z-30 w-full border-b border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#FAF9F5]/95 sepia:bg-[#F4ECD8]/95 dark:bg-[#0D0D0C]/95 backdrop-blur-sm">
       <div className="max-w-[1680px] mx-auto px-3 sm:px-6 h-12 md:h-14 flex items-center justify-between gap-2 sm:gap-4">
@@ -215,26 +115,8 @@ export const TopBar: React.FC<TopBarProps> = ({
           })}
         </nav>
 
-        {/* Zone 3: Library Sync Indicator & Primary Upload Action */}
+        {/* Zone 3: Direct Upload Action */}
         <div className="flex items-center gap-1.5 sm:gap-2.5 shrink-0">
-          {syncVisual && librarySync && (
-            <button
-              type="button"
-              onClick={librarySync.onSyncAction}
-              disabled={librarySync.isSyncing}
-              title={syncVisual.tooltip}
-              aria-label={syncVisual.tooltip}
-              aria-live="polite"
-              className={`inline-flex items-center gap-1.5 h-8 md:h-9 px-2 sm:px-2.5 rounded-md border text-[11px] sm:text-xs font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer disabled:cursor-wait ${syncVisual.toneClass}`}
-            >
-              <syncVisual.Icon
-                className={`w-3.5 h-3.5 shrink-0 ${syncVisual.spin ? 'animate-spin' : ''}`}
-              />
-              <span className="sm:hidden tabular-nums">{syncVisual.shortLabel}</span>
-              <span className="hidden sm:inline tabular-nums">{syncVisual.fullLabel}</span>
-            </button>
-          )}
-
           <input
             ref={fileInputRef}
             type="file"

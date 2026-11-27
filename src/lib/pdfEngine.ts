@@ -1080,3 +1080,59 @@ export async function runClientOcrOnPage(
     scriptDirection: isTextPredominantlyRtl(combined) ? 'rtl' : 'ltr',
   };
 }
+
+const plainTextCacheByPdf = new WeakMap<PDFDocumentProxy, Map<number, string>>();
+
+/**
+ * Lightweight, cached plain-text extraction for fast full-book search across
+ * all pages without triggering canvas renders or figure operator-list cropping.
+ */
+export async function extractPagePlainText(
+  pdf: PDFDocumentProxy,
+  pageNumber: number
+): Promise<string> {
+  let docCache = plainTextCacheByPdf.get(pdf);
+  if (!docCache) {
+    docCache = new Map<number, string>();
+    plainTextCacheByPdf.set(pdf, docCache);
+  }
+  const existing = docCache.get(pageNumber);
+  if (existing !== undefined) {
+    return existing;
+  }
+
+  try {
+    const page = await pdf.getPage(pageNumber);
+    const textContent = await page.getTextContent();
+    const parts: string[] = [];
+    let lastY: number | null = null;
+
+    for (const rawItem of textContent.items) {
+      if (!('str' in rawItem)) continue;
+      const str = rawItem.str;
+      if (!str) continue;
+      const y = Array.isArray(rawItem.transform) ? rawItem.transform[5] : null;
+      if (lastY !== null && y !== null && Math.abs(y - lastY) > 4) {
+        parts.push(' ');
+      }
+      parts.push(str);
+      if (rawItem.hasEOL) {
+        parts.push(' ');
+      }
+      if (y !== null) lastY = y;
+    }
+
+    const joined = parts
+      .join('')
+      .replace(/[ \t\r\n]+/g, ' ')
+      .normalize('NFKC')
+      .trim();
+
+    docCache.set(pageNumber, joined);
+    return joined;
+  } catch {
+    docCache.set(pageNumber, '');
+    return '';
+  }
+}
+

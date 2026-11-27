@@ -12,169 +12,68 @@ const __dirname = path.dirname(__filename);
 const PORT = 3000;
 
 const ALLOWED_LANGS: Record<string, { name: string; gtxCode: string; myMemoryCode: string }> = {
+  orig: { name: 'Original Book', gtxCode: 'en', myMemoryCode: 'en' },
   hi: { name: 'Hindi', gtxCode: 'hi', myMemoryCode: 'hi' },
   sa: { name: 'Sanskrit', gtxCode: 'sa', myMemoryCode: 'sa' },
   hinglish: { name: 'Hinglish', gtxCode: 'hi', myMemoryCode: 'hi' },
   mr: { name: 'Marathi', gtxCode: 'mr', myMemoryCode: 'mr' },
   ur: { name: 'Urdu', gtxCode: 'ur', myMemoryCode: 'ur' },
   ar: { name: 'Arabic', gtxCode: 'ar', myMemoryCode: 'ar' },
+  fa: { name: 'Persian', gtxCode: 'fa', myMemoryCode: 'fa' },
   bn: { name: 'Bengali', gtxCode: 'bn', myMemoryCode: 'bn' },
   ta: { name: 'Tamil', gtxCode: 'ta', myMemoryCode: 'ta' },
   te: { name: 'Telugu', gtxCode: 'te', myMemoryCode: 'te' },
   gu: { name: 'Gujarati', gtxCode: 'gu', myMemoryCode: 'gu' },
   pa: { name: 'Punjabi', gtxCode: 'pa', myMemoryCode: 'pa' },
+  kn: { name: 'Kannada', gtxCode: 'kn', myMemoryCode: 'kn' },
+  ml: { name: 'Malayalam', gtxCode: 'ml', myMemoryCode: 'ml' },
+  or: { name: 'Odia', gtxCode: 'or', myMemoryCode: 'or' },
+  ne: { name: 'Nepali', gtxCode: 'ne', myMemoryCode: 'ne' },
+  en: { name: 'English', gtxCode: 'en', myMemoryCode: 'en' },
+  zh: { name: 'Chinese', gtxCode: 'zh-CN', myMemoryCode: 'zh-CN' },
+  ja: { name: 'Japanese', gtxCode: 'ja', myMemoryCode: 'ja' },
+  ko: { name: 'Korean', gtxCode: 'ko', myMemoryCode: 'ko' },
+  ru: { name: 'Russian', gtxCode: 'ru', myMemoryCode: 'ru' },
   es: { name: 'Spanish', gtxCode: 'es', myMemoryCode: 'es' },
   fr: { name: 'French', gtxCode: 'fr', myMemoryCode: 'fr' },
   de: { name: 'German', gtxCode: 'de', myMemoryCode: 'de' },
-  en: { name: 'English', gtxCode: 'en', myMemoryCode: 'en' },
-  orig: { name: 'Original Book', gtxCode: 'en', myMemoryCode: 'en' },
+  pt: { name: 'Portuguese', gtxCode: 'pt', myMemoryCode: 'pt' },
+  it: { name: 'Italian', gtxCode: 'it', myMemoryCode: 'it' },
+  tr: { name: 'Turkish', gtxCode: 'tr', myMemoryCode: 'tr' },
+  id: { name: 'Indonesian', gtxCode: 'id', myMemoryCode: 'id' },
+  th: { name: 'Thai', gtxCode: 'th', myMemoryCode: 'th' },
+  vi: { name: 'Vietnamese', gtxCode: 'vi', myMemoryCode: 'vi' },
+  he: { name: 'Hebrew', gtxCode: 'iw', myMemoryCode: 'he' },
+  uk: { name: 'Ukrainian', gtxCode: 'uk', myMemoryCode: 'uk' },
 };
 
+// Only unambiguous technical acronyms/protocols (never ordinary book words)
 const DEFAULT_TECH_TERMS = [
-  'Open Broadcaster Software',
   'OBS Studio',
-  'OBS Classic',
-  'OBS',
-  'Audio Mixer',
-  'Browser Docks',
-  'Browser Dock',
-  'Custom Browser Docks',
-  'Custom Docks',
-  'Stats Dock',
-  'Studio Mode',
-  'Source Docks',
-  'Source Dock',
-  'Source Record',
-  'Replay Source',
-  'Replay Buffer',
-  'Advanced Scene Switcher',
-  'Multiple RTMP Output',
-  'Audio Monitor',
-  'Virtual Audio Cables',
-  'Virtual Audio Cable',
-  'Filter Hotkeys',
-  'Animated Lower Thirds',
-  'Lower Thirds',
-  'Lower Third',
-  'Background Removal',
-  'OBS Color Monitor',
-  'Color Monitor',
-  'Color Correction',
-  'Image Mask/Blend',
-  'Chroma Key',
-  'Luma Key',
-  'LUT Filter',
-  'LUT',
-  'Move Transitions',
-  'Scene Collections',
-  'Scene Transitions',
-  'Virtual Camera',
-  'Web-Captioner',
-  'Web Captioner',
-  'VDO.ninja',
-  'VDO.Ninja',
-  'PTZOptics',
-  'StreamGeeks',
-  'Elgato StreamDeck',
-  'StreamDeck',
-  'Touch Portal',
-  'VoiceMeeter',
-  'VB-CABLE',
-  'ReaGate',
-  'ReaEQ',
-  'ReaXcomp',
-  'Sidechain/Ducking',
-  'Sidechain Compression',
-  'Noise Suppression',
-  'Noise Gate',
-  'Compressor',
-  'Expander',
-  'Limiter',
-  'RNNoise',
-  'Speex',
   'NVENC',
-  'QuickSync',
-  'AMF',
-  'x264',
   'H.264',
   'H.265',
   'HEVC',
-  'NDI®|HX',
-  'NDI|HX',
-  'NDI®',
-  'NDI',
   'RTMP',
   'RTSP',
-  'SRT',
-  'IPMX',
-  'WebSockets',
   'WebSocket',
   'WebRTC',
-  'Bitrate',
-  'Dynamic Bitrates',
-  'CBR',
-  'VBR',
-  'ABR',
-  'CQP',
-  'Keyframe',
-  'T-Bar',
-  'Multiview',
-  'Hotkeys',
-  'Hotkey',
-  'Plugins',
-  'Plugin',
-  'Scenes',
-  'Scene',
-  'Sources',
-  'Source',
-  'Filters',
-  'Filter',
-  'Vectorscope',
-  'Waveform Monitor',
-  'Histogram',
-  'Tally Light',
-  'Tally Lights',
-  'Sync Offset',
-  'PTZ',
-  'VST',
-  'DAW',
-  'NTP',
-  'DHCP',
-  'VLAN',
-  'LAN',
-  'WAN',
-  'ISP',
-  'NIC',
-  'CDN',
-  'PoE',
   'HDMI',
-  'SDI',
-  'PCIe',
   'USB',
   'GPU',
   'CPU',
   'VRAM',
-  'DRAM',
-  'DDR4',
   'SSD',
-  'HDD',
-  'FPS',
-  '4K',
-  '1080p',
-  '720p',
+  'HTTP',
+  'HTTPS',
+  'JSON',
+  'HTML',
+  'CSS',
+  'SQL',
+  'API',
+  'PDF',
   'GitHub',
   'YouTube',
-  'Twitch',
-  'Facebook',
-  'Zoom',
-  'Microsoft Teams',
-  'Skype',
-  'Task Manager',
-  'Activity Monitor',
-  'QSS',
-  'CSS',
-  'HTML',
-  'API',
 ];
 
 function getGeminiClient(): GoogleGenAI | null {
@@ -516,10 +415,9 @@ async function translateFreeSingle(
   sourceLang?: { gtxCode: string; myMemoryCode: string }
 ): Promise<string> {
   if (!text.trim()) return '';
-  if (gtxCode === 'en' && !sourceLang) return text;
 
   const slGtx = sourceLang?.gtxCode || 'auto';
-  const slMyMemory = sourceLang?.myMemoryCode || 'en';
+  const slMyMemory = sourceLang?.myMemoryCode || 'autodetect';
 
   // Fast Primary A: clients5 mirror (fast ~400-600ms, high throughput)
   if (Date.now() >= clients5CooldownUntil) {
@@ -824,14 +722,16 @@ async function startServer() {
       }
 
       const scriptHintMap: Record<string, string> = {
-        auto: 'Detect the exact language(s) and script(s) on the page automatically (Sanskrit, Hindi, Marathi, Urdu, Arabic, Bengali, Tamil, Telugu, Gujarati, Punjabi, English, European, or mixed scripts).',
-        devanagari: 'The page is likely printed in Devanagari script (Hindi, Sanskrit, or Marathi, possibly with English terms). Preserve every matra, halant/virama, anusvara, visarga, and conjunct accurately.',
-        persoarabic: 'The page is likely printed in Perso-Arabic / Nastaliq / Naskh script (Urdu or Arabic, possibly with English terms). Read right-to-left accurately and preserve exact words and diacritics.',
-        bengali: 'The page is likely printed in Bengali / Bangla script (possibly with English terms).',
-        tamil: 'The page is likely printed in Tamil script (possibly with English terms).',
-        telugu: 'The page is likely printed in Telugu script (possibly with English terms).',
-        gujarati: 'The page is likely printed in Gujarati script (possibly with English terms).',
-        gurmukhi: 'The page is likely printed in Gurmukhi / Punjabi script (possibly with English terms).',
+        auto: 'Detect the exact language(s) and script(s) on the page automatically — supports EVERY language in the world (Sanskrit, Hindi, Marathi, Nepali, Urdu, Arabic, Persian, Bengali, Tamil, Telugu, Gujarati, Punjabi, Kannada, Malayalam, Odia, Chinese, Japanese, Korean, Russian, Ukrainian, Hebrew, Greek, Thai, Vietnamese, Turkish, Spanish, French, German, Portuguese, English, or mixed scripts).',
+        devanagari: 'The page is likely printed in Devanagari script (Hindi, Sanskrit, Marathi, or Nepali, possibly with English terms). Preserve every matra, halant/virama, anusvara, visarga, and conjunct accurately.',
+        persoarabic: 'The page is likely printed in Perso-Arabic / Nastaliq / Naskh script (Urdu, Arabic, or Persian/Farsi). Read right-to-left accurately and preserve exact words and diacritics.',
+        bengali: 'The page is likely printed in Bengali / Bangla script.',
+        tamil: 'The page is likely printed in Tamil script.',
+        telugu: 'The page is likely printed in Telugu script.',
+        gujarati: 'The page is likely printed in Gujarati script.',
+        gurmukhi: 'The page is likely printed in Gurmukhi / Punjabi script.',
+        cjk: 'The page is likely printed in Chinese, Japanese, or Korean script.',
+        cyrillic: 'The page is likely printed in Cyrillic script (Russian, Ukrainian, etc.).',
         latin: 'The page is likely printed in English or European Latin script.',
       };
 
@@ -840,15 +740,15 @@ async function startServer() {
           ? scriptHintMap[scriptMode]
           : scriptHintMap.auto;
 
-      const systemInstruction = `You are a high-precision multilingual book OCR transcriber processing Page ${Number(pageNumber) || 1}.
+      const systemInstruction = `You are a high-precision universal world-language book OCR transcriber processing Page ${Number(pageNumber) || 1}.
 ${scriptGuidance}
 CRITICAL FIDELITY RULES:
-1. EXACT VERBATIM TRANSCRIPTION ("same to same"): Output the EXACT printed text word-for-word, character-for-character in the SAME language and script as printed on the page.
-2. NEVER translate, summarize, paraphrase, modernize, or invent text. If the book is in Sanskrit, output exact Sanskrit in Devanagari. If Urdu, exact Urdu in Nastaliq/Arabic script. If Arabic, exact Arabic. If Marathi or Hindi, exact Marathi or Hindi. If mixed scripts, preserve every script verbatim.
-3. Preserve authentic reading order (top-to-bottom across columns, right-to-left order within Urdu/Arabic lines) and merge broken line-wrap hyphens cleanly into natural book blocks.
-4. Skip tiny edge artifacts, scanner shadows, or page border specks, and skip tiny decorative watermarks, while keeping all headings, chapter titles, shlokas/verses, bullets, callouts, footnotes, and paragraphs.
+1. EXACT VERBATIM TRANSCRIPTION ("same to same"): Output the EXACT printed text word-for-word, character-for-character in the SAME language and script as printed on the page — zero distortion.
+2. NEVER translate, summarize, paraphrase, modernize, or invent text. Whatever world language is printed on the page (Sanskrit, Hindi, Marathi, Urdu, Arabic, Persian, Bengali, Tamil, Telugu, Gujarati, Punjabi, Kannada, Malayalam, Odia, Chinese, Japanese, Korean, Russian, Hebrew, Thai, European, English, etc.), transcribe it verbatim in its native Unicode script.
+3. Preserve authentic reading order (top-to-bottom across columns, right-to-left order within Urdu/Arabic/Persian/Hebrew lines) and merge broken line-wrap hyphens cleanly into natural book blocks.
+4. Skip tiny edge artifacts, scanner shadows, or page border specks while keeping all headings, chapter titles, shlokas/verses, bullets, callouts, footnotes, and paragraphs.
 5. Classify each block's "kind" as one of: "heading", "subheading", "paragraph", "bullet", "callout", "caption", or "table", and provide "yPercent" (0 to 100 vertical position from top of page).
-6. Set "scriptDirection" to "rtl" if the page text is primarily Arabic, Urdu, or another right-to-left script; otherwise "ltr". Set "detectedLang" to the primary language name (e.g. "Sanskrit", "Hindi", "Marathi", "Urdu", "Arabic", "Bengali", "Tamil", "Telugu", "Gujarati", "Punjabi", "English").`;
+6. Set "scriptDirection" to "rtl" if the page text is primarily Arabic, Urdu, Persian, Hebrew, or another right-to-left script; otherwise "ltr". Set "detectedLang" to the primary language name in English (e.g. "Sanskrit", "Hindi", "Marathi", "Urdu", "Arabic", "Persian", "Chinese", "Japanese", "Russian", "English").`;
 
       const response = await ai.models.generateContent({
         model: 'gemini-4-hydrogen',
@@ -1554,7 +1454,22 @@ Follow these strict fidelity rules:
       const ttsAi = getTtsAiClient();
 
       if (ttsAi) {
-        const isIndic = ['hi', 'sa', 'hinglish', 'bn', 'ta', 'te', 'mr', 'ur', 'gu', 'pa'].includes(safeLang);
+        const isIndic = [
+          'hi',
+          'sa',
+          'hinglish',
+          'bn',
+          'ta',
+          'te',
+          'mr',
+          'ur',
+          'gu',
+          'pa',
+          'kn',
+          'ml',
+          'or',
+          'ne',
+        ].includes(safeLang);
         const languageCadence = isIndic
           ? `Speak ${String(languageName).slice(0, 40)} with natural, expressive Indian educator cadence, melodic rise-and-fall intonation, clear pauses at purna viram (।) and commas, and crisp pronunciation of English technical terms.`
           : `Speak ${String(languageName).slice(0, 40)} with natural, expressive educator cadence, melodic rise-and-fall intonation, clear clause pauses, and crisp pronunciation of technical terms.`;
@@ -2021,14 +1936,31 @@ Follow these strict fidelity rules:
     mr: 'mar',
     gu: 'guj',
     pa: 'pan',
+    kn: 'kan',
+    ml: 'mal',
+    or: 'ori',
+    ne: 'nep',
     es: 'spa',
     fr: 'fre',
     de: 'ger',
+    pt: 'por',
+    it: 'ita',
+    ru: 'rus',
+    uk: 'ukr',
     ar: 'ara',
+    fa: 'per',
     ur: 'urd',
+    he: 'heb',
     bn: 'ben',
     ta: 'tam',
     te: 'tel',
+    zh: 'chi',
+    ja: 'jpn',
+    ko: 'kor',
+    tr: 'tur',
+    id: 'ind',
+    th: 'tha',
+    vi: 'vie',
   };
 
   const normalizeLangLabel = (raw: unknown): string => {
@@ -2041,14 +1973,31 @@ Follow these strict fidelity rules:
     if (lower.startsWith('mr') || lower === 'mar') return 'Marathi';
     if (lower.startsWith('gu')) return 'Gujarati';
     if (lower.startsWith('pa') || lower === 'pan') return 'Punjabi';
+    if (lower.startsWith('kn') || lower === 'kan') return 'Kannada';
+    if (lower.startsWith('ml') || lower === 'mal') return 'Malayalam';
+    if (lower.startsWith('or') || lower === 'ori') return 'Odia';
+    if (lower.startsWith('ne') || lower === 'nep') return 'Nepali';
     if (lower.startsWith('es') || lower === 'spa') return 'Spanish';
     if (lower.startsWith('fr') || lower === 'fre') return 'French';
     if (lower.startsWith('de') || lower === 'ger') return 'German';
+    if (lower.startsWith('pt') || lower === 'por') return 'Portuguese';
+    if (lower.startsWith('it') || lower === 'ita') return 'Italian';
+    if (lower.startsWith('ru') || lower === 'rus') return 'Russian';
+    if (lower.startsWith('uk') || lower === 'ukr') return 'Ukrainian';
     if (lower.startsWith('ar') || lower === 'ara') return 'Arabic';
+    if (lower.startsWith('fa') || lower === 'per' || lower === 'fas') return 'Persian';
     if (lower.startsWith('ur') || lower === 'urd') return 'Urdu';
+    if (lower.startsWith('he') || lower === 'heb' || lower === 'iw') return 'Hebrew';
     if (lower.startsWith('bn') || lower === 'ben') return 'Bengali';
     if (lower.startsWith('ta') || lower === 'tam') return 'Tamil';
     if (lower.startsWith('te') || lower === 'tel') return 'Telugu';
+    if (lower.startsWith('zh') || lower === 'chi') return 'Chinese';
+    if (lower.startsWith('ja') || lower === 'jpn') return 'Japanese';
+    if (lower.startsWith('ko') || lower === 'kor') return 'Korean';
+    if (lower.startsWith('tr') || lower === 'tur') return 'Turkish';
+    if (lower.startsWith('id') || lower === 'ind') return 'Indonesian';
+    if (lower.startsWith('th') || lower === 'tha') return 'Thai';
+    if (lower.startsWith('vi') || lower === 'vie') return 'Vietnamese';
     return val.slice(0, 16);
   };
 

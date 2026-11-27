@@ -7,7 +7,6 @@ import type {
   TranslatedPageRecord,
   TranslationEngine,
 } from '../types';
-import { hasNonLatinScript } from './languages';
 import { makeTranslationKey } from './storage';
 
 export interface ServerCapabilities {
@@ -76,11 +75,8 @@ export async function translatePageBlocks(
     };
   }
 
-  const pageCombinedText = parsedPage.blocks.map((b) => b.text).join(' ');
-  const pageIsAsciiLatin = !hasNonLatinScript(pageCombinedText);
-
-  // Original Book ("same to same") mode or already-English page with free engine needs no network hop
-  if (targetLang === 'orig' || (targetLang === 'en' && engine === 'free' && pageIsAsciiLatin)) {
+  // Original Book ("same to same") mode preserves the exact PDF text without modifying a single character
+  if (targetLang === 'orig') {
     const blocks: TranslatedBlock[] = parsedPage.blocks.map((b) => ({
       ...b,
       translatedText: b.text,
@@ -259,10 +255,7 @@ export async function translatePagesBatchFast(
         imageExplanations: [],
         updatedAt: Date.now(),
       });
-    } else if (
-      targetLang === 'orig' ||
-      (targetLang === 'en' && !hasNonLatinScript(parsedPage.blocks.map((b) => b.text).join(' ')))
-    ) {
+    } else if (targetLang === 'orig') {
       results.set(parsedPage.pageNumber, {
         key,
         bookId,
@@ -539,15 +532,38 @@ export function buildAudiobookText(record: TranslatedPageRecord): string {
   return lines.join('\n\n');
 }
 
+export function triggerBlobUrlDownload(url: string, fileName: string): boolean {
+  try {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    a.rel = 'noopener';
+    a.style.position = 'fixed';
+    a.style.left = '-9999px';
+    a.style.top = '0';
+    a.style.opacity = '0';
+    a.style.pointerEvents = 'none';
+    document.body.appendChild(a);
+    a.click();
+    window.setTimeout(() => {
+      try {
+        if (a.parentNode) {
+          a.parentNode.removeChild(a);
+        }
+      } catch {
+        // ignore DOM removal race
+      }
+    }, 1000);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function downloadBlob(blob: Blob, fileName: string): void {
   const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = fileName;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 4000);
+  triggerBlobUrlDownload(url, fileName);
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 export async function lookupDictionaryTerm(

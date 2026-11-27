@@ -2,6 +2,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Bookmark,
   BookOpen,
+  CheckCircle2,
+  Download,
   FileText,
   Languages,
   Loader2,
@@ -19,11 +21,7 @@ import { useOnlineStatus } from './hooks/useOnlineStatus';
 import {
   cacheBookForOffline,
   getCachedBookBufferFromSW,
-  inspectOfflineLibraryCache,
   removeBookFromOfflineCache,
-  subscribeServiceWorkerStatus,
-  warmPdfEngineOfflineAssets,
-  type ServiceWorkerStatus,
 } from './lib/offlineCache';
 import { TopBar, type ActiveTab } from './components/TopBar';
 import { DiscoverView, type DiscoverBookAction } from './components/DiscoverView';
@@ -67,13 +65,13 @@ import {
   runClientOcrOnPage,
   type LoadedPdf,
 } from './lib/pdfEngine';
+import { exportTranslatedPdf } from './lib/pdfExporter';
 import {
   deleteBook,
   getBook,
   getBookPdfData,
   getParsedPage,
   getTranslation,
-  listAllTranslationCountsByBook,
   listBooks,
   listTranslationsForBookLang,
   makeTranslationKey,
@@ -92,11 +90,22 @@ import {
   type DailyReadingGoalSnapshot,
 } from './lib/readingGoal';
 import {
+  countPageWords,
+  countReadableWords,
+  estimateChapterFinishTime,
+  getReadingSpeedSnapshot,
+  recordPageTurnSample,
+  resetReadingSpeedHistory,
+  type ChapterReadingEstimate,
+  type ReadingSpeedSnapshot,
+} from './lib/readingSpeed';
+import {
   checkServerCapabilities,
   downloadBlob,
   splitBlocksIntoSentences,
   translatePageBlocks,
   translatePagesBatchFast,
+  triggerBlobUrlDownload,
 } from './lib/translatorClient';
 import { logDevError } from './lib/devErrorLog';
 import type {
@@ -118,19 +127,14 @@ import type {
 type MobilePane = 'pdf' | 'translated' | 'chapters';
 
 export default function App() {
-  // Connectivity & Service Worker Offline Cache State
+  // Connectivity & Reading Goal State
   const isOnline = useOnlineStatus();
-  const [swStatus, setSwStatus] = useState<ServiceWorkerStatus>('registering');
-  const [cachedBookIds, setCachedBookIds] = useState<Set<string>>(() => new Set());
-  const [storageUsageBytes, setStorageUsageBytes] = useState<number | null>(null);
-  const [allLangTranslationCountsByBook, setAllLangTranslationCountsByBook] = useState<
-    Record<string, number>
-  >({});
-  const [cachingBookId, setCachingBookId] = useState<string | null>(null);
   const [downloadingBookId, setDownloadingBookId] = useState<string | null>(null);
-  const [isSyncingAllOffline, setIsSyncingAllOffline] = useState(false);
   const [dailyReadingGoal, setDailyReadingGoal] = useState<DailyReadingGoalSnapshot>(() =>
     getDailyReadingGoalSnapshot()
+  );
+  const [readingSpeed, setReadingSpeed] = useState<ReadingSpeedSnapshot>(() =>
+    getReadingSpeedSnapshot()
   );
 
   // Navigation & Reading Themes (Light Paper, Sepia, OLED Dark)
@@ -174,15 +178,13 @@ export default function App() {
   const [currentPage, setCurrentPage] = useState(1);
   const [targetLang, setTargetLang] = useState<LanguageCode>('hi');
   const [engine, setEngine] = useState<TranslationEngine>('free');
-  const [preserveTerms, setPreserveTerms] = useState(true);
+  const [preserveTerms, setPreserveTerms] = useState(false);
   const [autoPreloadNext, setAutoPreloadNext] = useState<boolean>(() => {
     if (typeof window === 'undefined') return true;
     const saved = localStorage.getItem('bhashabook-auto-preload-next');
     return saved === null ? true : saved === 'true';
   });
-  const [customTermsInput, setCustomTermsInput] = useState(
-    'OBS, Scene, Source, Plugin, Bitrate, NDI, SRT, Audio Mixer'
-  );
+  const [customTermsInput, setCustomTermsInput] = useState('');
   const [voiceStylePreference, setVoiceStylePreference] = useState<VoiceStylePreference>(() => {
     if (typeof window === 'undefined') return 'teacher';
     const saved = localStorage.getItem('bhashabook-voice-style-preference');
@@ -223,15 +225,138 @@ export default function App() {
       'telugu',
       'gujarati',
       'gurmukhi',
+      'cjk',
+      'cyrillic',
       'latin',
     ];
     return allowed.includes(saved as OcrScriptMode) ? (saved as OcrScriptMode) : 'auto';
   });
   const [pendingOcrReview, setPendingOcrReview] = useState<PendingOcrReview | null>(null);
   const [batchProgress, setBatchProgress] = useState<BatchTranslationProgress | null>(null);
+  const batchInFlightRef = useRef(false);
+  const [autoDownloadAfterFast, setAutoDownloadAfterFast] = useState(true);
+  const autoDownloadAfterFastRef = useRef(true);
+  autoDownloadAfterFastRef.current = autoDownloadAfterFast;
+  const activeTabRef = useRef<ActiveTab>(activeTab);
+  activeTabRef.current = activeTab;
+  const exportPdfOptionsRef = useRef<{
+    includeCover: boolean;
+    includeFigures: boolean;
+    includeOriginalSubheader: boolean;
+  }>({
+    includeCover: true,
+    includeFigures: true,
+    includeOriginalSubheader: false,
+  });
+  const handleSyncExportPdfOptions = useCallback(
+    (opts: {
+      includeCover: boolean;
+      includeFigures: boolean;
+      includeOriginalSubheader: boolean;
+    }) => {
+      exportPdfOptionsRef.current = opts;
+    },
+    []
+  );
+  const [autoPdfBuildProgress, setAutoPdfBuildProgress] = useState<{
+    current: number;
+    total: number;
+    status: string;
+  } | null>(null);
+  const [readyAutoPdf, setReadyAutoPdf] = useState<{
+    url: string;
+    fileName: string;
+    exportedPageCount: number;
+    includeCover: boolean;
+    waitingForFocus?: boolean;
+  } | null>(null);
+  const [autoPdfError, setAutoPdfError] = useState<string | null>(null);
+  const readyAutoPdfUrlRef = useRef<string | null>(null);
+  const pendingVisibilityDownloadRef = useRef<{ url: string; fileName: string } | null>(null);
   const batchCancelRef = useRef(false);
   const batchAbortRef = useRef<AbortController | null>(null);
   const pageTranslateAbortRef = useRef<AbortController | null>(null);
+
+  const setReadyAutoPdfSafe = useCallback(
+    (
+      next: {
+        blob: Blob;
+        fileName: string;
+        exportedPageCount: number;
+        includeCover: boolean;
+        waitingForFocus?: boolean;
+      } | null
+    ): string | null => {
+      pendingVisibilityDownloadRef.current = null;
+      const previousUrl = readyAutoPdfUrlRef.current;
+      readyAutoPdfUrlRef.current = null;
+      if (previousUrl) {
+        // Delay revocation so any active browser download transfer from the previous URL never aborts mid-stream
+        window.setTimeout(() => {
+          try {
+            URL.revokeObjectURL(previousUrl);
+          } catch {
+            // ignore revoke error
+          }
+        }, 60_000);
+      }
+      if (!next) {
+        setReadyAutoPdf(null);
+        return null;
+      }
+      const url = URL.createObjectURL(next.blob);
+      readyAutoPdfUrlRef.current = url;
+      setReadyAutoPdf({
+        url,
+        fileName: next.fileName,
+        exportedPageCount: next.exportedPageCount,
+        includeCover: next.includeCover,
+        waitingForFocus: next.waitingForFocus,
+      });
+      return url;
+    },
+    []
+  );
+
+  // If a converted PDF finished while the browser tab was hidden/backgrounded, trigger the download the instant the user returns
+  useEffect(() => {
+    const flushPendingVisibleDownload = () => {
+      const pending = pendingVisibilityDownloadRef.current;
+      if (!pending) return;
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      pendingVisibilityDownloadRef.current = null;
+      triggerBlobUrlDownload(pending.url, pending.fileName);
+      setReadyAutoPdf((prev) =>
+        prev && prev.url === pending.url ? { ...prev, waitingForFocus: false } : prev
+      );
+    };
+
+    document.addEventListener('visibilitychange', flushPendingVisibleDownload);
+    window.addEventListener('focus', flushPendingVisibleDownload);
+    return () => {
+      document.removeEventListener('visibilitychange', flushPendingVisibleDownload);
+      window.removeEventListener('focus', flushPendingVisibleDownload);
+    };
+  }, []);
+
+  useEffect(() => {
+    setReadyAutoPdfSafe(null);
+    setAutoPdfError(null);
+  }, [activeBook?.id, targetLang, setReadyAutoPdfSafe]);
+
+  useEffect(() => {
+    return () => {
+      pendingVisibilityDownloadRef.current = null;
+      if (readyAutoPdfUrlRef.current) {
+        try {
+          URL.revokeObjectURL(readyAutoPdfUrlRef.current);
+        } catch {
+          // ignore
+        }
+        readyAutoPdfUrlRef.current = null;
+      }
+    };
+  }, []);
 
   // Deduplicated Background Auto-Translate & Auto-Save Tracking
   const inFlightTranslationsRef = useRef<Map<string, Promise<TranslatedPageRecord>>>(new Map());
@@ -342,7 +467,7 @@ export default function App() {
     [customTermsInput]
   );
 
-  // Refresh translated counts across library for active language + all cached languages
+  // Refresh translated counts across library for active language
   const refreshLibraryCounts = useCallback(
     async (bookList: StoredBook[], lang: LanguageCode) => {
       const counts: Record<string, number> = {};
@@ -353,46 +478,12 @@ export default function App() {
         })
       );
       setTranslatedCountsByBook(counts);
-      const allCounts = await listAllTranslationCountsByBook().catch(() => counts);
-      setAllLangTranslationCountsByBook(allCounts);
     },
     []
   );
 
-  // Refresh Service Worker & local IndexedDB offline cache diagnostics
-  const refreshOfflineInspection = useCallback(async (bookList: StoredBook[]) => {
-    const info = await inspectOfflineLibraryCache(bookList);
-    setCachedBookIds(info.cachedBookIds);
-    setStorageUsageBytes(info.storageUsageBytes);
-  }, []);
-
-  // Subscribe to Service Worker registration status & warm PDF.js fonts once online
-  useEffect(() => {
-    const unsubscribe = subscribeServiceWorkerStatus((status) => {
-      setSwStatus(status);
-    });
-    return unsubscribe;
-  }, []);
-
-  const booksCacheSignature = useMemo(
-    () =>
-      books
-        .map((b) => `${b.id}:${b.hasLocalPdf || (b.pdfData && b.pdfData.byteLength > 0) ? 1 : 0}`)
-        .join('|'),
-    [books]
-  );
   const booksRef = useRef(books);
   booksRef.current = books;
-
-  useEffect(() => {
-    refreshOfflineInspection(booksRef.current);
-  }, [booksCacheSignature, swStatus, translatedCountsByBook, refreshOfflineInspection]);
-
-  useEffect(() => {
-    if (isOnline && swStatus === 'active') {
-      warmPdfEngineOfflineAssets().catch(() => {});
-    }
-  }, [isOnline, swStatus]);
 
   const activeBookRef = useRef<StoredBook | null>(null);
   activeBookRef.current = activeBook;
@@ -998,88 +1089,6 @@ export default function App() {
       }
     }
   };
-
-  const handleCacheBookOffline = useCallback(
-    async (book: StoredBook) => {
-      if (cachingBookId || isSyncingAllOffline) return;
-      setCachingBookId(book.id);
-      setAppBanner(null);
-      try {
-        let cached: StoredBook;
-        if (!book.hasLocalPdf && !book.sourceUrl && book.discoveredBook) {
-          const hydrated = await hydrateDiscoveredBookPdf(book);
-          hydrated.pdf.cleanup().catch(() => {});
-          cached = hydrated.book;
-        } else {
-          cached = await cacheBookForOffline(book);
-        }
-        await warmPdfEngineOfflineAssets();
-        const updatedList = await listBooks();
-        setBooks(updatedList);
-        if (activeBook?.id === cached.id) {
-          setActiveBook(cached);
-        }
-        await refreshOfflineInspection(updatedList);
-        setAppBanner(`“${book.title}” is now cached in your browser for offline reading.`);
-      } catch (err) {
-        logDevError('app', err, `Cache book offline (${book.title})`);
-        setAppBanner(
-          err instanceof Error
-            ? `Could not cache “${book.title}” offline: ${err.message}`
-            : 'Could not cache this book offline.'
-        );
-      } finally {
-        setCachingBookId(null);
-      }
-    },
-    [
-      activeBook?.id,
-      cachingBookId,
-      hydrateDiscoveredBookPdf,
-      isSyncingAllOffline,
-      refreshOfflineInspection,
-    ]
-  );
-
-  const handleSyncAllOffline = useCallback(async () => {
-    if (isSyncingAllOffline || books.length === 0) return;
-    setIsSyncingAllOffline(true);
-    setAppBanner(null);
-    let newlyCached = 0;
-    let failed = 0;
-    try {
-      await warmPdfEngineOfflineAssets();
-      for (const book of books) {
-        try {
-          if (!book.hasLocalPdf && !book.sourceUrl && book.discoveredBook) {
-            const hydrated = await hydrateDiscoveredBookPdf(book);
-            hydrated.pdf.cleanup().catch(() => {});
-          } else {
-            await cacheBookForOffline(book);
-          }
-          newlyCached++;
-        } catch {
-          failed++;
-        }
-      }
-      const updatedList = await listBooks();
-      setBooks(updatedList);
-      await refreshOfflineInspection(updatedList);
-      if (failed === 0) {
-        setAppBanner(
-          `Offline cache verified: all ${newlyCached} ${
-            newlyCached === 1 ? 'book' : 'books'
-          } and PDF viewer assets are ready offline.`
-        );
-      } else {
-        setAppBanner(
-          `Cached ${newlyCached} book(s) offline (${failed} could not be downloaded right now).`
-        );
-      }
-    } finally {
-      setIsSyncingAllOffline(false);
-    }
-  }, [books, hydrateDiscoveredBookPdf, isSyncingAllOffline, refreshOfflineInspection]);
 
   // Toggle Book-level Bookmark / Save (distinct from page bookmarks; metadata-only, crash-safe)
   const handleToggleBookSavedBookmark = useCallback(
@@ -1841,12 +1850,29 @@ export default function App() {
       startPage: number;
       endPage: number;
       label: string;
-    }): Promise<{ records: TranslatedPageRecord[]; cancelled: boolean }> => {
+      autoDownloadPdfOptions?: {
+        includeCover: boolean;
+        includeFigures: boolean;
+        includeOriginalSubheader: boolean;
+      };
+    }): Promise<{
+      records: TranslatedPageRecord[];
+      cancelled: boolean;
+      autoDownloaded?: boolean;
+      autoDownloadFileName?: string;
+    }> => {
       if (!activeBook || !loadedPdf) {
         return { records: [], cancelled: false };
       }
-      if (batchProgress) {
+      if (batchInFlightRef.current) {
         return { records: [], cancelled: false };
+      }
+
+      batchInFlightRef.current = true;
+      setAutoPdfError(null);
+      if (options.autoDownloadPdfOptions) {
+        exportPdfOptionsRef.current = options.autoDownloadPdfOptions;
+        setReadyAutoPdfSafe(null);
       }
 
       const book = activeBook;
@@ -1993,15 +2019,116 @@ export default function App() {
         done = collected.size;
       };
 
+      const runAutoPdfBuildAndDownload = async (
+        recordsToExport: TranslatedPageRecord[]
+      ): Promise<{ autoDownloaded: boolean; autoDownloadFileName?: string }> => {
+        const shouldAutoDownload =
+          autoDownloadAfterFastRef.current &&
+          (Boolean(options.autoDownloadPdfOptions) || activeTabRef.current === 'export');
+
+        if (!shouldAutoDownload) {
+          return { autoDownloaded: false };
+        }
+
+        // Pull latest layout options so mid-translation toggles (Cover / Figures / Subheader) are honored
+        const pdfOpts = exportPdfOptionsRef.current;
+
+        // If recordsToExport came back empty, double-check IndexedDB for any saved pages in this range
+        let finalRecords = recordsToExport;
+        if (finalRecords.length === 0) {
+          const reloaded = await Promise.all(
+            allPages.map((p) => getTranslation(book.id, lang, p))
+          );
+          finalRecords = reloaded
+            .filter((r): r is TranslatedPageRecord => Boolean(r))
+            .sort((a, b) => a.pageNumber - b.pageNumber);
+        }
+
+        if (finalRecords.length === 0) {
+          setAutoPdfError(
+            'Translation finished with 0 exportable pages, so the PDF could not be generated.'
+          );
+          return { autoDownloaded: false };
+        }
+
+        setAutoPdfError(null);
+        setAutoPdfBuildProgress({
+          current: 0,
+          total: finalRecords.length + (pdfOpts.includeCover ? 1 : 0),
+          status: 'Building converted PDF for automatic download…',
+        });
+        try {
+          const result = await exportTranslatedPdf({
+            pdf,
+            book,
+            pages: finalRecords,
+            lang,
+            includeCover: pdfOpts.includeCover,
+            includeFigures: pdfOpts.includeFigures,
+            includeOriginalSubheader: pdfOpts.includeOriginalSubheader,
+            onProgress: (current, total, status) => {
+              setAutoPdfBuildProgress({ current, total, status });
+            },
+          });
+
+          const isTabVisible =
+            typeof document === 'undefined' || document.visibilityState === 'visible';
+          const readyUrl = setReadyAutoPdfSafe({
+            blob: result.blob,
+            fileName: result.fileName,
+            exportedPageCount: result.exportedPageCount,
+            includeCover: pdfOpts.includeCover,
+            waitingForFocus: !isTabVisible,
+          });
+
+          if (readyUrl) {
+            if (isTabVisible) {
+              triggerBlobUrlDownload(readyUrl, result.fileName);
+            } else {
+              // Tab is backgrounded: still attempt immediate trigger AND guarantee download when user returns to tab
+              pendingVisibilityDownloadRef.current = {
+                url: readyUrl,
+                fileName: result.fileName,
+              };
+              triggerBlobUrlDownload(readyUrl, result.fileName);
+            }
+          } else {
+            downloadBlob(result.blob, result.fileName);
+          }
+
+          return { autoDownloaded: true, autoDownloadFileName: result.fileName };
+        } catch (pdfErr) {
+          const msg =
+            pdfErr instanceof Error
+              ? pdfErr.message
+              : 'Auto-download PDF generation encountered an error.';
+          logDevError('app', pdfErr, 'Auto-download converted PDF');
+          setAutoPdfError(msg);
+          return { autoDownloaded: false };
+        } finally {
+          setAutoPdfBuildProgress(null);
+        }
+      };
+
       if (missingPages.length === 0) {
-        const sortedAll = Array.from(collected.values()).sort(
-          (a, b) => a.pageNumber - b.pageNumber
-        );
-        commitSavedBatchToState(sortedAll);
-        document.removeEventListener('visibilitychange', handleVisibilityWake);
-        releaseWakeLock();
-        batchAbortRef.current = null;
-        return { records: sortedAll, cancelled: false };
+        try {
+          const sortedAll = Array.from(collected.values()).sort(
+            (a, b) => a.pageNumber - b.pageNumber
+          );
+          commitSavedBatchToState(sortedAll);
+          const autoRes = await runAutoPdfBuildAndDownload(sortedAll);
+          return {
+            records: sortedAll,
+            cancelled: false,
+            autoDownloaded: autoRes.autoDownloaded,
+            autoDownloadFileName: autoRes.autoDownloadFileName,
+          };
+        } finally {
+          document.removeEventListener('visibilitychange', handleVisibilityWake);
+          releaseWakeLock();
+          batchAbortRef.current = null;
+          batchInFlightRef.current = false;
+        }
       }
 
       pushProgress(missingPages[0]);
@@ -2231,12 +2358,47 @@ export default function App() {
               await runAiPageWithRetry(pNum, 2);
             }
           }
+
+          // Final safeguard for Smart AI: save original fallback blocks for any page still unreachable so PDF export still completes at 100%
+          const unresolvedAiPages = missingPages.filter((p) => !collected.has(p));
+          if (unresolvedAiPages.length > 0 && !batchCancelRef.current) {
+            const parsedFallbacks = await Promise.all(
+              unresolvedAiPages.map((pNum) => loadParsedPageSafe(pNum))
+            );
+            const fallbackRecords: TranslatedPageRecord[] = parsedFallbacks.map((p) => ({
+              key: makeTranslationKey(book.id, lang, p.pageNumber),
+              bookId: book.id,
+              pageNumber: p.pageNumber,
+              lang,
+              engine: 'ai',
+              blocks: p.blocks.map((b) => ({ ...b, translatedText: b.text })),
+              figures: p.figures,
+              imageExplanations: [],
+              updatedAt: Date.now(),
+            }));
+            await persistBatchRecords(fallbackRecords);
+          }
         }
 
         const sortedRecords = Array.from(collected.values()).sort(
           (a, b) => a.pageNumber - b.pageNumber
         );
-        return { records: sortedRecords, cancelled: batchCancelRef.current };
+        const wasCancelled = batchCancelRef.current;
+
+        // Clear translation progress before transitioning smoothly into PDF build & auto-download
+        setBatchProgress(null);
+
+        if (!wasCancelled) {
+          const autoRes = await runAutoPdfBuildAndDownload(sortedRecords);
+          return {
+            records: sortedRecords,
+            cancelled: false,
+            autoDownloaded: autoRes.autoDownloaded,
+            autoDownloadFileName: autoRes.autoDownloadFileName,
+          };
+        }
+
+        return { records: sortedRecords, cancelled: true };
       } catch (err) {
         if (batchCancelRef.current || (err instanceof DOMException && err.name === 'AbortError')) {
           const sortedRecords = Array.from(collected.values()).sort(
@@ -2255,13 +2417,13 @@ export default function App() {
         document.removeEventListener('visibilitychange', handleVisibilityWake);
         releaseWakeLock();
         batchAbortRef.current = null;
+        batchInFlightRef.current = false;
         setBatchProgress(null);
       }
     },
     [
       activeBook,
       loadedPdf,
-      batchProgress,
       targetLang,
       engine,
       preserveTerms,
@@ -2270,6 +2432,7 @@ export default function App() {
       commitSavedTranslationToState,
       ensureCleanParsedPage,
       translateSinglePageInternal,
+      setReadyAutoPdfSafe,
     ]
   );
 
@@ -2463,7 +2626,7 @@ export default function App() {
       for (const blk of rec.blocks) {
         const txt = (narrationSource === 'original' ? blk.text : blk.translatedText || blk.text).trim();
         if (txt) {
-          words += txt.split(/\s+/).filter(Boolean).length;
+          words += countReadableWords(txt);
         }
       }
       if (words > 0) {
@@ -2472,6 +2635,183 @@ export default function App() {
     }
     return counts;
   }, [bookTranslations, currentChapter, currentPage, narrationSource]);
+
+  // All known page word counts across the active book (translated pages + current parsed page)
+  const allBookPageWordCounts = useMemo<Record<number, number>>(() => {
+    const counts: Record<number, number> = {};
+    for (const rec of bookTranslations) {
+      let words = 0;
+      for (const blk of rec.blocks) {
+        const txt = (narrationSource === 'original' ? blk.text : blk.translatedText || blk.text).trim();
+        if (txt) {
+          words += countReadableWords(txt);
+        }
+      }
+      if (words > 0) {
+        counts[rec.pageNumber] = words;
+      }
+    }
+    const currentPageWords = countPageWords(
+      parsedPage && parsedPage.pageNumber === currentPage ? parsedPage : null,
+      translatedPage && translatedPage.pageNumber === currentPage ? translatedPage : null,
+      narrationSource === 'original'
+    );
+    if (currentPageWords > 0) {
+      counts[currentPage] = currentPageWords;
+    }
+    return counts;
+  }, [bookTranslations, parsedPage, translatedPage, currentPage, narrationSource]);
+
+  const bookFallbackWordsPerPage = useMemo(() => {
+    const values = Object.values(allBookPageWordCounts).filter((w) => w >= 20);
+    if (values.length >= 2) {
+      const sum = values.reduce((acc, val) => acc + val, 0);
+      return Math.max(80, Math.round(sum / values.length));
+    }
+    return readingSpeed.avgWordsPerPage;
+  }, [allBookPageWordCounts, readingSpeed.avgWordsPerPage]);
+
+  const chapterReadingEstimate = useMemo<ChapterReadingEstimate | null>(
+    () =>
+      estimateChapterFinishTime({
+        chapter: currentChapter,
+        currentPage,
+        wpm: readingSpeed.averageWpm,
+        knownPageWordCounts: allBookPageWordCounts,
+        fallbackWordsPerPage: bookFallbackWordsPerPage,
+      }),
+    [
+      currentChapter,
+      currentPage,
+      readingSpeed.averageWpm,
+      allBookPageWordCounts,
+      bookFallbackWordsPerPage,
+    ]
+  );
+
+  const handleResetReadingSpeed = useCallback(() => {
+    setReadingSpeed(resetReadingSpeedHistory());
+  }, []);
+
+  // Page-turning reading speed tracker (visibility-aware, pauses when tabbed away or listening to TTS)
+  const pageReadSessionRef = useRef<{
+    bookId: string;
+    pageNumber: number;
+    accumulatedMs: number;
+    resumedAt: number | null;
+    wordCount: number;
+  } | null>(null);
+
+  // Keep current page's word count synced as soon as parsed/translated content arrives
+  useEffect(() => {
+    const session = pageReadSessionRef.current;
+    if (!session || session.bookId !== activeBookId || session.pageNumber !== currentPage) return;
+    const words = countPageWords(
+      parsedPage && parsedPage.pageNumber === currentPage ? parsedPage : null,
+      translatedPage && translatedPage.pageNumber === currentPage ? translatedPage : null,
+      narrationSource === 'original'
+    );
+    if (words > 0) {
+      session.wordCount = words;
+    }
+  }, [activeBookId, currentPage, parsedPage, translatedPage, narrationSource]);
+
+  // Pause/resume active page timer on tab visibility, window focus, or audiobook speech
+  useEffect(() => {
+    const pauseSession = () => {
+      const session = pageReadSessionRef.current;
+      if (session && session.resumedAt !== null) {
+        session.accumulatedMs += Math.max(0, Date.now() - session.resumedAt);
+        session.resumedAt = null;
+      }
+    };
+    const resumeSession = () => {
+      const session = pageReadSessionRef.current;
+      if (
+        session &&
+        session.resumedAt === null &&
+        activeTab === 'reader' &&
+        !isSpeaking &&
+        typeof document !== 'undefined' &&
+        document.visibilityState === 'visible'
+      ) {
+        session.resumedAt = Date.now();
+      }
+    };
+
+    if (activeTab !== 'reader' || isSpeaking) {
+      pauseSession();
+    } else {
+      resumeSession();
+    }
+
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        resumeSession();
+      } else {
+        pauseSession();
+      }
+    };
+    window.addEventListener('blur', pauseSession);
+    window.addEventListener('focus', resumeSession);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('blur', pauseSession);
+      window.removeEventListener('focus', resumeSession);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [activeTab, isSpeaking]);
+
+  // Commit completed page turn whenever the user turns to a new page or leaves the reader
+  useEffect(() => {
+    const finalizePrevious = () => {
+      const prev = pageReadSessionRef.current;
+      if (!prev) return;
+      const totalMs =
+        prev.accumulatedMs + (prev.resumedAt !== null ? Math.max(0, Date.now() - prev.resumedAt) : 0);
+      pageReadSessionRef.current = null;
+      if (prev.wordCount >= 20 && totalMs >= 5000) {
+        const snapshot = recordPageTurnSample({
+          bookId: prev.bookId,
+          pageNumber: prev.pageNumber,
+          wordCount: prev.wordCount,
+          durationSeconds: totalMs / 1000,
+        });
+        setReadingSpeed(snapshot);
+      }
+    };
+
+    if (activeTab !== 'reader' || !activeBookId) {
+      finalizePrevious();
+      return;
+    }
+
+    const prev = pageReadSessionRef.current;
+    if (prev && (prev.bookId !== activeBookId || prev.pageNumber !== currentPage)) {
+      finalizePrevious();
+    }
+
+    if (
+      !pageReadSessionRef.current ||
+      pageReadSessionRef.current.bookId !== activeBookId ||
+      pageReadSessionRef.current.pageNumber !== currentPage
+    ) {
+      const initialWords = countPageWords(
+        parsedPage && parsedPage.pageNumber === currentPage ? parsedPage : null,
+        translatedPage && translatedPage.pageNumber === currentPage ? translatedPage : null,
+        narrationSource === 'original'
+      );
+      const isVisible =
+        typeof document === 'undefined' || document.visibilityState === 'visible';
+      pageReadSessionRef.current = {
+        bookId: activeBookId,
+        pageNumber: currentPage,
+        accumulatedMs: 0,
+        resumedAt: !isSpeaking && isVisible ? Date.now() : null,
+        wordCount: initialWords,
+      };
+    }
+  }, [activeTab, activeBookId, currentPage]);
 
   const sentences = useMemo(() => {
     if (narrationSource === 'original') {
@@ -2750,28 +3090,6 @@ export default function App() {
     );
   };
 
-  const cachedLibraryBookCount = useMemo(
-    () => books.reduce((count, b) => count + (cachedBookIds.has(b.id) ? 1 : 0), 0),
-    [books, cachedBookIds]
-  );
-
-  const handleHeaderSyncClick = useCallback(() => {
-    const hasPending = books.length > cachedLibraryBookCount;
-    if (swStatus === 'active' && isOnline && hasPending && !isSyncingAllOffline && !cachingBookId) {
-      handleSyncAllOffline();
-      return;
-    }
-    setActiveTab('library');
-  }, [
-    books.length,
-    cachedLibraryBookCount,
-    swStatus,
-    isOnline,
-    isSyncingAllOffline,
-    cachingBookId,
-    handleSyncAllOffline,
-  ]);
-
   return (
     <div className="min-h-screen w-full max-w-full overflow-x-hidden flex flex-col bg-[#FAF9F5] sepia:bg-[#F4ECD8] dark:bg-[#090908] text-stone-900 sepia:text-[#3B2F23] dark:text-stone-100">
       {/* Top 3-Zone Navigation Bar */}
@@ -2780,14 +3098,6 @@ export default function App() {
         onSelectTab={setActiveTab}
         onUploadPdf={handleUploadPdf}
         isUploading={isUploading}
-        librarySync={{
-          swStatus,
-          isOnline,
-          totalBooks: books.length,
-          cachedBooks: cachedLibraryBookCount,
-          isSyncing: isSyncingAllOffline || Boolean(cachingBookId),
-          onSyncAction: handleHeaderSyncClick,
-        }}
       />
 
       {/* Offline Mode Connectivity Bar */}
@@ -3234,6 +3544,49 @@ export default function App() {
         </div>
       )}
 
+      {/* Auto-Download Converted PDF Status Bar (visible when user switched away from Export tab) */}
+      {activeTab !== 'export' && autoPdfBuildProgress && (
+        <div className="no-print px-4 py-2 text-xs bg-amber-50 dark:bg-amber-950/40 border-b border-amber-200 dark:border-amber-900/60 text-amber-900 dark:text-amber-200 flex items-center justify-between gap-3">
+          <span className="inline-flex items-center gap-2 min-w-0">
+            <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+            <span className="truncate">{autoPdfBuildProgress.status}</span>
+          </span>
+          <span className="font-mono-num shrink-0">
+            {autoPdfBuildProgress.current}/{autoPdfBuildProgress.total}
+          </span>
+        </div>
+      )}
+
+      {activeTab !== 'export' && !autoPdfBuildProgress && readyAutoPdf && (
+        <div className="no-print px-4 py-2 text-xs bg-emerald-50 dark:bg-emerald-950/40 border-b border-emerald-200 dark:border-emerald-900/60 text-emerald-900 dark:text-emerald-200 flex flex-wrap items-center justify-between gap-2">
+          <span className="inline-flex items-center gap-2 min-w-0">
+            <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+            <span className="truncate">
+              Converted PDF ready ({readyAutoPdf.exportedPageCount} pages):{' '}
+              <strong>{readyAutoPdf.fileName}</strong>
+            </span>
+          </span>
+          <div className="flex items-center gap-2 shrink-0">
+            <a
+              href={readyAutoPdf.url}
+              download={readyAutoPdf.fileName}
+              className="inline-flex items-center gap-1 h-7 px-2.5 rounded bg-emerald-700 hover:bg-emerald-800 text-white font-medium transition-colors"
+            >
+              <Download className="w-3 h-3" />
+              <span>Save PDF</span>
+            </a>
+            <button
+              type="button"
+              onClick={() => setReadyAutoPdfSafe(null)}
+              aria-label="Dismiss PDF ready notice"
+              className="text-emerald-700 dark:text-emerald-300 hover:opacity-75 cursor-pointer"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Main View Content */}
       <div className="no-print flex-1 flex flex-col min-h-0">
         {activeTab === 'discover' ? (
@@ -3257,16 +3610,9 @@ export default function App() {
             books={books}
             activeBookId={activeBook?.id ?? null}
             translatedCountsByBook={translatedCountsByBook}
-            allLangTranslationCountsByBook={allLangTranslationCountsByBook}
             dailyReadingGoal={dailyReadingGoal}
             onChangeDailyGoal={handleUpdateDailyReadingGoal}
-            isOnline={isOnline}
-            swStatus={swStatus}
-            cachedBookIds={cachedBookIds}
-            storageUsageBytes={storageUsageBytes}
-            cachingBookId={cachingBookId}
             downloadingBookId={downloadingBookId}
-            isSyncingAllOffline={isSyncingAllOffline}
             onSelectBook={async (book) => {
               try {
                 await openStoredBook(book);
@@ -3275,7 +3621,7 @@ export default function App() {
                 setAppBanner(
                   err instanceof Error
                     ? err.message
-                    : 'Unable to open this book while offline.'
+                    : 'Unable to open this book right now.'
                 );
               }
             }}
@@ -3285,8 +3631,6 @@ export default function App() {
             onToggleBookBookmark={handleToggleBookSavedBookmark}
             onUploadPdf={handleUploadPdf}
             onDeleteBook={handleDeleteBook}
-            onCacheBookOffline={handleCacheBookOffline}
-            onSyncAllOffline={handleSyncAllOffline}
             onGoToDiscover={() => setActiveTab('discover')}
             isUploading={isUploading}
           />
@@ -3303,6 +3647,13 @@ export default function App() {
             aiAvailable={aiAvailable}
             translatedPages={bookTranslations}
             batchProgress={batchProgress}
+            autoDownloadAfterFast={autoDownloadAfterFast}
+            onChangeAutoDownloadAfterFast={setAutoDownloadAfterFast}
+            onSyncExportPdfOptions={handleSyncExportPdfOptions}
+            autoPdfBuildProgress={autoPdfBuildProgress}
+            readyAutoPdf={readyAutoPdf}
+            autoPdfError={autoPdfError}
+            onDismissReadyAutoPdf={() => setReadyAutoPdfSafe(null)}
             onFastTranslateRange={handleFastTranslateRange}
             onCancelBatch={handleCancelBatch}
             onPreparePrintPages={(pages, includeCover) =>
@@ -3355,6 +3706,10 @@ export default function App() {
                   onSummarizeChapter={handleSummarizeChapter}
                   summarizingChapterId={summarizingChapterId}
                   isBatchTranslating={Boolean(batchProgress)}
+                  readingSpeed={readingSpeed}
+                  chapterReadingEstimate={chapterReadingEstimate}
+                  pageWordCounts={allBookPageWordCounts}
+                  fallbackWordsPerPage={bookFallbackWordsPerPage}
                 />
               </div>
             )}
@@ -3392,6 +3747,10 @@ export default function App() {
                     summarizingChapterId={summarizingChapterId}
                     isBatchTranslating={Boolean(batchProgress)}
                     onCloseMobile={() => setMobileChaptersOpen(false)}
+                    readingSpeed={readingSpeed}
+                    chapterReadingEstimate={chapterReadingEstimate}
+                    pageWordCounts={allBookPageWordCounts}
+                    fallbackWordsPerPage={bookFallbackWordsPerPage}
                   />
                 </div>
                 <button
@@ -3482,6 +3841,14 @@ export default function App() {
                   onExportHighlights={handleExportHighlightsSheet}
                   onShareQuote={handleShareQuoteFromReader}
                   onOpenShareStudio={handleOpenShareStudio}
+                  readingSpeed={readingSpeed}
+                  chapterReadingEstimate={chapterReadingEstimate}
+                  onResetReadingSpeed={handleResetReadingSpeed}
+                  bookId={activeBook.id}
+                  pdf={loadedPdf}
+                  chapters={activeBook.chapters}
+                  bookTranslations={bookTranslations}
+                  onSelectPage={setCurrentPage}
                 />
               </div>
 
@@ -3515,6 +3882,10 @@ export default function App() {
                     }}
                     summarizingChapterId={summarizingChapterId}
                     isBatchTranslating={Boolean(batchProgress)}
+                    readingSpeed={readingSpeed}
+                    chapterReadingEstimate={chapterReadingEstimate}
+                    pageWordCounts={allBookPageWordCounts}
+                    fallbackWordsPerPage={bookFallbackWordsPerPage}
                   />
                 </div>
               )}

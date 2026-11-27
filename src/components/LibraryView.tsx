@@ -1,34 +1,30 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ArrowUpDown,
   Bookmark,
   BookOpen,
-  CheckCircle2,
-  CloudDownload,
   Compass,
   Download,
   Flame,
-  HardDrive,
   Headphones,
   Languages,
   Loader2,
   Minus,
   Plus,
-  RefreshCw,
   Search,
   Target,
   Trash2,
   Upload,
-  WifiOff,
   X,
 } from 'lucide-react';
 import { PRELOADED_OBS_BOOK_ID } from '../lib/languages';
-import { formatStorageBytes, type ServiceWorkerStatus } from '../lib/offlineCache';
 import type { DailyReadingGoalSnapshot } from '../lib/readingGoal';
 import type { StoredBook } from '../types';
 import { PWAInstallButton } from './PWAInstallButton';
 
-type LibraryFilterTab = 'all' | 'bookmarked' | 'listened' | 'offline';
+type LibraryFilterTab = 'all' | 'bookmarked' | 'listened';
 type LibrarySearchScope = 'all' | 'title' | 'author';
+type LibrarySortOption = 'recent' | 'title' | 'author';
 
 const GOAL_PRESETS = [10, 15, 25, 50] as const;
 
@@ -151,16 +147,9 @@ interface LibraryViewProps {
   books: StoredBook[];
   activeBookId: string | null;
   translatedCountsByBook: Record<string, number>;
-  allLangTranslationCountsByBook: Record<string, number>;
   dailyReadingGoal: DailyReadingGoalSnapshot;
   onChangeDailyGoal: (pages: number) => void;
-  isOnline: boolean;
-  swStatus: ServiceWorkerStatus;
-  cachedBookIds: Set<string>;
-  storageUsageBytes: number | null;
-  cachingBookId: string | null;
   downloadingBookId?: string | null;
-  isSyncingAllOffline: boolean;
   onSelectBook: (book: StoredBook) => void;
   onListenBook: (book: StoredBook) => void;
   onTranslateBook: (book: StoredBook) => void;
@@ -168,8 +157,6 @@ interface LibraryViewProps {
   onToggleBookBookmark: (bookId: string) => void;
   onUploadPdf: (file: File) => void;
   onDeleteBook: (bookId: string) => void;
-  onCacheBookOffline: (book: StoredBook) => void;
-  onSyncAllOffline: () => void;
   onGoToDiscover?: () => void;
   isUploading: boolean;
 }
@@ -178,16 +165,9 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   books,
   activeBookId,
   translatedCountsByBook,
-  allLangTranslationCountsByBook,
   dailyReadingGoal,
   onChangeDailyGoal,
-  isOnline,
-  swStatus,
-  cachedBookIds,
-  storageUsageBytes,
-  cachingBookId,
   downloadingBookId = null,
-  isSyncingAllOffline,
   onSelectBook,
   onListenBook,
   onTranslateBook,
@@ -195,8 +175,6 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   onToggleBookBookmark,
   onUploadPdf,
   onDeleteBook,
-  onCacheBookOffline,
-  onSyncAllOffline,
   onGoToDiscover,
   isUploading,
 }) => {
@@ -206,17 +184,29 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchScope, setSearchScope] = useState<LibrarySearchScope>('all');
+  const [sortBy, setSortBy] = useState<LibrarySortOption>('recent');
   const [activeFilter, setActiveFilter] = useState<LibraryFilterTab>('all');
 
-  const isBookOfflineReady = (book: StoredBook): boolean =>
-    cachedBookIds.has(book.id) ||
-    Boolean(book.hasLocalPdf) ||
-    Boolean(book.pdfData && book.pdfData.byteLength > 0);
-
-  const offlineReadyCount = useMemo(
-    () => books.filter((b) => isBookOfflineReady(b)).length,
-    [books, cachedBookIds]
-  );
+  // Press '/' anywhere outside form fields to jump straight into the Library search bar
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return;
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      e.preventDefault();
+      searchInputRef.current?.focus();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
 
   const bookmarkedCount = useMemo(
     () => books.filter((b) => Boolean(b.isBookmarked)).length,
@@ -231,21 +221,13 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     [books]
   );
 
-  const totalCachedTranslations = useMemo(
-    () => Object.values(allLangTranslationCountsByBook).reduce((sum, n) => sum + n, 0),
-    [allLangTranslationCountsByBook]
-  );
-
   const searchTokens = useMemo(() => {
-    const trimmed = searchQuery.trim().toLowerCase();
+    const trimmed = searchQuery.normalize('NFKC').trim().toLowerCase();
     return trimmed ? trimmed.split(/\s+/).filter(Boolean) : [];
   }, [searchQuery]);
 
   const filteredBooks = useMemo(() => {
-    return books.filter((book) => {
-      if (activeFilter === 'offline' && !isBookOfflineReady(book)) {
-        return false;
-      }
+    const matched = books.filter((book) => {
       if (activeFilter === 'bookmarked' && !book.isBookmarked) {
         return false;
       }
@@ -257,15 +239,33 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
         return false;
       }
       if (searchTokens.length === 0) return true;
+      const normTitle = `${book.title ?? ''} ${book.fileName ?? ''}`.normalize('NFKC').toLowerCase();
+      const normAuthor = (book.author ?? '').normalize('NFKC').toLowerCase();
       const haystack =
         searchScope === 'title'
-          ? (book.title ?? '').toLowerCase()
+          ? normTitle
           : searchScope === 'author'
-          ? (book.author ?? '').toLowerCase()
-          : `${book.title ?? ''} ${book.author ?? ''}`.toLowerCase();
+          ? normAuthor
+          : `${normTitle} ${normAuthor}`;
       return searchTokens.every((token) => haystack.includes(token));
     });
-  }, [books, searchTokens, searchScope, activeFilter, cachedBookIds]);
+
+    if (sortBy === 'title') {
+      return [...matched].sort((a, b) =>
+        (a.title ?? '').localeCompare(b.title ?? '', undefined, { sensitivity: 'base' })
+      );
+    }
+    if (sortBy === 'author') {
+      return [...matched].sort((a, b) => {
+        const aAuth = (a.author ?? '').trim();
+        const bAuth = (b.author ?? '').trim();
+        if (!aAuth && bAuth) return 1;
+        if (aAuth && !bAuth) return -1;
+        return aAuth.localeCompare(bAuth, undefined, { sensitivity: 'base' });
+      });
+    }
+    return matched;
+  }, [books, searchTokens, searchScope, activeFilter, sortBy]);
 
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
@@ -278,15 +278,6 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
   const hasQuery = searchQuery.trim().length > 0;
   const hasActiveFilter = hasQuery || activeFilter !== 'all';
-  const uncachedCount = Math.max(0, books.length - offlineReadyCount);
-
-  const swStatusLabel = !isOnline
-    ? 'Offline mode active · serving cached books & reader engine locally'
-    : swStatus === 'active'
-    ? 'Service worker active · My Library & reader cached for offline access'
-    : swStatus === 'registering'
-    ? 'Activating offline service worker cache…'
-    : 'Local IndexedDB offline storage active';
 
   return (
     <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8 sm:py-10 space-y-7">
@@ -306,13 +297,8 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
             <button
               type="button"
               onClick={onGoToDiscover}
-              disabled={!isOnline}
-              title={
-                isOnline
-                  ? 'Search free public-domain books online'
-                  : 'Reconnect to search online repositories'
-              }
-              className="inline-flex items-center gap-1.5 h-8 px-3 rounded-md border border-stone-300 sepia:border-[#D4C6AA] dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#191816] text-xs font-medium text-stone-800 sepia:text-[#3B2F23] dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 disabled:opacity-45 disabled:cursor-not-allowed cursor-pointer whitespace-nowrap"
+              title="Search free public-domain books online"
+              className="inline-flex items-center gap-1.5 h-8 px-3 rounded-md border border-stone-300 sepia:border-[#D4C6AA] dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#191816] text-xs font-medium text-stone-800 sepia:text-[#3B2F23] dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer whitespace-nowrap"
             >
               <Compass className="w-3.5 h-3.5 text-amber-700 dark:text-amber-500" />
               <span>Discover Free Books</span>
@@ -425,15 +411,20 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
       {/* Prominent Library Search Bar & Shelf Filter Tabs */}
       <section aria-label="Search and filter saved books" className="space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center gap-2.5">
-          <div className="relative flex-1">
+        <div className="flex flex-col md:flex-row md:items-center gap-2.5">
+          <div className="relative flex-1 min-w-0">
             <Search
               aria-hidden="true"
               className="w-4 h-4 text-stone-400 dark:text-stone-500 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none"
             />
             <input
               ref={searchInputRef}
-              type="search"
+              type="text"
+              role="searchbox"
+              inputMode="search"
+              enterKeyHint="search"
+              autoComplete="off"
+              spellCheck={false}
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               onKeyDown={(e) => {
@@ -446,52 +437,86 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                   ? 'Filter saved books by title…'
                   : searchScope === 'author'
                   ? 'Filter saved books by author…'
-                  : 'Search your library by title or author…'
+                  : 'Search saved books by title or author…'
               }
               aria-label="Filter library books by title or author"
-              className="w-full h-11 pl-10 pr-10 rounded-md border border-stone-300 sepia:border-[#D4C6AA] dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#191816] text-sm text-stone-900 sepia:text-[#2F241A] dark:text-stone-100 placeholder:text-stone-400 dark:placeholder:text-stone-500 focus:outline-none focus:border-amber-700 dark:focus:border-amber-500 transition-colors"
+              className="w-full h-11 pl-10 pr-24 rounded-md border border-stone-300 sepia:border-[#D4C6AA] dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#191816] text-sm text-stone-900 sepia:text-[#2F241A] dark:text-stone-100 placeholder:text-stone-400 dark:placeholder:text-stone-500 focus:outline-none focus:border-amber-700 dark:focus:border-amber-500 transition-colors"
             />
-            {hasQuery && (
-              <button
-                type="button"
-                onClick={() => {
-                  setSearchQuery('');
-                  searchInputRef.current?.focus();
-                }}
-                aria-label="Clear library search"
-                className="absolute right-2.5 top-1/2 -translate-y-1/2 h-6 w-6 inline-flex items-center justify-center rounded text-stone-400 hover:text-stone-900 dark:hover:text-stone-100 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer"
+            {hasQuery ? (
+              <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1.5">
+                <span
+                  aria-live="polite"
+                  className="text-[11px] font-mono-num text-stone-500 dark:text-stone-400 select-none"
+                >
+                  {filteredBooks.length} {filteredBooks.length === 1 ? 'match' : 'matches'}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSearchQuery('');
+                    searchInputRef.current?.focus();
+                  }}
+                  aria-label="Clear library search"
+                  className="h-6 w-6 inline-flex items-center justify-center rounded text-stone-500 hover:text-stone-900 dark:hover:text-stone-100 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ) : (
+              <kbd
+                aria-hidden="true"
+                className="hidden sm:inline-flex items-center justify-center absolute right-3 top-1/2 -translate-y-1/2 h-5 min-w-[20px] px-1.5 rounded border border-stone-200 sepia:border-[#D4C6AA] dark:border-stone-700 bg-stone-50 sepia:bg-[#F4ECD8] dark:bg-[#22211E] text-[10px] font-mono-num text-stone-400 dark:text-stone-500 pointer-events-none"
               >
-                <X className="w-3.5 h-3.5" />
-              </button>
+                /
+              </kbd>
             )}
           </div>
 
-          <div
-            role="group"
-            aria-label="Search field scope"
-            className="inline-flex h-11 rounded-md border border-stone-300 sepia:border-[#D4C6AA] dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#191816] p-1 shrink-0"
-          >
-            {(
-              [
-                { id: 'all', label: 'Title & Author' },
-                { id: 'title', label: 'Title' },
-                { id: 'author', label: 'Author' },
-              ] as const
-            ).map((scope) => (
-              <button
-                key={scope.id}
-                type="button"
-                aria-pressed={searchScope === scope.id}
-                onClick={() => setSearchScope(scope.id)}
-                className={`px-2.5 rounded text-xs font-medium whitespace-nowrap transition-colors cursor-pointer ${
-                  searchScope === scope.id
-                    ? 'bg-stone-900 text-stone-50 dark:bg-stone-100 dark:text-stone-950'
-                    : 'text-stone-600 sepia:text-[#5B4938] dark:text-stone-300 hover:text-stone-950 dark:hover:text-stone-100'
-                }`}
+          <div className="flex items-center gap-2 shrink-0 flex-wrap sm:flex-nowrap">
+            <div
+              role="group"
+              aria-label="Search field scope"
+              className="inline-flex h-11 rounded-md border border-stone-300 sepia:border-[#D4C6AA] dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#191816] p-1 shrink-0"
+            >
+              {(
+                [
+                  { id: 'all', label: 'Title & Author' },
+                  { id: 'title', label: 'Title' },
+                  { id: 'author', label: 'Author' },
+                ] as const
+              ).map((scope) => (
+                <button
+                  key={scope.id}
+                  type="button"
+                  aria-pressed={searchScope === scope.id}
+                  onClick={() => setSearchScope(scope.id)}
+                  className={`px-2.5 rounded text-xs font-medium whitespace-nowrap transition-colors cursor-pointer ${
+                    searchScope === scope.id
+                      ? 'bg-stone-900 text-stone-50 dark:bg-stone-100 dark:text-stone-950'
+                      : 'text-stone-600 sepia:text-[#5B4938] dark:text-stone-300 hover:text-stone-950 dark:hover:text-stone-100'
+                  }`}
+                >
+                  {scope.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="relative inline-flex items-center h-11 rounded-md border border-stone-300 sepia:border-[#D4C6AA] dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#191816] px-2.5 shrink-0">
+              <ArrowUpDown
+                aria-hidden="true"
+                className="w-3.5 h-3.5 text-stone-400 dark:text-stone-500 mr-1.5 shrink-0"
+              />
+              <select
+                aria-label="Sort saved books"
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as LibrarySortOption)}
+                className="h-full bg-transparent text-xs font-medium text-stone-700 sepia:text-[#3B2F23] dark:text-stone-200 focus:outline-none cursor-pointer pr-1"
               >
-                {scope.label}
-              </button>
-            ))}
+                <option value="recent">Recent</option>
+                <option value="title">Title A–Z</option>
+                <option value="author">Author A–Z</option>
+              </select>
+            </div>
           </div>
         </div>
 
@@ -507,7 +532,6 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                   { id: 'all', label: `All Books (${books.length})` },
                   { id: 'bookmarked', label: `Bookmarked (${bookmarkedCount})` },
                   { id: 'listened', label: `Audio History (${listenedCount})` },
-                  { id: 'offline', label: `Offline Ready (${offlineReadyCount})` },
                 ] as const
               ).map((tab) => {
                 const active = activeFilter === tab.id;
@@ -530,12 +554,21 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
               })}
             </div>
 
-            <p className="text-xs font-mono-num text-stone-500 dark:text-stone-400 pb-2 sm:pb-0 whitespace-nowrap">
+            <p
+              aria-live="polite"
+              className="text-xs font-mono-num text-stone-500 dark:text-stone-400 pb-2 sm:pb-0 whitespace-nowrap"
+            >
               {hasActiveFilter
                 ? `Showing ${filteredBooks.length} of ${books.length} ${
                     books.length === 1 ? 'book' : 'books'
                   }`
-                : `${books.length} ${books.length === 1 ? 'book' : 'books'} · most recent`}
+                : `${books.length} ${books.length === 1 ? 'book' : 'books'} · ${
+                    sortBy === 'title'
+                      ? 'sorted by title'
+                      : sortBy === 'author'
+                      ? 'sorted by author'
+                      : 'most recent'
+                  }`}
             </p>
           </div>
         )}
@@ -554,18 +587,14 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
               ? `No books match “${searchQuery.trim()}”`
               : activeFilter === 'bookmarked'
               ? 'No bookmarked books yet'
-              : activeFilter === 'listened'
-              ? 'No audiobook listening history yet'
-              : 'No offline-cached books match this filter yet'}
+              : 'No audiobook listening history yet'}
           </p>
           <p className="mt-1 text-xs text-stone-500 dark:text-stone-400">
             {hasQuery
               ? 'Try searching with a different title keyword, author name, or switch scope to Title & Author.'
               : activeFilter === 'bookmarked'
               ? 'Click the Bookmark button on any book in Discover, Library, or Reader to save it here.'
-              : activeFilter === 'listened'
-              ? 'Click Listen Now on any book — your exact page and sentence position will be saved automatically.'
-              : 'Click “Cache All Offline” below while online to save your library for offline reading.'}
+              : 'Click Listen Now on any book — your exact page and sentence position will be saved automatically.'}
           </p>
           <button
             type="button"
@@ -586,13 +615,8 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
           {filteredBooks.map((book) => {
             const isCurrent = book.id === activeBookId;
             const translatedCount = translatedCountsByBook[book.id] ?? 0;
-            const totalSavedTranslations =
-              allLangTranslationCountsByBook[book.id] ?? translatedCount;
             const isPreloaded = book.id === PRELOADED_OBS_BOOK_ID;
-            const offlineReady = isBookOfflineReady(book);
-            const isCachingThis = cachingBookId === book.id;
             const isDownloadingThis = downloadingBookId === book.id;
-            const unavailableOffline = !isOnline && !offlineReady;
             const hasAudioHistory =
               book.lastAudioPage !== undefined || book.lastSentenceIndex !== undefined;
             const audioResumePage = book.lastAudioPage ?? book.lastPage ?? 1;
@@ -716,47 +740,6 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                     </p>
                   )}
 
-                  {/* Per-book Offline Readiness Line */}
-                  <div className="mt-2 flex items-center justify-between gap-2 text-[11px]">
-                    {offlineReady ? (
-                      <span className="inline-flex items-center gap-1.5 text-emerald-800 dark:text-emerald-400 font-medium">
-                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                        <span>
-                          Available offline
-                          {totalSavedTranslations > 0
-                            ? ` · ${totalSavedTranslations} translated ${
-                                totalSavedTranslations === 1 ? 'page' : 'pages'
-                              }`
-                            : ''}
-                        </span>
-                      </span>
-                    ) : (
-                      <>
-                        <span className="inline-flex items-center gap-1.5 text-stone-500 dark:text-stone-400">
-                          <CloudDownload className="w-3.5 h-3.5 shrink-0" />
-                          <span>{isOnline ? 'Not yet cached offline' : 'Offline unavailable'}</span>
-                        </span>
-                        {isOnline && (
-                          <button
-                            type="button"
-                            disabled={isCachingThis || isSyncingAllOffline}
-                            onClick={() => onCacheBookOffline(book)}
-                            className="inline-flex items-center gap-1 font-medium text-amber-800 dark:text-amber-400 hover:underline disabled:opacity-50 cursor-pointer whitespace-nowrap"
-                          >
-                            {isCachingThis ? (
-                              <>
-                                <Loader2 className="w-3 h-3 animate-spin" />
-                                <span>Saving…</span>
-                              </>
-                            ) : (
-                              <span>Save Offline</span>
-                            )}
-                          </button>
-                        )}
-                      </>
-                    )}
-                  </div>
-
                   {/* Daily Reading Goal Circular Progress Ring + Book Reading Progress */}
                   {(() => {
                     const lastPg = Math.max(1, Math.min(book.numPages, book.lastPage || 1));
@@ -818,20 +801,13 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                     <div className="pt-3 border-t border-stone-200/80 sepia:border-[#DFD4BC] dark:border-stone-800/80 grid grid-cols-2 gap-2">
                       <button
                         type="button"
-                        disabled={unavailableOffline}
                         onClick={() => onSelectBook(book)}
-                        title={
-                          unavailableOffline
-                            ? 'Reconnect once and save this PDF offline to read without internet'
-                            : `Resume reading at Page ${book.lastPage || 1}`
-                        }
-                        className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 bg-stone-900 text-stone-50 hover:bg-stone-800 dark:bg-stone-100 dark:text-stone-950 dark:hover:bg-stone-200 disabled:opacity-45 disabled:cursor-not-allowed cursor-pointer whitespace-nowrap"
+                        title={`Resume reading at Page ${book.lastPage || 1}`}
+                        className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 bg-stone-900 text-stone-50 hover:bg-stone-800 dark:bg-stone-100 dark:text-stone-950 dark:hover:bg-stone-200 cursor-pointer whitespace-nowrap"
                       >
                         <BookOpen className="w-3.5 h-3.5" />
                         <span>
-                          {unavailableOffline
-                            ? 'Needs Internet'
-                            : isCurrent || (book.lastPage ?? 1) > 1
+                          {isCurrent || (book.lastPage ?? 1) > 1
                             ? `Continue p.${book.lastPage || 1}`
                             : 'Read Book'}
                         </span>
@@ -839,14 +815,13 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
                       <button
                         type="button"
-                        disabled={unavailableOffline}
                         onClick={() => onListenBook(book)}
                         title={
                           hasAudioHistory
                             ? `Continue listening from Page ${audioResumePage}, Line ${audioResumeLine}`
                             : 'Open and start audiobook narration'
                         }
-                        className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 bg-amber-700 hover:bg-amber-800 text-white disabled:opacity-45 disabled:cursor-not-allowed cursor-pointer whitespace-nowrap"
+                        className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 bg-amber-700 hover:bg-amber-800 text-white cursor-pointer whitespace-nowrap"
                       >
                         <Headphones className="w-3.5 h-3.5" />
                         <span>{hasAudioHistory ? 'Resume Audio' : 'Listen Now'}</span>
@@ -854,10 +829,9 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
                       <button
                         type="button"
-                        disabled={unavailableOffline}
                         onClick={() => onTranslateBook(book)}
                         title="Open in Reader and translate"
-                        className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 border border-stone-300 sepia:border-[#D4C7AA] dark:border-stone-700 text-stone-800 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 disabled:opacity-45 disabled:cursor-not-allowed cursor-pointer whitespace-nowrap"
+                        className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 border border-stone-300 sepia:border-[#D4C7AA] dark:border-stone-700 text-stone-800 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer whitespace-nowrap"
                       >
                         <Languages className="w-3.5 h-3.5" />
                         <span>Translate</span>
@@ -865,7 +839,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
                       <button
                         type="button"
-                        disabled={unavailableOffline || isDownloadingThis}
+                        disabled={isDownloadingThis}
                         onClick={() => onDownloadBook(book)}
                         title="Download this PDF to your device"
                         className="h-8 px-2.5 rounded text-xs font-medium inline-flex items-center justify-center gap-1.5 border border-stone-300 sepia:border-[#D4C7AA] dark:border-stone-700 text-stone-800 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 disabled:opacity-45 disabled:cursor-not-allowed cursor-pointer whitespace-nowrap"
@@ -913,10 +887,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
         />
         <Upload className="w-5 h-5 mx-auto text-amber-700 dark:text-amber-500" />
         <p className="mt-2.5 text-sm font-medium text-stone-900 sepia:text-[#2F241A] dark:text-stone-100">
-          Drop any illustrated technical guidebook or PDF here (works offline too)
+          Drop any PDF book in any language here to open directly
         </p>
         <p className="mt-1 text-xs text-stone-500 sepia:text-[#6E5A47] dark:text-stone-400">
-          Automatically saves the PDF, reading progress, audio position, chapters, and cover locally.
+          Reads every world language faithfully — Sanskrit, Hindi, Marathi, Urdu, Arabic, English, Chinese, Japanese, Russian &amp; more.
         </p>
         <button
           type="button"
@@ -924,65 +898,9 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
           onClick={() => fileInputRef.current?.click()}
           className="mt-3.5 inline-flex items-center gap-2 h-9 px-4 rounded-md text-sm font-medium bg-stone-900 text-stone-50 hover:bg-stone-800 dark:bg-stone-100 dark:text-stone-950 dark:hover:bg-stone-200 disabled:opacity-50 cursor-pointer"
         >
-          {isUploading ? 'Parsing PDF & Caching Offline…' : 'Choose PDF File'}
+          {isUploading ? 'Opening PDF…' : 'Choose PDF File'}
         </button>
       </div>
-
-      {/* Offline Service Worker & Local Cache Summary Strip */}
-      <section
-        aria-label="Offline cache status"
-        className="rounded-lg border border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-white sepia:bg-[#FBF6E9] dark:bg-[#191816] px-4 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
-      >
-        <div className="space-y-1 min-w-0">
-          <div className="flex items-center gap-2 text-xs font-medium text-stone-900 sepia:text-[#2F241A] dark:text-stone-100">
-            {!isOnline ? (
-              <WifiOff className="w-4 h-4 text-amber-700 dark:text-amber-500 shrink-0" />
-            ) : (
-              <HardDrive className="w-4 h-4 text-amber-700 dark:text-amber-500 shrink-0" />
-            )}
-            <span className="truncate">{swStatusLabel}</span>
-          </div>
-          <p className="text-xs font-mono-num text-stone-500 sepia:text-[#6E5A47] dark:text-stone-400 pl-6">
-            {offlineReadyCount} / {books.length} {books.length === 1 ? 'PDF' : 'PDFs'} cached
-            offline · {bookmarkedCount} bookmarked · {totalCachedTranslations} translated{' '}
-            {totalCachedTranslations === 1 ? 'page' : 'pages'} saved
-            {storageUsageBytes !== null ? ` · ${formatStorageBytes(storageUsageBytes)} local storage` : ''}
-          </p>
-        </div>
-
-        <div className="flex items-center gap-2 shrink-0 pl-6 sm:pl-0">
-          <button
-            type="button"
-            disabled={!isOnline || isSyncingAllOffline || books.length === 0}
-            onClick={onSyncAllOffline}
-            title={
-              !isOnline
-                ? 'Reconnect to cache additional books offline'
-                : uncachedCount > 0
-                ? `Download and cache ${uncachedCount} remaining book(s) plus PDF viewer fonts for offline reading`
-                : 'Verify offline cache and pre-warm PDF.js fonts for offline reading'
-            }
-            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-md border border-stone-300 sepia:border-[#D4C6AA] dark:border-stone-700 bg-[#FAF9F5] sepia:bg-[#F4ECD8] dark:bg-[#22211E] hover:bg-stone-100 dark:hover:bg-stone-800 text-xs font-medium text-stone-800 sepia:text-[#3B2F23] dark:text-stone-200 disabled:opacity-45 disabled:cursor-not-allowed cursor-pointer whitespace-nowrap transition-colors"
-          >
-            {isSyncingAllOffline ? (
-              <>
-                <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-700 dark:text-amber-500" />
-                <span>Caching Library…</span>
-              </>
-            ) : uncachedCount > 0 ? (
-              <>
-                <CloudDownload className="w-3.5 h-3.5 text-amber-700 dark:text-amber-500" />
-                <span>Cache All Offline ({uncachedCount})</span>
-              </>
-            ) : (
-              <>
-                <RefreshCw className="w-3.5 h-3.5 text-amber-700 dark:text-amber-500" />
-                <span>Verify Offline Cache</span>
-              </>
-            )}
-          </button>
-        </div>
-      </section>
     </main>
   );
 };

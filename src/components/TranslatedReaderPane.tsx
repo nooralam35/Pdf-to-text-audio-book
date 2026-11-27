@@ -3,19 +3,25 @@ import {
   ArrowRight,
   BookOpen,
   Check,
+  ChevronDown,
+  ChevronUp,
+  Clock,
   Copy,
   Download,
   Edit3,
   Eye,
   EyeOff,
   FileText,
+  Gauge,
   Highlighter,
   Image as ImageIcon,
   Languages,
   Loader2,
   LocateFixed,
   RefreshCw,
+  RotateCcw,
   ScanText,
+  Search,
   Share2,
   Sparkles,
   StickyNote,
@@ -24,10 +30,23 @@ import {
   X,
 } from 'lucide-react';
 import {
+  findSearchRangesInText,
+  searchEntireBook,
+  type BookSearchMatch,
+  type BookSearchProgress,
+  type BookSearchScope,
+} from '../lib/bookSearch';
+import {
   detectTextLanguageCode,
   getLanguageOption,
   isTextPredominantlyRtl,
 } from '../lib/languages';
+import type { LoadedPdf } from '../lib/pdfEngine';
+import {
+  formatReadingDuration,
+  type ChapterReadingEstimate,
+  type ReadingSpeedSnapshot,
+} from '../lib/readingSpeed';
 import { lookupDictionaryTerm } from '../lib/translatorClient';
 import type {
   ChapterItem,
@@ -82,6 +101,14 @@ interface TranslatedReaderPaneProps {
   onOpenShareStudio?: () => void;
   onRunOcr?: () => void;
   isRunningOcr?: boolean;
+  readingSpeed?: ReadingSpeedSnapshot;
+  chapterReadingEstimate?: ChapterReadingEstimate | null;
+  onResetReadingSpeed?: () => void;
+  bookId?: string;
+  pdf?: LoadedPdf | null;
+  chapters?: ChapterItem[];
+  bookTranslations?: TranslatedPageRecord[];
+  onSelectPage?: (page: number) => void;
 }
 
 type StreamItem =
@@ -241,6 +268,14 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
   onOpenShareStudio,
   onRunOcr,
   isRunningOcr = false,
+  readingSpeed,
+  chapterReadingEstimate = null,
+  onResetReadingSpeed,
+  bookId,
+  pdf = null,
+  chapters = [],
+  bookTranslations = [],
+  onSelectPage,
 }) => {
   const [editingBlockId, setEditingBlockId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState('');
@@ -268,6 +303,27 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
   const reachedKeyRef = useRef<string | null>(null);
   const onReachPageEndRef = useRef(onReachPageEnd);
   onReachPageEndRef.current = onReachPageEnd;
+
+  // Global full-book search state
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchScope, setSearchScope] = useState<BookSearchScope>('all');
+  const [searchCaseSensitive, setSearchCaseSensitive] = useState(false);
+  const [searchResultsOpen, setSearchResultsOpen] = useState(true);
+  const [isSearchingBook, setIsSearchingBook] = useState(false);
+  const [searchProgress, setSearchProgress] = useState<BookSearchProgress | null>(null);
+  const [searchMatches, setSearchMatches] = useState<BookSearchMatch[]>([]);
+  const [searchTruncated, setSearchTruncated] = useState(false);
+  const [activeMatchIdx, setActiveMatchIdx] = useState(-1);
+  const [pendingScrollMatch, setPendingScrollMatch] = useState<{
+    pageNumber: number;
+    source: 'translated' | 'original';
+    matchIndexOnPage: number;
+  } | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const searchAbortRef = useRef<AbortController | null>(null);
+  const pageNumberRef = useRef(pageNumber);
+  pageNumberRef.current = pageNumber;
 
   useEffect(() => {
     try {
@@ -325,6 +381,266 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
       scrollContainerRef.current.scrollTop = 0;
     }
   }, [pageNumber, targetLang, closePopover]);
+
+  // Clear book-wide search state when switching to a different book
+  useEffect(() => {
+    searchAbortRef.current?.abort();
+    searchAbortRef.current = null;
+    setSearchQuery('');
+    setSearchMatches([]);
+    setSearchProgress(null);
+    setSearchTruncated(false);
+    setIsSearchingBook(false);
+    setActiveMatchIdx(-1);
+    setPendingScrollMatch(null);
+  }, [bookId]);
+
+  // Open search bar on Ctrl+F / Cmd+F while reading
+  useEffect(() => {
+    const handleGlobalFind = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        setSearchOpen(true);
+        setSearchResultsOpen(true);
+        window.setTimeout(() => {
+          searchInputRef.current?.focus();
+          searchInputRef.current?.select();
+        }, 20);
+      }
+    };
+    window.addEventListener('keydown', handleGlobalFind);
+    return () => window.removeEventListener('keydown', handleGlobalFind);
+  }, []);
+
+  // Debounced, cancellable full-book search across all pages
+  useEffect(() => {
+    const trimmed = searchQuery.trim();
+    searchAbortRef.current?.abort();
+    searchAbortRef.current = null;
+
+    if (!trimmed || !bookId) {
+      setSearchMatches([]);
+      setSearchProgress(null);
+      setSearchTruncated(false);
+      setIsSearchingBook(false);
+      setActiveMatchIdx(-1);
+      return;
+    }
+
+    const controller = new AbortController();
+    searchAbortRef.current = controller;
+    setIsSearchingBook(true);
+
+    const timer = window.setTimeout(async () => {
+      try {
+        const result = await searchEntireBook({
+          bookId,
+          numPages,
+          pdf,
+          chapters,
+          bookTranslations,
+          currentParsedPage: parsedPage,
+          query: trimmed,
+          scope: searchScope,
+          caseSensitive: searchCaseSensitive,
+          signal: controller.signal,
+          onProgress: (prog, partial) => {
+            if (controller.signal.aborted) return;
+            setSearchProgress(prog);
+            setSearchMatches(partial);
+          },
+        });
+        if (controller.signal.aborted) return;
+        setSearchMatches(result.matches);
+        setSearchTruncated(result.truncated);
+        setSearchProgress({
+          scannedPages: numPages,
+          totalPages: numPages,
+          matchesFound: result.matches.length,
+        });
+        setActiveMatchIdx((prev) => {
+          if (result.matches.length === 0) return -1;
+          if (prev >= 0 && prev < result.matches.length) return prev;
+          const onCurrentPageIdx = result.matches.findIndex(
+            (m) => m.pageNumber === pageNumberRef.current
+          );
+          return onCurrentPageIdx >= 0 ? onCurrentPageIdx : 0;
+        });
+      } catch {
+        // Ignore aborted or transient search errors
+      } finally {
+        if (!controller.signal.aborted) {
+          setIsSearchingBook(false);
+        }
+      }
+    }, 180);
+
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [
+    searchQuery,
+    searchScope,
+    searchCaseSensitive,
+    bookId,
+    numPages,
+    pdf,
+    chapters,
+    bookTranslations,
+    parsedPage,
+  ]);
+
+  const activeSearchQuery = searchOpen ? searchQuery.trim() : '';
+  const activeSearchMatch =
+    activeMatchIdx >= 0 && activeMatchIdx < searchMatches.length
+      ? searchMatches[activeMatchIdx]
+      : null;
+
+  const jumpToSearchMatch = useCallback(
+    (index: number) => {
+      if (searchMatches.length === 0) return;
+      const wrapped =
+        ((index % searchMatches.length) + searchMatches.length) % searchMatches.length;
+      const target = searchMatches[wrapped];
+      if (!target) return;
+
+      setActiveMatchIdx(wrapped);
+      setPendingScrollMatch({
+        pageNumber: target.pageNumber,
+        source: target.source,
+        matchIndexOnPage: target.matchIndexOnPage,
+      });
+
+      if (target.source === 'original') {
+        setShowOriginalRef(true);
+      }
+
+      if (target.pageNumber !== pageNumber && onSelectPage) {
+        onSelectPage(target.pageNumber);
+      }
+    },
+    [searchMatches, pageNumber, onSelectPage]
+  );
+
+  // Smoothly scroll to the exact highlighted occurrence once the target page renders
+  useEffect(() => {
+    if (!pendingScrollMatch || pendingScrollMatch.pageNumber !== pageNumber) return;
+    if (!activeSearchQuery) {
+      setPendingScrollMatch(null);
+      return;
+    }
+
+    let frame2 = 0;
+    const frame1 = window.requestAnimationFrame(() => {
+      frame2 = window.requestAnimationFrame(() => {
+        const container = scrollContainerRef.current;
+        if (!container) return;
+
+        const exactEl = container.querySelector<HTMLElement>(
+          `mark[data-search-match="true"][data-search-source="${pendingScrollMatch.source}"][data-search-page-idx="${pendingScrollMatch.matchIndexOnPage}"]`
+        );
+        const fallbackEl =
+          exactEl ??
+          container.querySelector<HTMLElement>('mark[data-search-match="true"]');
+
+        if (fallbackEl) {
+          fallbackEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          setPendingScrollMatch(null);
+        }
+      });
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frame1);
+      if (frame2) window.cancelAnimationFrame(frame2);
+    };
+  }, [
+    pendingScrollMatch,
+    pageNumber,
+    translatedPage,
+    parsedPage,
+    showOriginalRef,
+    activeSearchQuery,
+  ]);
+
+  // Precompute per-block search match ranges on the current page in exact reading order
+  const currentPageSearchRanges = useMemo(() => {
+    type IndexedRange = { start: number; end: number; pageMatchIdx: number };
+    const translatedByBlock = new Map<string, IndexedRange[]>();
+    const originalByBlock = new Map<string, IndexedRange[]>();
+    const untranslatedByBlock = new Map<string, IndexedRange[]>();
+
+    if (!activeSearchQuery) {
+      return {
+        translatedByBlock,
+        originalByBlock,
+        untranslatedByBlock,
+        hasUntranslatedMatches: false,
+      };
+    }
+
+    if (translatedPage) {
+      if (searchScope === 'all' || searchScope === 'translated') {
+        let trCounter = 0;
+        for (const blk of translatedPage.blocks) {
+          const textVal = blk.translatedText || blk.text || '';
+          const ranges = findSearchRangesInText(textVal, activeSearchQuery, searchCaseSensitive);
+          if (ranges.length > 0) {
+            translatedByBlock.set(
+              blk.id,
+              ranges.map((r) => ({ ...r, pageMatchIdx: trCounter++ }))
+            );
+          }
+        }
+        translatedPage.imageExplanations.forEach((exp, idx) => {
+          const ranges = findSearchRangesInText(exp, activeSearchQuery, searchCaseSensitive);
+          if (ranges.length > 0) {
+            translatedByBlock.set(
+              `img-exp-${idx}`,
+              ranges.map((r) => ({ ...r, pageMatchIdx: trCounter++ }))
+            );
+          }
+        });
+      }
+
+      if (searchScope === 'all' || searchScope === 'original') {
+        let origCounter = 0;
+        for (const blk of translatedPage.blocks) {
+          const origVal = blk.text || '';
+          const ranges = findSearchRangesInText(origVal, activeSearchQuery, searchCaseSensitive);
+          if (ranges.length > 0) {
+            originalByBlock.set(
+              blk.id,
+              ranges.map((r) => ({ ...r, pageMatchIdx: origCounter++ }))
+            );
+          }
+        }
+      }
+    }
+
+    let hasUntranslatedMatches = false;
+    if (parsedPage && (searchScope === 'all' || searchScope === 'original')) {
+      let unCounter = 0;
+      for (const blk of parsedPage.blocks) {
+        const ranges = findSearchRangesInText(blk.text || '', activeSearchQuery, searchCaseSensitive);
+        if (ranges.length > 0) {
+          hasUntranslatedMatches = true;
+          untranslatedByBlock.set(
+            blk.id,
+            ranges.map((r) => ({ ...r, pageMatchIdx: unCounter++ }))
+          );
+        }
+      }
+    }
+
+    return {
+      translatedByBlock,
+      originalByBlock,
+      untranslatedByBlock,
+      hasUntranslatedMatches,
+    };
+  }, [activeSearchQuery, searchCaseSensitive, searchScope, translatedPage, parsedPage]);
 
   // Reset user scroll pause when audiobook stops playing
   useEffect(() => {
@@ -855,28 +1171,80 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
     setEditDraft('');
   };
 
-  // Render a text slice interleaved with any overlapping saved TextHighlights
+  // Render plain text with inline global-search highlights (used for original reference & untranslated previews)
+  const renderPlainSearchHighlights = (
+    text: string,
+    ranges: Array<{ start: number; end: number; pageMatchIdx: number }>,
+    source: 'translated' | 'original'
+  ): React.ReactNode => {
+    if (!ranges || ranges.length === 0 || !text) return text;
+    const nodes: React.ReactNode[] = [];
+    let cursor = 0;
+    for (const r of ranges) {
+      const start = Math.max(cursor, Math.min(r.start, text.length));
+      const end = Math.max(start, Math.min(r.end, text.length));
+      if (start > cursor) {
+        nodes.push(<React.Fragment key={`pt-${cursor}`}>{text.slice(cursor, start)}</React.Fragment>);
+      }
+      if (end > start) {
+        const isCurrentFocused =
+          Boolean(activeSearchMatch) &&
+          activeSearchMatch!.pageNumber === pageNumber &&
+          activeSearchMatch!.source === source &&
+          activeSearchMatch!.matchIndexOnPage === r.pageMatchIdx;
+        nodes.push(
+          <mark
+            key={`ps-${source}-${r.pageMatchIdx}-${start}`}
+            data-search-match="true"
+            data-search-source={source}
+            data-search-page-idx={r.pageMatchIdx}
+            className={
+              isCurrentFocused
+                ? 'bg-orange-400/95 dark:bg-orange-500/85 text-stone-950 dark:text-white ring-2 ring-orange-500/75 dark:ring-orange-300/80 rounded-[2px] px-[1px] font-medium'
+                : 'bg-yellow-300/90 dark:bg-yellow-500/45 text-stone-950 dark:text-yellow-50 rounded-[2px] px-[1px]'
+            }
+          >
+            {text.slice(start, end)}
+          </mark>
+        );
+      }
+      cursor = end;
+    }
+    if (cursor < text.length) {
+      nodes.push(<React.Fragment key={`pt-end-${cursor}`}>{text.slice(cursor)}</React.Fragment>);
+    }
+    return nodes;
+  };
+
+  // Render a text slice interleaved with both saved TextHighlights and active book-search matches
   const renderHighlightedSlice = (
     text: string,
     baseOffset: number,
-    blockHighlights: TextHighlight[]
+    blockHighlights: TextHighlight[],
+    blockSearchRanges: Array<{ start: number; end: number; pageMatchIdx: number }> = []
   ): React.ReactNode => {
-    if (blockHighlights.length === 0 || text.length === 0) {
-      return text;
-    }
+    if (text.length === 0) return text;
 
     const sliceEnd = baseOffset + text.length;
-    const overlapping = blockHighlights.filter(
+    const overlappingHighlights = blockHighlights.filter(
       (h) => h.endOffset > baseOffset && h.startOffset < sliceEnd
     );
-    if (overlapping.length === 0) {
+    const overlappingSearch = blockSearchRanges.filter(
+      (r) => r.end > baseOffset && r.start < sliceEnd
+    );
+
+    if (overlappingHighlights.length === 0 && overlappingSearch.length === 0) {
       return text;
     }
 
     const cutPoints = new Set<number>([baseOffset, sliceEnd]);
-    for (const hl of overlapping) {
+    for (const hl of overlappingHighlights) {
       cutPoints.add(Math.max(baseOffset, hl.startOffset));
       cutPoints.add(Math.min(sliceEnd, hl.endOffset));
+    }
+    for (const sr of overlappingSearch) {
+      cutPoints.add(Math.max(baseOffset, sr.start));
+      cutPoints.add(Math.min(sliceEnd, sr.end));
     }
     const sortedPoints = Array.from(cutPoints).sort((a, b) => a - b);
 
@@ -887,9 +1255,10 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
       if (segEnd <= segStart) continue;
 
       const segmentText = text.slice(segStart - baseOffset, segEnd - baseOffset);
-      // If multiple highlights overlap, prefer the most recently updated one
+
+      // Check overlapping saved user highlight (prefer most recently updated)
       let covering: TextHighlight | null = null;
-      for (const hl of overlapping) {
+      for (const hl of overlappingHighlights) {
         if (hl.startOffset <= segStart && hl.endOffset >= segEnd) {
           if (!covering || hl.updatedAt >= covering.updatedAt) {
             covering = hl;
@@ -897,8 +1266,41 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
         }
       }
 
+      // Check overlapping global-search match
+      let coveringSearch: { start: number; end: number; pageMatchIdx: number } | null = null;
+      for (const sr of overlappingSearch) {
+        if (sr.start <= segStart && sr.end >= segEnd) {
+          coveringSearch = sr;
+          break;
+        }
+      }
+
+      let innerNode: React.ReactNode = segmentText;
+      if (coveringSearch) {
+        const isCurrentFocused =
+          Boolean(activeSearchMatch) &&
+          activeSearchMatch!.pageNumber === pageNumber &&
+          activeSearchMatch!.source === 'translated' &&
+          activeSearchMatch!.matchIndexOnPage === coveringSearch.pageMatchIdx;
+        innerNode = (
+          <mark
+            key={`sm-${coveringSearch.pageMatchIdx}-${segStart}`}
+            data-search-match="true"
+            data-search-source="translated"
+            data-search-page-idx={coveringSearch.pageMatchIdx}
+            className={
+              isCurrentFocused
+                ? 'bg-orange-400/95 dark:bg-orange-500/85 text-stone-950 dark:text-white ring-2 ring-orange-500/75 dark:ring-orange-300/80 rounded-[2px] px-[0.5px] font-medium'
+                : 'bg-yellow-300/90 dark:bg-yellow-500/45 text-stone-950 dark:text-yellow-50 rounded-[2px] px-[0.5px]'
+            }
+          >
+            {segmentText}
+          </mark>
+        );
+      }
+
       if (!covering) {
-        nodes.push(<React.Fragment key={`t-${segStart}`}>{segmentText}</React.Fragment>);
+        nodes.push(<React.Fragment key={`t-${segStart}`}>{innerNode}</React.Fragment>);
       } else {
         const hl = covering;
         const style = HIGHLIGHT_STYLE_MAP[hl.color] ?? HIGHLIGHT_STYLE_MAP.amber;
@@ -926,7 +1328,7 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
                 : ''
             }`}
           >
-            {segmentText}
+            {innerNode}
           </mark>
         );
       }
@@ -938,9 +1340,14 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
   const renderClickableSentences = (blockId: string, fallbackText: string) => {
     const spans = sentencesByBlock.get(blockId);
     const blockHighlights = highlightsByBlock.get(blockId) ?? [];
+    const blockSearchRanges = currentPageSearchRanges.translatedByBlock.get(blockId) ?? [];
 
     if (!spans || spans.length === 0) {
-      return <span>{renderHighlightedSlice(fallbackText, 0, blockHighlights)}</span>;
+      return (
+        <span>
+          {renderHighlightedSlice(fallbackText, 0, blockHighlights, blockSearchRanges)}
+        </span>
+      );
     }
 
     let cursor = 0;
@@ -952,7 +1359,7 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
       const isActive = activeSentenceIndex === span.globalIndex;
       const spaceSep =
         idx < spans.length - 1
-          ? renderHighlightedSlice(' ', spanEnd, blockHighlights)
+          ? renderHighlightedSlice(' ', spanEnd, blockHighlights, blockSearchRanges)
           : null;
 
       return (
@@ -974,7 +1381,7 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
                 : 'hover:bg-stone-200/60 dark:hover:bg-stone-800/70'
             }`}
           >
-            {renderHighlightedSlice(span.text, spanStart, blockHighlights)}
+            {renderHighlightedSlice(span.text, spanStart, blockHighlights, blockSearchRanges)}
           </span>
           {spaceSep}
         </React.Fragment>
@@ -1001,6 +1408,38 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
+          <button
+            type="button"
+            onClick={() => {
+              setSearchOpen((prev) => {
+                const next = !prev;
+                if (next) {
+                  setSearchResultsOpen(true);
+                  window.setTimeout(() => {
+                    searchInputRef.current?.focus();
+                    searchInputRef.current?.select();
+                  }, 20);
+                }
+                return next;
+              });
+            }}
+            aria-expanded={searchOpen}
+            className={`inline-flex items-center gap-1.5 h-7 px-2 rounded text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
+              searchOpen || activeSearchQuery
+                ? 'bg-amber-100/90 sepia:bg-[#E7D8B6] dark:bg-amber-950/60 text-amber-900 sepia:text-[#6B3A10] dark:text-amber-300'
+                : 'text-stone-600 dark:text-stone-300 hover:bg-stone-200/70 dark:hover:bg-stone-800'
+            }`}
+            title="Search terms or phrases across all pages of this book (Ctrl+F)"
+          >
+            <Search className="w-3.5 h-3.5" />
+            <span className="hidden lg:inline">Search</span>
+            {activeSearchQuery && searchMatches.length > 0 && (
+              <span className="font-mono-num text-[10px] px-1 rounded bg-amber-700/15 dark:bg-amber-500/20">
+                {searchMatches.length}
+              </span>
+            )}
+          </button>
+
           {onSummarizeCurrentChapter && (
             <button
               type="button"
@@ -1129,6 +1568,305 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
           )}
         </div>
       </div>
+
+      {/* Reading Pace & Chapter Time-to-Finish Strip */}
+      {readingSpeed && (
+        <div
+          dir="ltr"
+          className="px-3 sm:px-4 min-h-[32px] py-1 border-b border-stone-200/80 sepia:border-[#DFD4BC] dark:border-stone-800/80 bg-[#F5F3EE]/85 sepia:bg-[#F1E8D2]/90 dark:bg-[#11100F] flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-[11px] text-stone-600 sepia:text-[#5B4B3A] dark:text-stone-400 shrink-0"
+        >
+          <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 min-w-0">
+            <span
+              className="inline-flex items-center gap-1.5 font-medium text-stone-700 sepia:text-[#443527] dark:text-stone-200 whitespace-nowrap"
+              title={
+                readingSpeed.isMeasured
+                  ? `Personal average calculated from your last ${readingSpeed.sampleCount} timed ${
+                      readingSpeed.sampleCount === 1 ? 'page turn' : 'page turns'
+                    }${
+                      readingSpeed.lastPageWpm
+                        ? ` (last page: ${readingSpeed.lastPageWpm} WPM)`
+                        : ''
+                    }`
+                  : 'Default estimate — turns into your personal reading speed automatically as you turn pages'
+              }
+            >
+              <Gauge className="w-3.5 h-3.5 text-amber-700 dark:text-amber-500 shrink-0" />
+              <span className="font-mono-num">
+                {readingSpeed.isMeasured ? '' : '~'}
+                {readingSpeed.averageWpm} WPM
+              </span>
+              <span className="text-stone-500 sepia:text-[#6E5C49] dark:text-stone-400 font-normal">
+                {readingSpeed.isMeasured
+                  ? `(${readingSpeed.sampleCount} ${
+                      readingSpeed.sampleCount === 1 ? 'page' : 'pages'
+                    })`
+                  : '(est.)'}
+              </span>
+            </span>
+
+            {chapterReadingEstimate && (
+              <>
+                <span className="text-stone-300 dark:text-stone-700 select-none">·</span>
+                <span
+                  className="inline-flex items-center gap-1.5 whitespace-nowrap"
+                  title={`Estimated time to finish "${chapterReadingEstimate.chapterTitle}" (${chapterReadingEstimate.remainingPages} of ${chapterReadingEstimate.totalPages} pages left, ~${chapterReadingEstimate.remainingWords.toLocaleString()} words at ${readingSpeed.averageWpm} WPM)`}
+                >
+                  <Clock className="w-3.5 h-3.5 text-stone-500 dark:text-stone-400 shrink-0" />
+                  <span className="font-medium text-stone-800 sepia:text-[#3B2F23] dark:text-stone-200 font-mono-num">
+                    ~{formatReadingDuration(chapterReadingEstimate.remainingMinutes)}
+                  </span>
+                  <span>left in chapter</span>
+                  <span className="hidden sm:inline text-stone-400 dark:text-stone-500 font-mono-num">
+                    ({chapterReadingEstimate.remainingPages}p)
+                  </span>
+                </span>
+              </>
+            )}
+
+            {!readingSpeed.isMeasured && (
+              <span className="hidden xl:inline text-stone-400 dark:text-stone-500 truncate">
+                · Turn pages to calibrate your pace
+              </span>
+            )}
+          </div>
+
+          {readingSpeed.isMeasured && onResetReadingSpeed && (
+            <button
+              type="button"
+              onClick={onResetReadingSpeed}
+              className="inline-flex items-center gap-1 text-[11px] text-stone-500 hover:text-stone-800 dark:text-stone-400 dark:hover:text-stone-200 transition-colors cursor-pointer shrink-0"
+              title="Reset recorded reading speed history"
+            >
+              <RotateCcw className="w-3 h-3" />
+              <span className="hidden sm:inline">Reset pace</span>
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Global Book-Wide Search Panel */}
+      {searchOpen && (
+        <div
+          dir="ltr"
+          className="border-b border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-white sepia:bg-[#FBF6E9] dark:bg-[#171614] shrink-0"
+        >
+          {/* Search Input & Controls Row */}
+          <div className="px-3 sm:px-4 py-2 flex flex-wrap items-center gap-2">
+            <div className="relative flex-1 min-w-[180px]">
+              <Search className="w-3.5 h-3.5 text-stone-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <input
+                ref={searchInputRef}
+                type="text"
+                value={searchQuery}
+                onChange={(e) => {
+                  setSearchQuery(e.target.value);
+                  setSearchResultsOpen(true);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    if (searchMatches.length > 0) {
+                      jumpToSearchMatch(
+                        e.shiftKey
+                          ? activeMatchIdx <= 0
+                            ? searchMatches.length - 1
+                            : activeMatchIdx - 1
+                          : activeMatchIdx + 1
+                      );
+                    }
+                  } else if (e.key === 'Escape') {
+                    e.preventDefault();
+                    setSearchOpen(false);
+                  }
+                }}
+                placeholder={`Search across all ${numPages} pages…`}
+                aria-label="Search across all pages of this book"
+                className="w-full h-8 pl-8 pr-7 rounded-md border border-stone-300 sepia:border-[#D4C7AA] dark:border-stone-700 bg-[#FAF9F5] sepia:bg-[#F5EEDB] dark:bg-[#100F0E] text-xs text-stone-900 dark:text-stone-100 placeholder:text-stone-400 focus:outline-none focus:border-amber-700 dark:focus:border-amber-500"
+              />
+              {searchQuery && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSearchQuery('');
+                    searchInputRef.current?.focus();
+                  }}
+                  aria-label="Clear search"
+                  className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 text-stone-400 hover:text-stone-700 dark:hover:text-stone-200 cursor-pointer"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+
+            {/* Scope Filter: All / Translated / Original */}
+            <div className="inline-flex items-center rounded-md border border-stone-200 sepia:border-[#D4C7AA] dark:border-stone-700 bg-stone-100/70 sepia:bg-[#EFE5CE] dark:bg-[#11100F] p-0.5 text-[11px]">
+              {(
+                [
+                  { id: 'all', label: 'All' },
+                  { id: 'translated', label: 'Translated' },
+                  { id: 'original', label: 'Original' },
+                ] as { id: BookSearchScope; label: string }[]
+              ).map((opt) => (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => setSearchScope(opt.id)}
+                  className={`h-6 px-2 rounded transition-colors cursor-pointer ${
+                    searchScope === opt.id
+                      ? 'bg-stone-900 text-stone-50 dark:bg-stone-100 dark:text-stone-950 font-medium'
+                      : 'text-stone-600 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-200'
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+
+            {/* Case Sensitivity Toggle */}
+            <button
+              type="button"
+              onClick={() => setSearchCaseSensitive((v) => !v)}
+              aria-pressed={searchCaseSensitive}
+              title="Match case"
+              className={`h-7 px-2 rounded border text-[11px] font-mono font-semibold transition-colors cursor-pointer ${
+                searchCaseSensitive
+                  ? 'border-amber-700 bg-amber-100/90 dark:bg-amber-950/60 text-amber-900 dark:text-amber-300'
+                  : 'border-stone-200 dark:border-stone-700 text-stone-500 dark:text-stone-400 hover:text-stone-800 dark:hover:text-stone-200'
+              }`}
+            >
+              Aa
+            </button>
+
+            {/* Match Counter + Prev / Next Navigation */}
+            <div className="flex items-center gap-1 shrink-0">
+              <span className="text-[11px] font-mono-num text-stone-500 dark:text-stone-400 min-w-[54px] text-right pr-1">
+                {isSearchingBook && searchProgress ? (
+                  <span className="inline-flex items-center gap-1">
+                    <Loader2 className="w-3 h-3 animate-spin text-amber-700" />
+                    {searchProgress.scannedPages}/{searchProgress.totalPages}
+                  </span>
+                ) : activeSearchQuery ? (
+                  searchMatches.length > 0 ? (
+                    `${activeMatchIdx >= 0 ? activeMatchIdx + 1 : 1}/${searchMatches.length}${
+                      searchTruncated ? '+' : ''
+                    }`
+                  ) : (
+                    '0 hits'
+                  )
+                ) : (
+                  ''
+                )}
+              </span>
+
+              <button
+                type="button"
+                disabled={searchMatches.length === 0}
+                onClick={() =>
+                  jumpToSearchMatch(
+                    activeMatchIdx <= 0 ? searchMatches.length - 1 : activeMatchIdx - 1
+                  )
+                }
+                aria-label="Previous match"
+                title="Previous occurrence (Shift+Enter)"
+                className="h-7 w-7 inline-flex items-center justify-center rounded border border-stone-200 dark:border-stone-700 text-stone-600 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800 disabled:opacity-35 cursor-pointer"
+              >
+                <ChevronUp className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                disabled={searchMatches.length === 0}
+                onClick={() => jumpToSearchMatch(activeMatchIdx + 1)}
+                aria-label="Next match"
+                title="Next occurrence (Enter)"
+                className="h-7 w-7 inline-flex items-center justify-center rounded border border-stone-200 dark:border-stone-700 text-stone-600 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800 disabled:opacity-35 cursor-pointer"
+              >
+                <ChevronDown className="w-3.5 h-3.5" />
+              </button>
+
+              {activeSearchQuery && searchMatches.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setSearchResultsOpen((v) => !v)}
+                  className="h-7 px-2 rounded text-[11px] font-medium text-stone-600 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer whitespace-nowrap"
+                  title={searchResultsOpen ? 'Hide results list' : 'Show results list'}
+                >
+                  {searchResultsOpen ? 'Hide list' : 'Show list'}
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={() => setSearchOpen(false)}
+                aria-label="Close book search"
+                title="Close search (Esc)"
+                className="h-7 w-7 inline-flex items-center justify-center rounded text-stone-500 hover:text-stone-900 dark:text-stone-400 dark:hover:text-stone-100 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+
+          {/* Scrollable Global Results List */}
+          {activeSearchQuery && searchResultsOpen && (
+            <div className="border-t border-stone-200/80 sepia:border-[#DFD4BC] dark:border-stone-800 max-h-56 overflow-y-auto divide-y divide-stone-100 sepia:divide-[#E6DCC3] dark:divide-stone-800/70">
+              {searchMatches.length === 0 ? (
+                <div className="px-4 py-4 text-xs text-stone-500 dark:text-stone-400 text-center">
+                  {isSearchingBook
+                    ? `Scanning book pages (${searchProgress?.scannedPages ?? 0}/${numPages})…`
+                    : `No matches found for "${activeSearchQuery}" across all ${numPages} pages.`}
+                </div>
+              ) : (
+                searchMatches.map((m, idx) => {
+                  const isFocused = idx === activeMatchIdx;
+                  const isCurrentPg = m.pageNumber === pageNumber;
+                  return (
+                    <button
+                      key={m.id}
+                      type="button"
+                      onClick={() => jumpToSearchMatch(idx)}
+                      className={`w-full px-3 sm:px-4 py-2 text-left transition-colors cursor-pointer flex items-start gap-2.5 ${
+                        isFocused
+                          ? 'bg-amber-50/90 sepia:bg-[#EFE2C1] dark:bg-amber-950/35'
+                          : 'hover:bg-stone-50 sepia:hover:bg-[#F4EBD4] dark:hover:bg-[#1E1D1B]'
+                      }`}
+                    >
+                      <span
+                        className={`mt-0.5 shrink-0 font-mono-num text-[11px] font-semibold px-1.5 py-0.5 rounded ${
+                          isFocused
+                            ? 'bg-amber-700 text-white'
+                            : isCurrentPg
+                            ? 'bg-amber-100 dark:bg-amber-900/50 text-amber-900 dark:text-amber-300'
+                            : 'bg-stone-100 dark:bg-stone-800 text-stone-700 dark:text-stone-300'
+                        }`}
+                      >
+                        p.{m.pageNumber}
+                      </span>
+
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5 text-[10px] text-stone-500 dark:text-stone-400">
+                          {m.chapterTitle && (
+                            <span className="truncate font-medium">{m.chapterTitle}</span>
+                          )}
+                          <span className="shrink-0 uppercase tracking-wider px-1 py-0.2 rounded bg-stone-100 dark:bg-stone-800 text-stone-500 dark:text-stone-400">
+                            {m.source === 'translated' ? langOption.name : 'Original'}
+                          </span>
+                        </div>
+                        <p className="mt-0.5 text-xs leading-relaxed text-stone-700 dark:text-stone-300 break-words">
+                          <span>{m.snippetBefore}</span>
+                          <mark className="bg-yellow-300/90 dark:bg-yellow-500/50 text-stone-950 dark:text-yellow-50 rounded-[2px] px-0.5 font-medium">
+                            {m.matchedText}
+                          </mark>
+                          <span>{m.snippetAfter}</span>
+                        </p>
+                      </div>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Main Editorial Reading Surface */}
       <div
@@ -1577,21 +2315,43 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
                   </p>
                 )}
 
-                {/* Brief raw extracted preview */}
+                {/* Brief raw extracted preview (expands to show highlighted matches when searching an untranslated page) */}
                 {parsedPage && parsedPage.blocks.length > 0 && (
                   <div className="mt-7 pt-5 border-t border-stone-200 dark:border-stone-800">
                     <p className="text-[11px] uppercase tracking-wider font-medium text-stone-400 dark:text-stone-500">
                       Extracted Original Book Text ({sourceScriptInfo.name})
+                      {currentPageSearchRanges.hasUntranslatedMatches && (
+                        <span className="ml-2 normal-case tracking-normal text-amber-700 dark:text-amber-400 font-semibold">
+                          · Search matches highlighted below
+                        </span>
+                      )}
                     </p>
-                    <p
-                      dir={sourceScriptInfo.rtl ? 'rtl' : 'ltr'}
-                      className={`mt-2 text-sm text-stone-600 dark:text-stone-400 leading-relaxed line-clamp-5 ${sourceScriptInfo.cssClass}`}
-                    >
-                      {parsedPage.blocks
-                        .slice(0, 3)
-                        .map((b) => b.text)
-                        .join(' ')}
-                    </p>
+                    {currentPageSearchRanges.hasUntranslatedMatches ? (
+                      <div
+                        dir={sourceScriptInfo.rtl ? 'rtl' : 'ltr'}
+                        className={`mt-2.5 space-y-2.5 text-sm text-stone-700 dark:text-stone-300 leading-relaxed ${sourceScriptInfo.cssClass}`}
+                      >
+                        {parsedPage.blocks.map((b) => {
+                          const ranges =
+                            currentPageSearchRanges.untranslatedByBlock.get(b.id) ?? [];
+                          return (
+                            <p key={b.id}>
+                              {renderPlainSearchHighlights(b.text, ranges, 'original')}
+                            </p>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <p
+                        dir={sourceScriptInfo.rtl ? 'rtl' : 'ltr'}
+                        className={`mt-2 text-sm text-stone-600 dark:text-stone-400 leading-relaxed line-clamp-5 ${sourceScriptInfo.cssClass}`}
+                      >
+                        {parsedPage.blocks
+                          .slice(0, 3)
+                          .map((b) => b.text)
+                          .join(' ')}
+                      </p>
+                    )}
                   </div>
                 )}
               </div>
@@ -1757,7 +2517,11 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
                           dir={sourceScriptInfo.rtl ? 'rtl' : 'ltr'}
                           className={`mt-1.5 text-xs leading-relaxed text-stone-500 dark:text-stone-400 ${sourceScriptInfo.cssClass}`}
                         >
-                          {blk.text}
+                          {renderPlainSearchHighlights(
+                            blk.text,
+                            currentPageSearchRanges.originalByBlock.get(blk.id) ?? [],
+                            'original'
+                          )}
                         </p>
                       )}
                     </div>

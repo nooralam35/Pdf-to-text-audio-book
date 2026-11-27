@@ -31,7 +31,9 @@ export interface ExportPdfResult {
 }
 
 function dataUrlToUint8Array(dataUrl: string): Uint8Array {
-  const base64 = dataUrl.split(',')[1] ?? '';
+  const commaIdx = dataUrl.indexOf(',');
+  const base64 = commaIdx >= 0 ? dataUrl.slice(commaIdx + 1) : '';
+  if (!base64) return new Uint8Array(0);
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
@@ -115,15 +117,18 @@ export async function exportTranslatedPdf(
   const langOption = getLanguageOption(lang);
   const isRtl = Boolean(langOption.rtl);
 
-  // Ensure Google Noto Indic/Urdu web fonts are loaded before drawing to Canvas
+  // Ensure Google Noto Indic/Urdu web fonts are loaded before drawing to Canvas (capped at 2.5s so offline/slow fonts never stall export)
   if (typeof document !== 'undefined' && document.fonts) {
     try {
-      await Promise.allSettled([
-        document.fonts.load(`400 24px ${langOption.canvasFont}`),
-        document.fonts.load(`600 24px ${langOption.canvasFont}`),
-        document.fonts.load(`700 28px ${langOption.canvasFont}`),
+      await Promise.race([
+        Promise.allSettled([
+          document.fonts.load(`400 24px ${langOption.canvasFont}`),
+          document.fonts.load(`600 24px ${langOption.canvasFont}`),
+          document.fonts.load(`700 28px ${langOption.canvasFont}`),
+          document.fonts.ready,
+        ]),
+        new Promise((resolve) => setTimeout(resolve, 2500)),
       ]);
-      await document.fonts.ready;
     } catch {
       // proceed with loaded fonts
     }
@@ -158,19 +163,30 @@ export async function exportTranslatedPdf(
       // fallback to stored coverDataUrl
     }
 
-    if (coverDataUrl) {
-      const coverBytes = dataUrlToUint8Array(coverDataUrl);
-      const isPng = coverDataUrl.startsWith('data:image/png');
-      const embeddedCover = isPng
-        ? await outPdf.embedPng(coverBytes)
-        : await outPdf.embedJpg(coverBytes);
-      const coverPage = outPdf.addPage([coverW, coverH]);
-      coverPage.drawImage(embeddedCover, {
-        x: 0,
-        y: 0,
-        width: coverW,
-        height: coverH,
-      });
+    if (coverDataUrl && coverDataUrl.startsWith('data:image/')) {
+      try {
+        const coverBytes = dataUrlToUint8Array(coverDataUrl);
+        if (coverBytes.byteLength > 0) {
+          const isPng = coverDataUrl.startsWith('data:image/png');
+          const isJpg =
+            coverDataUrl.startsWith('data:image/jpeg') ||
+            coverDataUrl.startsWith('data:image/jpg');
+          if (isPng || isJpg) {
+            const embeddedCover = isPng
+              ? await outPdf.embedPng(coverBytes)
+              : await outPdf.embedJpg(coverBytes);
+            const coverPage = outPdf.addPage([coverW, coverH]);
+            coverPage.drawImage(embeddedCover, {
+              x: 0,
+              y: 0,
+              width: coverW,
+              height: coverH,
+            });
+          }
+        }
+      } catch {
+        // Non-fatal cover image failure — continue exporting translated pages
+      }
     }
     stepDone++;
     onProgress?.(stepDone, totalSteps, 'Cover page embedded.');
@@ -262,17 +278,17 @@ export async function exportTranslatedPdf(
 
     // Combine blocks + inline figures in exact vertical page order
     const items: RenderItem[] = [];
-    for (const block of record.blocks) {
+    for (const block of record.blocks ?? []) {
       items.push({ type: 'block', yPercent: block.yPercent, block });
     }
-    if (includeFigures && record.figures.length > 0) {
+    if (includeFigures && Array.isArray(record.figures) && record.figures.length > 0) {
       for (const figure of record.figures) {
         items.push({ type: 'figure', yPercent: figure.yPercent, figure });
       }
     }
     items.sort((a, b) => a.yPercent - b.yPercent);
 
-    if (record.imageExplanations.length > 0) {
+    if (Array.isArray(record.imageExplanations) && record.imageExplanations.length > 0) {
       for (const exp of record.imageExplanations) {
         items.push({ type: 'explanation', yPercent: 101, text: exp });
       }

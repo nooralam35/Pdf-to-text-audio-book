@@ -1,20 +1,37 @@
 export type LanguageCode =
+  | 'orig'
   | 'hi'
   | 'sa'
   | 'hinglish'
   | 'mr'
   | 'ur'
   | 'ar'
+  | 'fa'
   | 'bn'
   | 'ta'
   | 'te'
   | 'gu'
   | 'pa'
+  | 'kn'
+  | 'ml'
+  | 'or'
+  | 'ne'
+  | 'en'
+  | 'zh'
+  | 'ja'
+  | 'ko'
+  | 'ru'
   | 'es'
   | 'fr'
   | 'de'
-  | 'en'
-  | 'orig';
+  | 'pt'
+  | 'it'
+  | 'tr'
+  | 'id'
+  | 'th'
+  | 'vi'
+  | 'he'
+  | 'uk';
 
 export type OcrScriptMode =
   | 'auto'
@@ -25,6 +42,8 @@ export type OcrScriptMode =
   | 'telugu'
   | 'gujarati'
   | 'gurmukhi'
+  | 'cjk'
+  | 'cyrillic'
   | 'latin';
 
 export type TranslationEngine = 'free' | 'ai';

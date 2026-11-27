@@ -349,6 +349,23 @@ export async function getParsedPage(
   return row?.page;
 }
 
+export async function listParsedPagesForBook(
+  bookId: string
+): Promise<Map<number, ParsedPage>> {
+  const db = await getDb();
+  const map = new Map<number, ParsedPage>();
+  const tx = db.transaction('parsedPages', 'readonly');
+  let cursor = await tx.store.openCursor();
+  while (cursor) {
+    if (cursor.value.bookId === bookId && cursor.value.page) {
+      map.set(cursor.value.pageNumber, cursor.value.page);
+    }
+    cursor = await cursor.continue();
+  }
+  await tx.done;
+  return map;
+}
+
 export function makeAnnotationKey(bookId: string, pageNumber: number): string {
   return `${bookId}::${pageNumber}`;
 }

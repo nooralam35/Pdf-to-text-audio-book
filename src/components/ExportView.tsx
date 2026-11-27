@@ -59,11 +59,42 @@ interface ExportViewProps {
   aiAvailable: boolean;
   translatedPages: TranslatedPageRecord[];
   batchProgress: BatchTranslationProgress | null;
+  autoDownloadAfterFast?: boolean;
+  onChangeAutoDownloadAfterFast?: (enabled: boolean) => void;
+  onSyncExportPdfOptions?: (opts: {
+    includeCover: boolean;
+    includeFigures: boolean;
+    includeOriginalSubheader: boolean;
+  }) => void;
+  autoPdfBuildProgress?: {
+    current: number;
+    total: number;
+    status: string;
+  } | null;
+  readyAutoPdf?: {
+    url: string;
+    fileName: string;
+    exportedPageCount: number;
+    includeCover: boolean;
+    waitingForFocus?: boolean;
+  } | null;
+  autoPdfError?: string | null;
+  onDismissReadyAutoPdf?: () => void;
   onFastTranslateRange: (options: {
     startPage: number;
     endPage: number;
     label: string;
-  }) => Promise<{ records: TranslatedPageRecord[]; cancelled: boolean }>;
+    autoDownloadPdfOptions?: {
+      includeCover: boolean;
+      includeFigures: boolean;
+      includeOriginalSubheader: boolean;
+    };
+  }) => Promise<{
+    records: TranslatedPageRecord[];
+    cancelled: boolean;
+    autoDownloaded?: boolean;
+    autoDownloadFileName?: string;
+  }>;
   onCancelBatch: () => void;
   onPreparePrintPages: (pages: TranslatedPageRecord[], includeCover: boolean) => void;
   onTranslateChapter: (chapter: ChapterItem) => void;
@@ -82,6 +113,13 @@ export const ExportView: React.FC<ExportViewProps> = ({
   aiAvailable,
   translatedPages,
   batchProgress,
+  autoDownloadAfterFast: autoDownloadProp,
+  onChangeAutoDownloadAfterFast,
+  onSyncExportPdfOptions,
+  autoPdfBuildProgress = null,
+  readyAutoPdf = null,
+  autoPdfError = null,
+  onDismissReadyAutoPdf,
   onFastTranslateRange,
   onCancelBatch,
   onPreparePrintPages,
@@ -107,7 +145,20 @@ export const ExportView: React.FC<ExportViewProps> = ({
   const [rangeMode, setRangeMode] = useState<'full' | 'custom'>('full');
   const [rangeStart, setRangeStart] = useState(1);
   const [rangeEnd, setRangeEnd] = useState(book?.numPages ?? 1);
-  const [autoDownloadAfterFast, setAutoDownloadAfterFast] = useState(true);
+  const [localAutoDownload, setLocalAutoDownload] = useState(true);
+  const autoDownloadAfterFast = autoDownloadProp ?? localAutoDownload;
+  const setAutoDownloadAfterFast = (checked: boolean) => {
+    setLocalAutoDownload(checked);
+    onChangeAutoDownloadAfterFast?.(checked);
+  };
+
+  useEffect(() => {
+    onSyncExportPdfOptions?.({
+      includeCover,
+      includeFigures,
+      includeOriginalSubheader,
+    });
+  }, [includeCover, includeFigures, includeOriginalSubheader, onSyncExportPdfOptions]);
 
   useEffect(() => {
     if (book) {
@@ -246,27 +297,43 @@ export const ExportView: React.FC<ExportViewProps> = ({
     await buildAndDownloadTranslatedPdf(selectedPages);
   };
 
-  const handleRunFastConverter = async (downloadWhenDone: boolean) => {
-    if (!book || !pdf || batchProgress || isExporting) return;
-    const clampedStart =
-      rangeMode === 'full' ? 1 : Math.max(1, Math.min(book.numPages, Math.floor(rangeStart) || 1));
-    const clampedEnd =
-      rangeMode === 'full'
-        ? book.numPages
-        : Math.max(clampedStart, Math.min(book.numPages, Math.floor(rangeEnd) || book.numPages));
+  const handleRunFastConverter = async (
+    customRange?: { startPage: number; endPage: number; label: string }
+  ) => {
+    if (!book || !pdf || batchProgress || isExporting || autoPdfBuildProgress) return;
+    const clampedStart = customRange
+      ? Math.max(1, Math.min(book.numPages, customRange.startPage))
+      : rangeMode === 'full'
+      ? 1
+      : Math.max(1, Math.min(book.numPages, Math.floor(rangeStart) || 1));
+    const clampedEnd = customRange
+      ? Math.max(clampedStart, Math.min(book.numPages, customRange.endPage))
+      : rangeMode === 'full'
+      ? book.numPages
+      : Math.max(clampedStart, Math.min(book.numPages, Math.floor(rangeEnd) || book.numPages));
+
+    const rangeLabel =
+      customRange?.label ??
+      (clampedStart === 1 && clampedEnd === book.numPages
+        ? `Full PDF (${book.numPages} pages)`
+        : `Pages ${clampedStart}–${clampedEnd}`);
 
     setExportError(null);
     setExportNotice(null);
+    onDismissReadyAutoPdf?.();
 
     try {
-      const { records, cancelled } = await onFastTranslateRange({
-        startPage: clampedStart,
-        endPage: clampedEnd,
-        label:
-          clampedStart === 1 && clampedEnd === book.numPages
-            ? `Full PDF (${book.numPages} pages)`
-            : `Pages ${clampedStart}–${clampedEnd}`,
-      });
+      const { records, cancelled, autoDownloaded, autoDownloadFileName } =
+        await onFastTranslateRange({
+          startPage: clampedStart,
+          endPage: clampedEnd,
+          label: rangeLabel,
+          autoDownloadPdfOptions: {
+            includeCover,
+            includeFigures,
+            includeOriginalSubheader,
+          },
+        });
 
       if (cancelled) {
         setExportNotice(
@@ -275,9 +342,13 @@ export const ExportView: React.FC<ExportViewProps> = ({
         return;
       }
 
-      if (downloadWhenDone && records.length > 0) {
-        await buildAndDownloadTranslatedPdf(records);
-      } else {
+      if (autoDownloaded && autoDownloadFileName) {
+        setExportNotice(
+          `Converted & downloaded ${autoDownloadFileName} (${records.length} translated pages${
+            includeCover ? ', including original Page 1 cover' : ''
+          }).`
+        );
+      } else if (!autoDownloadAfterFast) {
         setExportNotice(
           `Fast-translated & saved ${records.length} pages in ${langOption.name}. Ready to read or download as PDF.`
         );
@@ -843,10 +914,7 @@ export const ExportView: React.FC<ExportViewProps> = ({
                         ? batchProgress.statusNote
                         : 'Continuous auto-retry & auto-save active — runs automatically to 100%.'}
                     </p>
-                  </div>
-                ) : (
-                  <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
-                    <label className="inline-flex items-center gap-2 text-xs text-stone-700 dark:text-stone-300 cursor-pointer select-none">
+                    <label className="pt-1 inline-flex items-center gap-2 text-xs text-stone-700 dark:text-stone-300 cursor-pointer select-none">
                       <input
                         type="checkbox"
                         checked={autoDownloadAfterFast}
@@ -855,43 +923,126 @@ export const ExportView: React.FC<ExportViewProps> = ({
                       />
                       <span>Auto-download converted PDF when translation finishes</span>
                     </label>
+                  </div>
+                ) : autoPdfBuildProgress ? (
+                  <div className="p-3.5 rounded-md border border-amber-700/40 bg-amber-50/70 dark:bg-amber-950/25 space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                      <span className="inline-flex items-center gap-2 font-medium text-stone-900 dark:text-stone-100">
+                        <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-700 dark:text-amber-400" />
+                        <span>{autoPdfBuildProgress.status}</span>
+                      </span>
+                      <span className="font-mono-num text-stone-700 dark:text-stone-300">
+                        {autoPdfBuildProgress.current}/{autoPdfBuildProgress.total} (
+                        {Math.round(
+                          (autoPdfBuildProgress.current /
+                            Math.max(1, autoPdfBuildProgress.total)) *
+                            100
+                        )}
+                        %)
+                      </span>
+                    </div>
+                    <div className="h-1.5 w-full rounded-full bg-amber-200/80 dark:bg-amber-950 overflow-hidden">
+                      <div
+                        className="h-full bg-amber-700 dark:bg-amber-500 transition-all duration-200"
+                        style={{
+                          width: `${Math.round(
+                            (autoPdfBuildProgress.current /
+                              Math.max(1, autoPdfBuildProgress.total)) *
+                              100
+                          )}%`,
+                        }}
+                      />
+                    </div>
+                    <p className="text-[11px] text-stone-600 dark:text-stone-400">
+                      Translation complete — automatically packaging and downloading your converted PDF…
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-3 pt-1">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <label className="inline-flex items-center gap-2 text-xs text-stone-700 dark:text-stone-300 cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={autoDownloadAfterFast}
+                          onChange={(e) => setAutoDownloadAfterFast(e.target.checked)}
+                          className="rounded accent-amber-700"
+                        />
+                        <span>Auto-download converted PDF when translation finishes</span>
+                      </label>
 
-                    <div className="flex flex-wrap items-center gap-2">
-                      <button
-                        type="button"
-                        disabled={!pdf || isExporting}
-                        onClick={() => handleRunFastConverter(autoDownloadAfterFast)}
-                        className="inline-flex items-center gap-2 h-10 px-4 rounded-md text-xs sm:text-sm font-medium bg-amber-700 hover:bg-amber-800 text-white disabled:opacity-45 transition-colors cursor-pointer whitespace-nowrap"
-                      >
-                        <Zap className="w-4 h-4" />
-                        <span>
-                          {rangeMode === 'full' &&
-                          translatedPages.length > 0 &&
-                          translatedPages.length < book.numPages
-                            ? autoDownloadAfterFast
-                              ? `Resume & Convert Full PDF (${book.numPages - translatedPages.length}p left)`
-                              : `Resume Fast Translate (${book.numPages - translatedPages.length}p left)`
-                            : autoDownloadAfterFast
-                            ? rangeMode === 'full'
-                              ? `Fast Translate & Convert Full PDF (${book.numPages}p)`
-                              : `Fast Translate & Convert p.${rangeStart}–${rangeEnd}`
-                            : rangeMode === 'full'
-                            ? `Fast Translate All ${book.numPages} Pages`
-                            : `Fast Translate p.${rangeStart}–${rangeEnd}`}
-                        </span>
-                      </button>
-
-                      {currentChapter && translatedPages.length === 0 && (
+                      <div className="flex flex-wrap items-center gap-2">
                         <button
                           type="button"
-                          disabled={!pdf || isExporting}
-                          onClick={() => onTranslateChapter(currentChapter)}
-                          className="h-10 px-3 rounded-md text-xs font-medium border border-stone-300 dark:border-stone-700 text-stone-800 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer whitespace-nowrap"
+                          disabled={!pdf || isExporting || Boolean(autoPdfBuildProgress)}
+                          onClick={() => handleRunFastConverter()}
+                          className="inline-flex items-center gap-2 h-10 px-4 rounded-md text-xs sm:text-sm font-medium bg-amber-700 hover:bg-amber-800 text-white disabled:opacity-45 transition-colors cursor-pointer whitespace-nowrap"
                         >
-                          Chapter Only ({currentChapter.endPage - currentChapter.startPage + 1}p)
+                          <Zap className="w-4 h-4" />
+                          <span>
+                            {rangeMode === 'full' &&
+                            translatedPages.length > 0 &&
+                            translatedPages.length < book.numPages
+                              ? autoDownloadAfterFast
+                                ? `Resume & Convert Full PDF (${book.numPages - translatedPages.length}p left)`
+                                : `Resume Fast Translate (${book.numPages - translatedPages.length}p left)`
+                              : autoDownloadAfterFast
+                              ? rangeMode === 'full'
+                                ? `Fast Translate & Convert Full PDF (${book.numPages}p)`
+                                : `Fast Translate & Convert p.${rangeStart}–${rangeEnd}`
+                              : rangeMode === 'full'
+                              ? `Fast Translate All ${book.numPages} Pages`
+                              : `Fast Translate p.${rangeStart}–${rangeEnd}`}
+                          </span>
                         </button>
-                      )}
+
+                        {currentChapter && translatedPages.length === 0 && (
+                          <button
+                            type="button"
+                            disabled={!pdf || isExporting || Boolean(autoPdfBuildProgress)}
+                            onClick={() => {
+                              if (autoDownloadAfterFast) {
+                                void handleRunFastConverter({
+                                  startPage: currentChapter.startPage,
+                                  endPage: currentChapter.endPage,
+                                  label: currentChapter.title,
+                                });
+                              } else {
+                                onTranslateChapter(currentChapter);
+                              }
+                            }}
+                            className="h-10 px-3 rounded-md text-xs font-medium border border-stone-300 dark:border-stone-700 text-stone-800 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer whitespace-nowrap"
+                          >
+                            Chapter Only ({currentChapter.endPage - currentChapter.startPage + 1}p)
+                          </button>
+                        )}
+                      </div>
                     </div>
+
+                    {readyAutoPdf && (
+                      <div className="p-3 rounded-md border border-emerald-200 dark:border-emerald-900/60 bg-emerald-50/75 dark:bg-emerald-950/30 flex flex-wrap items-center justify-between gap-2.5 text-xs text-emerald-900 dark:text-emerald-200">
+                        <span className="inline-flex items-center gap-2 min-w-0">
+                          <CheckCircle2 className="w-4 h-4 shrink-0" />
+                          <span className="truncate">
+                            PDF ready ({readyAutoPdf.exportedPageCount} pages):{' '}
+                            <strong>{readyAutoPdf.fileName}</strong>
+                          </span>
+                        </span>
+                        <a
+                          href={readyAutoPdf.url}
+                          download={readyAutoPdf.fileName}
+                          className="inline-flex items-center gap-1.5 h-8 px-3 rounded bg-emerald-700 hover:bg-emerald-800 text-white font-medium transition-colors shrink-0"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>Save PDF Again</span>
+                        </a>
+                      </div>
+                    )}
+
+                    {autoPdfError && (
+                      <div className="p-3 rounded-md border border-red-200 dark:border-red-900/60 bg-red-50/70 dark:bg-red-950/30 text-xs text-red-800 dark:text-red-300">
+                        {autoPdfError}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
