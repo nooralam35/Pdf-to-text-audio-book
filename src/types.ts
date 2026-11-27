@@ -1,16 +1,31 @@
 export type LanguageCode =
   | 'hi'
+  | 'sa'
   | 'hinglish'
+  | 'mr'
+  | 'ur'
+  | 'ar'
   | 'bn'
   | 'ta'
   | 'te'
-  | 'mr'
-  | 'ur'
+  | 'gu'
+  | 'pa'
   | 'es'
   | 'fr'
   | 'de'
-  | 'ar'
-  | 'en';
+  | 'en'
+  | 'orig';
+
+export type OcrScriptMode =
+  | 'auto'
+  | 'devanagari'
+  | 'persoarabic'
+  | 'bengali'
+  | 'tamil'
+  | 'telugu'
+  | 'gujarati'
+  | 'gurmukhi'
+  | 'latin';
 
 export type TranslationEngine = 'free' | 'ai';
 
@@ -58,6 +73,10 @@ export interface ParsedPage {
   figures: ExtractedFigure[];
   isBlank: boolean;
   isOcr?: boolean;
+  ocrEngine?: 'ai-vision' | 'tesseract';
+  looksGarbled?: boolean;
+  detectedLang?: string;
+  scriptDirection?: 'ltr' | 'rtl';
 }
 
 export interface TranslatedBlock extends TextBlock {
@@ -127,6 +146,7 @@ export interface StoredBook {
   chapters: ChapterItem[];
   sourceUrl?: string;
   pdfData?: ArrayBuffer;
+  hasLocalPdf?: boolean;
   addedAt: number;
   lastPage: number;
   pageWidth?: number;
@@ -141,6 +161,7 @@ export interface StoredBook {
   lastNarrationSource?: 'translated' | 'original';
   lastTargetLang?: LanguageCode;
   discoveredBookId?: string;
+  discoveredBook?: DiscoveredBook;
   externalSource?: BookSearchSource;
   externalUrl?: string;
 }

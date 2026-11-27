@@ -15,6 +15,7 @@ import {
   Loader2,
   LocateFixed,
   RefreshCw,
+  ScanText,
   Share2,
   Sparkles,
   StickyNote,
@@ -22,7 +23,11 @@ import {
   Volume2,
   X,
 } from 'lucide-react';
-import { getLanguageOption } from '../lib/languages';
+import {
+  detectTextLanguageCode,
+  getLanguageOption,
+  isTextPredominantlyRtl,
+} from '../lib/languages';
 import { lookupDictionaryTerm } from '../lib/translatorClient';
 import type {
   ChapterItem,
@@ -75,6 +80,8 @@ interface TranslatedReaderPaneProps {
     highlightColor?: TextHighlightColor;
   }) => void;
   onOpenShareStudio?: () => void;
+  onRunOcr?: () => void;
+  isRunningOcr?: boolean;
 }
 
 type StreamItem =
@@ -232,6 +239,8 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
   onExportHighlights,
   onShareQuote,
   onOpenShareStudio,
+  onRunOcr,
+  isRunningOcr = false,
 }) => {
   const [editingBlockId, setEditingBlockId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState('');
@@ -269,6 +278,26 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
   }, [autoScrollEnabled]);
 
   const langOption = getLanguageOption(targetLang);
+  const sourceScriptInfo = useMemo(() => {
+    const sample = parsedPage?.blocks.slice(0, 8).map((b) => b.text).join(' ') ?? '';
+    const detectedCode = detectTextLanguageCode(sample, parsedPage?.detectedLang);
+    const detectedOpt = getLanguageOption(detectedCode);
+    const isRtl =
+      parsedPage?.scriptDirection === 'rtl' ||
+      isTextPredominantlyRtl(sample) ||
+      Boolean(detectedOpt.rtl);
+    return {
+      code: detectedCode,
+      name: parsedPage?.detectedLang || detectedOpt.name,
+      cssClass: detectedOpt.cssClass,
+      rtl: isRtl,
+    };
+  }, [parsedPage]);
+
+  const effectivePaneRtl = targetLang === 'orig' ? sourceScriptInfo.rtl : Boolean(langOption.rtl);
+  const effectivePaneCssClass =
+    targetLang === 'orig' ? sourceScriptInfo.cssClass : langOption.cssClass;
+
   const pageHighlights = useMemo(
     () => translatedPage?.highlights ?? [],
     [translatedPage?.highlights]
@@ -1074,7 +1103,7 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
                 type="button"
                 onClick={() => setShowOriginalRef((v) => !v)}
                 className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded text-xs font-medium text-stone-600 dark:text-stone-300 hover:bg-stone-200/70 dark:hover:bg-stone-800 cursor-pointer whitespace-nowrap"
-                title="Toggle original English text beneath translated paragraphs"
+                title="Toggle original book text beneath translated paragraphs"
               >
                 {showOriginalRef ? (
                   <EyeOff className="w-3.5 h-3.5" />
@@ -1082,7 +1111,7 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
                   <Eye className="w-3.5 h-3.5" />
                 )}
                 <span className="hidden sm:inline">
-                  {showOriginalRef ? 'Hide English' : 'Compare'}
+                  {showOriginalRef ? 'Hide Original' : 'Compare'}
                 </span>
               </button>
 
@@ -1403,8 +1432,8 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
         )}
 
         <div
-          dir={langOption.rtl ? 'rtl' : 'ltr'}
-          className={`max-w-[660px] mx-auto ${langOption.cssClass}`}
+          dir={effectivePaneRtl ? 'rtl' : 'ltr'}
+          className={`max-w-[660px] mx-auto ${effectivePaneCssClass}`}
         >
           {/* Error Banner */}
           {translationError && (
@@ -1507,8 +1536,24 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
                     ) : (
                       <Languages className="w-4 h-4" />
                     )}
-                    <span>Translate Page {pageNumber}</span>
+                    <span>
+                      {targetLang === 'orig'
+                        ? `Open Clean Original Page ${pageNumber}`
+                        : `Translate Page ${pageNumber}`}
+                    </span>
                   </button>
+
+                  {onRunOcr && (parsedPage?.looksGarbled || parsedPage?.isBlank) && (
+                    <button
+                      type="button"
+                      disabled={isRunningOcr}
+                      onClick={onRunOcr}
+                      className="inline-flex items-center gap-2 h-10 px-4 rounded-md text-sm font-medium border border-amber-400 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/35 text-amber-900 dark:text-amber-200 hover:bg-amber-100/80 dark:hover:bg-amber-900/45 transition-colors cursor-pointer disabled:opacity-50"
+                    >
+                      <ScanText className="w-4 h-4" />
+                      <span>{isRunningOcr ? 'Reading Script via OCR…' : 'Run Multilingual OCR'}</span>
+                    </button>
+                  )}
 
                   {currentChapter && (
                     <button
@@ -1524,13 +1569,24 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
                   )}
                 </div>
 
+                {parsedPage?.looksGarbled && (
+                  <p className="mt-4 text-xs text-amber-800 dark:text-amber-300 bg-amber-50/80 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/60 rounded px-3 py-2">
+                    This PDF page uses non-standard legacy font encoding or scanned images. Use{' '}
+                    <strong>Run Multilingual OCR</strong> to read Sanskrit, Hindi, Marathi, Urdu,
+                    Arabic, or other scripts cleanly before translating.
+                  </p>
+                )}
+
                 {/* Brief raw extracted preview */}
                 {parsedPage && parsedPage.blocks.length > 0 && (
                   <div className="mt-7 pt-5 border-t border-stone-200 dark:border-stone-800">
                     <p className="text-[11px] uppercase tracking-wider font-medium text-stone-400 dark:text-stone-500">
-                      Extracted English Preview
+                      Extracted Original Book Text ({sourceScriptInfo.name})
                     </p>
-                    <p className="mt-2 text-sm text-stone-600 dark:text-stone-400 leading-relaxed line-clamp-5">
+                    <p
+                      dir={sourceScriptInfo.rtl ? 'rtl' : 'ltr'}
+                      className={`mt-2 text-sm text-stone-600 dark:text-stone-400 leading-relaxed line-clamp-5 ${sourceScriptInfo.cssClass}`}
+                    >
                       {parsedPage.blocks
                         .slice(0, 3)
                         .map((b) => b.text)
@@ -1698,8 +1754,8 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
 
                       {showOriginalRef && blk.text !== textVal && (
                         <p
-                          dir="ltr"
-                          className="mt-1.5 text-xs leading-relaxed text-stone-500 dark:text-stone-400"
+                          dir={sourceScriptInfo.rtl ? 'rtl' : 'ltr'}
+                          className={`mt-1.5 text-xs leading-relaxed text-stone-500 dark:text-stone-400 ${sourceScriptInfo.cssClass}`}
                         >
                           {blk.text}
                         </p>

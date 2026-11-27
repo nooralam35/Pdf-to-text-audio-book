@@ -11,7 +11,10 @@
     --font-indic-bn: "Noto Sans Bengali", "Plus Jakarta Sans", sans-serif;
     --font-indic-ta: "Noto Sans Tamil", "Plus Jakarta Sans", sans-serif;
     --font-indic-te: "Noto Sans Telugu", "Plus Jakarta Sans", sans-serif;
-    --font-indic-ur: "Noto Nastaliq Urdu", "Plus Jakarta Sans", serif;
+    --font-indic-gu: "Noto Sans Gujarati", "Plus Jakarta Sans", sans-serif;
+    --font-indic-pa: "Noto Sans Gurmukhi", "Plus Jakarta Sans", sans-serif;
+    --font-indic-ur: "Noto Nastaliq Urdu", "Noto Sans Arabic", "Plus Jakarta Sans", serif;
+    --font-indic-ar: "Noto Sans Arabic", "Plus Jakarta Sans", sans-serif;
   }
 
   body {
@@ -40,6 +43,7 @@
 }
 
 .lang-hi,
+.lang-sa,
 .lang-mr {
   font-family: var(--font-indic-hi);
   line-height: 1.9;
@@ -60,10 +64,26 @@
   line-height: 1.9;
 }
 
-.lang-ur,
-.lang-ar {
+.lang-gu {
+  font-family: var(--font-indic-gu);
+  line-height: 1.9;
+}
+
+.lang-pa {
+  font-family: var(--font-indic-pa);
+  line-height: 1.9;
+}
+
+.lang-ur {
   font-family: var(--font-indic-ur);
-  line-height: 2.2;
+  line-height: 2.25;
+  direction: rtl;
+  text-align: right;
+}
+
+.lang-ar {
+  font-family: var(--font-indic-ar);
+  line-height: 2.05;
   direction: rtl;
   text-align: right;
 }

@@ -13,17 +13,21 @@ const PORT = 3000;
 
 const ALLOWED_LANGS: Record<string, { name: string; gtxCode: string; myMemoryCode: string }> = {
   hi: { name: 'Hindi', gtxCode: 'hi', myMemoryCode: 'hi' },
+  sa: { name: 'Sanskrit', gtxCode: 'sa', myMemoryCode: 'sa' },
   hinglish: { name: 'Hinglish', gtxCode: 'hi', myMemoryCode: 'hi' },
+  mr: { name: 'Marathi', gtxCode: 'mr', myMemoryCode: 'mr' },
+  ur: { name: 'Urdu', gtxCode: 'ur', myMemoryCode: 'ur' },
+  ar: { name: 'Arabic', gtxCode: 'ar', myMemoryCode: 'ar' },
   bn: { name: 'Bengali', gtxCode: 'bn', myMemoryCode: 'bn' },
   ta: { name: 'Tamil', gtxCode: 'ta', myMemoryCode: 'ta' },
   te: { name: 'Telugu', gtxCode: 'te', myMemoryCode: 'te' },
-  mr: { name: 'Marathi', gtxCode: 'mr', myMemoryCode: 'mr' },
-  ur: { name: 'Urdu', gtxCode: 'ur', myMemoryCode: 'ur' },
+  gu: { name: 'Gujarati', gtxCode: 'gu', myMemoryCode: 'gu' },
+  pa: { name: 'Punjabi', gtxCode: 'pa', myMemoryCode: 'pa' },
   es: { name: 'Spanish', gtxCode: 'es', myMemoryCode: 'es' },
   fr: { name: 'French', gtxCode: 'fr', myMemoryCode: 'fr' },
   de: { name: 'German', gtxCode: 'de', myMemoryCode: 'de' },
-  ar: { name: 'Arabic', gtxCode: 'ar', myMemoryCode: 'ar' },
   en: { name: 'English', gtxCode: 'en', myMemoryCode: 'en' },
+  orig: { name: 'Original Book', gtxCode: 'en', myMemoryCode: 'en' },
 };
 
 const DEFAULT_TECH_TERMS = [
@@ -799,6 +803,151 @@ async function startServer() {
     });
   });
 
+  // Universal Multilingual Vision OCR Endpoint (Gemini 4 Hydrogen — exact verbatim transcription in any script)
+  app.post('/api/ocr-page', async (req, res) => {
+    try {
+      const ai = getGeminiClient();
+      if (!ai) {
+        return res.status(503).json({
+          error: 'AI Vision OCR requires GEMINI_API_KEY. Using offline Tesseract OCR instead.',
+        });
+      }
+
+      const { imageBase64, pageNumber = 1, scriptMode = 'auto' } = req.body ?? {};
+      if (typeof imageBase64 !== 'string' || imageBase64.length < 100 || imageBase64.length > 10_000_000) {
+        return res.status(400).json({ error: 'Valid page image data is required for OCR.' });
+      }
+
+      const match = imageBase64.match(/^data:(image\/(?:png|jpeg|webp));base64,(.+)$/);
+      if (!match) {
+        return res.status(400).json({ error: 'Unsupported image format for OCR.' });
+      }
+
+      const scriptHintMap: Record<string, string> = {
+        auto: 'Detect the exact language(s) and script(s) on the page automatically (Sanskrit, Hindi, Marathi, Urdu, Arabic, Bengali, Tamil, Telugu, Gujarati, Punjabi, English, European, or mixed scripts).',
+        devanagari: 'The page is likely printed in Devanagari script (Hindi, Sanskrit, or Marathi, possibly with English terms). Preserve every matra, halant/virama, anusvara, visarga, and conjunct accurately.',
+        persoarabic: 'The page is likely printed in Perso-Arabic / Nastaliq / Naskh script (Urdu or Arabic, possibly with English terms). Read right-to-left accurately and preserve exact words and diacritics.',
+        bengali: 'The page is likely printed in Bengali / Bangla script (possibly with English terms).',
+        tamil: 'The page is likely printed in Tamil script (possibly with English terms).',
+        telugu: 'The page is likely printed in Telugu script (possibly with English terms).',
+        gujarati: 'The page is likely printed in Gujarati script (possibly with English terms).',
+        gurmukhi: 'The page is likely printed in Gurmukhi / Punjabi script (possibly with English terms).',
+        latin: 'The page is likely printed in English or European Latin script.',
+      };
+
+      const scriptGuidance =
+        typeof scriptMode === 'string' && scriptHintMap[scriptMode]
+          ? scriptHintMap[scriptMode]
+          : scriptHintMap.auto;
+
+      const systemInstruction = `You are a high-precision multilingual book OCR transcriber processing Page ${Number(pageNumber) || 1}.
+${scriptGuidance}
+CRITICAL FIDELITY RULES:
+1. EXACT VERBATIM TRANSCRIPTION ("same to same"): Output the EXACT printed text word-for-word, character-for-character in the SAME language and script as printed on the page.
+2. NEVER translate, summarize, paraphrase, modernize, or invent text. If the book is in Sanskrit, output exact Sanskrit in Devanagari. If Urdu, exact Urdu in Nastaliq/Arabic script. If Arabic, exact Arabic. If Marathi or Hindi, exact Marathi or Hindi. If mixed scripts, preserve every script verbatim.
+3. Preserve authentic reading order (top-to-bottom across columns, right-to-left order within Urdu/Arabic lines) and merge broken line-wrap hyphens cleanly into natural book blocks.
+4. Skip tiny edge artifacts, scanner shadows, or page border specks, and skip tiny decorative watermarks, while keeping all headings, chapter titles, shlokas/verses, bullets, callouts, footnotes, and paragraphs.
+5. Classify each block's "kind" as one of: "heading", "subheading", "paragraph", "bullet", "callout", "caption", or "table", and provide "yPercent" (0 to 100 vertical position from top of page).
+6. Set "scriptDirection" to "rtl" if the page text is primarily Arabic, Urdu, or another right-to-left script; otherwise "ltr". Set "detectedLang" to the primary language name (e.g. "Sanskrit", "Hindi", "Marathi", "Urdu", "Arabic", "Bengali", "Tamil", "Telugu", "Gujarati", "Punjabi", "English").`;
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: {
+          parts: [
+            {
+              inlineData: {
+                mimeType: match[1],
+                data: match[2],
+              },
+            },
+            {
+              text: 'Transcribe all readable book text on this page verbatim into structured JSON blocks in its exact original language and script.',
+            },
+          ],
+        },
+        config: {
+          systemInstruction,
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              detectedLang: { type: Type.STRING },
+              scriptDirection: { type: Type.STRING },
+              blocks: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    kind: { type: Type.STRING },
+                    text: { type: Type.STRING },
+                    yPercent: { type: Type.NUMBER },
+                  },
+                  required: ['kind', 'text', 'yPercent'],
+                },
+              },
+            },
+            required: ['detectedLang', 'scriptDirection', 'blocks'],
+          },
+        },
+      });
+
+      const parsed = JSON.parse((response.text ?? '{}').trim()) as {
+        detectedLang?: string;
+        scriptDirection?: string;
+        blocks?: Array<{ kind?: string; text?: string; yPercent?: number }>;
+      };
+
+      const allowedKinds = new Set([
+        'heading',
+        'subheading',
+        'paragraph',
+        'bullet',
+        'callout',
+        'caption',
+        'table',
+      ]);
+
+      const rawBlocks = Array.isArray(parsed.blocks) ? parsed.blocks : [];
+      const cleanBlocks = rawBlocks
+        .map((b, idx) => {
+          const text = typeof b?.text === 'string' ? b.text.replace(/\s+/g, ' ').trim() : '';
+          if (!text) return null;
+          const kind =
+            typeof b?.kind === 'string' && allowedKinds.has(b.kind) ? b.kind : 'paragraph';
+          const yVal =
+            typeof b?.yPercent === 'number' && Number.isFinite(b.yPercent)
+              ? Math.max(0, Math.min(100, b.yPercent))
+              : Math.round(((idx + 1) / (rawBlocks.length + 1)) * 90);
+          return {
+            id: `p${Number(pageNumber) || 1}-ocr-${idx + 1}`,
+            kind,
+            text,
+            yPercent: yVal,
+            fontSize: kind === 'heading' ? 16 : kind === 'subheading' ? 13 : 11,
+          };
+        })
+        .filter((b): b is NonNullable<typeof b> => Boolean(b));
+
+      const scriptDirection =
+        parsed.scriptDirection === 'rtl' ? 'rtl' : 'ltr';
+      const detectedLang =
+        typeof parsed.detectedLang === 'string' && parsed.detectedLang.trim()
+          ? parsed.detectedLang.trim().slice(0, 40)
+          : 'Unknown';
+
+      return res.json({
+        detectedLang,
+        scriptDirection,
+        blocks: cleanBlocks,
+        engine: 'gemini-4-hydrogen',
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'AI Vision OCR failed.';
+      return res.status(502).json({ error: message });
+    }
+  });
+
   // 100% Free Open Translation Endpoint (Zero Paid API Cost, Fast Concurrent Chunks)
   app.post('/api/translate-free', async (req, res) => {
     try {
@@ -818,6 +967,18 @@ async function startServer() {
         (b): b is { id: string; text: string; kind?: string } =>
           Boolean(b && typeof b.id === 'string' && typeof b.text === 'string')
       );
+
+      if (targetLang === 'orig') {
+        const translations: Record<string, string> = {};
+        for (const blk of validBlocks) {
+          translations[blk.id] = blk.text;
+        }
+        return res.json({
+          translations,
+          imageExplanations: [],
+          engine: 'free-open',
+        });
+      }
 
       const { translations } = await translateBlocksFast(
         validBlocks,
@@ -864,6 +1025,10 @@ async function startServer() {
         pageTranslations[pg.pageNumber] = {};
         for (const blk of pg.blocks) {
           if (!blk || typeof blk.id !== 'string' || typeof blk.text !== 'string') continue;
+          if (targetLang === 'orig') {
+            pageTranslations[pg.pageNumber][blk.id] = blk.text;
+            continue;
+          }
           if (flatBlocks.length >= 1200) break;
           const compositeId = `p${pg.pageNumber}::${blk.id}`;
           flatBlocks.push({ id: compositeId, text: blk.text });
@@ -871,7 +1036,7 @@ async function startServer() {
         }
       }
 
-      if (flatBlocks.length > 0) {
+      if (targetLang !== 'orig' && flatBlocks.length > 0) {
         const { translations: translatedFlat, failedIds } = await translateBlocksFast(
           flatBlocks,
           targetLang,
@@ -921,7 +1086,7 @@ async function startServer() {
     }
   });
 
-  // Smart Technical Book & Diagram AI Translator (Gemini 4 Hydrogen — Server-Side)
+  // Smart Multilingual Book & Diagram AI Translator (Gemini 4 Hydrogen — Server-Side)
   app.post('/api/translate-ai', async (req, res) => {
     try {
       const ai = getGeminiClient();
@@ -938,7 +1103,7 @@ async function startServer() {
         preserveTerms = true,
         customTerms = [],
         pageImageBase64,
-        bookTitle = 'Technical Guidebook',
+        bookTitle = 'Book',
         pageNumber = 1,
       } = req.body ?? {};
 
@@ -949,7 +1114,6 @@ async function startServer() {
         return res.status(400).json({ error: 'Unsupported target language.' });
       }
 
-      const langName = ALLOWED_LANGS[targetLang].name;
       const safeBlocks = blocks
         .filter(
           (b): b is { id: string; text: string; kind: string } =>
@@ -961,18 +1125,32 @@ async function startServer() {
           text: b.text.slice(0, 4000),
         }));
 
+      if (targetLang === 'orig') {
+        const translations: Record<string, string> = {};
+        for (const b of safeBlocks) {
+          translations[b.id] = b.text;
+        }
+        return res.json({
+          translations,
+          imageExplanations: [],
+          engine: 'gemini-4-hydrogen',
+        });
+      }
+
+      const langName = ALLOWED_LANGS[targetLang].name;
       const extraTermsNote =
         Array.isArray(customTerms) && customTerms.length > 0
-          ? `Additional terms to keep in English: ${customTerms.slice(0, 40).join(', ')}.`
+          ? `Additional terms to keep untranslated when present: ${customTerms.slice(0, 40).join(', ')}.`
           : '';
 
-      const systemInstruction = `You are an expert technical book translator and audiobook narrator translating "${String(bookTitle).slice(0, 120)}" (Page ${Number(pageNumber) || 1}).
-Follow these exact rules:
-1. Accurate & Natural Translation: Translate every block into natural, easy-to-understand ${langName}${targetLang === 'hinglish' ? ' (conversational Hindi written clearly in Latin/English script)' : ''}.
-2. Technical Term Preservation: ${preserveTerms ? 'Keep standard technical/software terms (e.g., OBS, Scene, Source, Plugin, Bitrate, NDI, SRT, RTSP, RTMP, Audio Mixer, Hotkeys, Browser Dock, Chroma Key, LUT, NVENC, PTZ, VST, Sidechain, Ducking, Replay Buffer, Studio Mode, T-Bar) in English so technical clarity is preserved.' : 'Translate naturally while keeping proper brand names accurate.'} ${extraTermsNote}
-3. Preserve Structure & Hierarchy: Keep Headings concise, preserve bullet points, Pro Tips, Key Takeaways, and table structure cleanly.
-4. Audiobook-Ready Formatting: Write smooth, natural flowing sentences without broken mid-sentence line breaks or page-number interruptions so Text-to-Speech sounds like a fluent human audiobook narrator.
-5. Image & Diagram Context: If a page screenshot is provided and contains diagrams, screenshots, charts, or UI callouts, add 1-3 concise bracketed explanations in ${langName} inside imageExplanations (e.g. "[Image Explanation: ...]") describing the visible labels and callouts. If the page is text-only with no images/diagrams, return an empty imageExplanations array.`;
+      const systemInstruction = `You are a faithful multilingual book translator and audiobook narrator translating "${String(bookTitle).slice(0, 120)}" (Page ${Number(pageNumber) || 1}).
+Follow these strict fidelity rules:
+1. STRICT SOURCE FIDELITY: Translate ONLY what is actually written in the book — sentence-for-sentence and meaning-for-meaning — into clear, natural ${langName}${targetLang === 'hinglish' ? ' (conversational Hindi written clearly in Latin/English script)' : ''}. NEVER invent extra ideas, substitute unrelated topics, or alter the author's meaning.
+2. ANY SOURCE LANGUAGE SUPPORTED: The book may be in Sanskrit, Hindi, Marathi, Urdu, Arabic, Bengali, Tamil, Telugu, Gujarati, Punjabi, English, or mixed scripts. If a page screenshot is attached AND any extracted text block looks garbled/incomplete/legacy-encoded, read the ACTUAL printed words directly from the page screenshot first and translate that exact book text faithfully. If the source block is already in ${langName}, keep it faithful and cleanly formatted in ${langName}.
+3. Technical & Proper Term Preservation: ${preserveTerms ? 'Keep proper nouns and genuine technical/software terms or acronyms that appear in the source text accurate.' : 'Translate naturally while keeping proper names accurate.'} ${extraTermsNote}
+4. Preserve Structure & Hierarchy: Keep Headings concise, preserve verses/shlokas, bullet points, callouts, and table content faithfully.
+5. Audiobook-Ready Formatting: Write smooth, natural flowing sentences in ${langName} without broken mid-sentence line breaks so Text-to-Speech sounds clear and faithful to the book.
+6. Image & Diagram Context: If a page screenshot is provided and contains genuine diagrams, charts, or UI callouts, add 1-3 concise bracketed notes in ${langName} inside imageExplanations describing only the visible labels in the diagram. If the page is text-only (no diagrams/charts), return an empty imageExplanations array.`;
 
       const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [];
 
@@ -989,7 +1167,7 @@ Follow these exact rules:
       }
 
       parts.push({
-        text: `Translate each JSON block below into ${langName}, returning the exact same "id" for every block:\n${JSON.stringify(safeBlocks)}`,
+        text: `Translate each JSON block below faithfully into ${langName}, returning the exact same "id" for every block:\n${JSON.stringify(safeBlocks)}`,
       });
 
       const response = await ai.models.generateContent({
@@ -1376,7 +1554,7 @@ Follow these exact rules:
       const ttsAi = getTtsAiClient();
 
       if (ttsAi) {
-        const isIndic = ['hi', 'hinglish', 'bn', 'ta', 'te', 'mr', 'ur'].includes(safeLang);
+        const isIndic = ['hi', 'sa', 'hinglish', 'bn', 'ta', 'te', 'mr', 'ur', 'gu', 'pa'].includes(safeLang);
         const languageCadence = isIndic
           ? `Speak ${String(languageName).slice(0, 40)} with natural, expressive Indian educator cadence, melodic rise-and-fall intonation, clear pauses at purna viram (।) and commas, and crisp pronunciation of English technical terms.`
           : `Speak ${String(languageName).slice(0, 40)} with natural, expressive educator cadence, melodic rise-and-fall intonation, clear clause pauses, and crisp pronunciation of technical terms.`;
@@ -1839,12 +2017,18 @@ Follow these exact rules:
   const LANG_TO_IA: Record<string, string> = {
     en: 'eng',
     hi: 'hin',
+    sa: 'san',
+    mr: 'mar',
+    gu: 'guj',
+    pa: 'pan',
     es: 'spa',
     fr: 'fre',
     de: 'ger',
     ar: 'ara',
     ur: 'urd',
     bn: 'ben',
+    ta: 'tam',
+    te: 'tel',
   };
 
   const normalizeLangLabel = (raw: unknown): string => {
@@ -1853,12 +2037,18 @@ Follow these exact rules:
     if (!lower) return 'English';
     if (lower.startsWith('en')) return 'English';
     if (lower.startsWith('hi')) return 'Hindi';
+    if (lower.startsWith('sa')) return 'Sanskrit';
+    if (lower.startsWith('mr') || lower === 'mar') return 'Marathi';
+    if (lower.startsWith('gu')) return 'Gujarati';
+    if (lower.startsWith('pa') || lower === 'pan') return 'Punjabi';
     if (lower.startsWith('es') || lower === 'spa') return 'Spanish';
     if (lower.startsWith('fr') || lower === 'fre') return 'French';
     if (lower.startsWith('de') || lower === 'ger') return 'German';
     if (lower.startsWith('ar') || lower === 'ara') return 'Arabic';
     if (lower.startsWith('ur') || lower === 'urd') return 'Urdu';
     if (lower.startsWith('bn') || lower === 'ben') return 'Bengali';
+    if (lower.startsWith('ta') || lower === 'tam') return 'Tamil';
+    if (lower.startsWith('te') || lower === 'tel') return 'Telugu';
     return val.slice(0, 16);
   };
 
@@ -2649,14 +2839,18 @@ Follow these exact rules:
       }
 
       const contentLen = Number(response.headers.get('content-length') ?? '0');
-      const MAX_PDF_BYTES = 48 * 1024 * 1024;
+      const MAX_PDF_BYTES = 24 * 1024 * 1024;
       if (contentLen > MAX_PDF_BYTES) {
-        return res.status(413).json({ error: 'PDF exceeds 48 MB browser streaming limit.' });
+        return res.status(413).json({
+          error: 'PDF exceeds 24 MB mobile streaming limit. Try the plain-text edition if available.',
+        });
       }
 
       const arrBuf = await response.arrayBuffer();
       if (arrBuf.byteLength > MAX_PDF_BYTES) {
-        return res.status(413).json({ error: 'PDF exceeds 48 MB browser streaming limit.' });
+        return res.status(413).json({
+          error: 'PDF exceeds 24 MB mobile streaming limit. Try the plain-text edition if available.',
+        });
       }
       const buf = Buffer.from(arrBuf);
       // Verify PDF magic header (%PDF-) to avoid serving HTML login/error pages as PDFs
@@ -2775,15 +2969,19 @@ Follow these exact rules:
       const wordCount = clipped.split(/\s+/).filter(Boolean).length;
       const readingTimeMinutes = Math.max(1, Math.round(wordCount / 210));
       const langMeta = ALLOWED_LANGS[targetLang];
+      const summaryLangInstruction =
+        targetLang === 'orig'
+          ? 'the exact same language and script as the chapter text'
+          : langMeta.name;
 
       // 1. Optional Gemini AI structured summary when API key is configured
       const ai = getGeminiClient();
       if (ai) {
         try {
-          const prompt = `Summarize the following book chapter titled "${safeTitle}" for a student/reader in ${langMeta.name}.
+          const prompt = `Summarize the following book chapter titled "${safeTitle}" for a student/reader in ${summaryLangInstruction}.
 Return strict JSON with:
-- "summary": concise 2-3 sentence overview in ${langMeta.name}
-- "keyTakeaways": 4 to 6 crisp, actionable bullet-point takeaways in ${langMeta.name}
+- "summary": concise 2-3 sentence overview in ${summaryLangInstruction}
+- "keyTakeaways": 4 to 6 crisp, actionable bullet-point takeaways in ${summaryLangInstruction}
 - "keyTerms": 4 to 6 important concepts/terms mentioned in the chapter.
 
 Chapter text:
@@ -2879,7 +3077,7 @@ ${clipped.slice(0, 14000)}`;
       // If text looks English and user wants a non-English target language, translate summary & takeaways for free
       const asciiRatio =
         (summaryText.match(/[A-Za-z]/g)?.length ?? 0) / Math.max(1, summaryText.length);
-      if (targetLang !== 'en' && asciiRatio > 0.45) {
+      if (targetLang !== 'en' && targetLang !== 'orig' && asciiRatio > 0.45) {
         try {
           const blocksToTr = [
             { id: 'sum', text: summaryText },
@@ -2908,6 +3106,88 @@ ${clipped.slice(0, 14000)}`;
   });
 
   if (process.env.NODE_ENV !== 'production') {
+    // Serve a clean, lightweight classic Service Worker in dev mode so offline library
+    // caching works reliably without Workbox dev-dist module/importScripts conflicts or reload loops.
+    app.get('/sw.js', (_req, res) => {
+      res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-store');
+      return res.send(`
+const LIBRARY_CACHE = 'bhashabook-library-offline-v1';
+const PDFJS_CACHE = 'bhashabook-pdfjs-assets-v1';
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(self.skipWaiting());
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(self.clients.claim());
+});
+
+self.addEventListener('fetch', (event) => {
+  const req = event.request;
+  if (req.method !== 'GET') return;
+
+  const url = new URL(req.url);
+  if (url.origin !== self.location.origin) return;
+
+  // Never intercept Vite dev modules, HMR, source files, or API translate/TTS calls
+  if (
+    url.pathname.startsWith('/@') ||
+    url.pathname.startsWith('/src/') ||
+    url.pathname.startsWith('/node_modules/') ||
+    (url.pathname.startsWith('/api/') &&
+      url.pathname !== '/api/books/proxy-pdf' &&
+      url.pathname !== '/api/books/proxy-cover')
+  ) {
+    return;
+  }
+
+  if (url.pathname.startsWith('/pdfjs/')) {
+    event.respondWith(
+      caches.open(PDFJS_CACHE).then(async (cache) => {
+        const hit = await cache.match(req);
+        if (hit) return hit;
+        const resp = await fetch(req);
+        if (resp && resp.ok) {
+          cache.put(req, resp.clone()).catch(() => {});
+        }
+        return resp;
+      })
+    );
+    return;
+  }
+
+  if (
+    /^\\/assets\\/aistudio\\/.*\\.pdf$/i.test(url.pathname) ||
+    url.pathname === '/api/books/proxy-pdf' ||
+    url.pathname === '/api/books/proxy-cover'
+  ) {
+    event.respondWith(
+      caches.open(LIBRARY_CACHE).then(async (cache) => {
+        const hit = await cache.match(req);
+        if (hit) return hit;
+        const resp = await fetch(req);
+        if (resp && resp.ok) {
+          cache.put(req, resp.clone()).catch(() => {});
+        }
+        return resp;
+      })
+    );
+    return;
+  }
+
+  if (req.mode === 'navigate') {
+    event.respondWith(
+      fetch(req).catch(async () => {
+        const cache = await caches.open(LIBRARY_CACHE);
+        return (await cache.match('/')) || Response.error();
+      })
+    );
+  }
+});
+`);
+    });
+
     const vite = await createViteServer({
       server: {
         middlewareMode: true,

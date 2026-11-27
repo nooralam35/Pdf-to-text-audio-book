@@ -52,6 +52,14 @@ export const ChapterSidebar: React.FC<ChapterSidebarProps> = ({
   const [query, setQuery] = useState('');
   const [sidebarView, setSidebarView] = useState<'chapters' | 'bookmarks'>('chapters');
 
+  const safeBookmarks = useMemo(
+    () =>
+      Array.isArray(bookmarks)
+        ? bookmarks.filter((n) => typeof n === 'number' && Number.isFinite(n))
+        : [],
+    [bookmarks]
+  );
+
   const filteredChapters = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return chapters;
@@ -120,7 +128,7 @@ export const ChapterSidebar: React.FC<ChapterSidebarProps> = ({
             }`}
           >
             <Bookmark className="w-3 h-3" />
-            <span>Bookmarks ({bookmarks.length})</span>
+            <span>Bookmarks ({safeBookmarks.length})</span>
           </button>
         </div>
 
@@ -142,14 +150,14 @@ export const ChapterSidebar: React.FC<ChapterSidebarProps> = ({
       {/* Chapter List or Bookmarks List */}
       <div className="flex-1 overflow-y-auto divide-y divide-stone-200/70 sepia:divide-[#DFD4BC] dark:divide-stone-800/70">
         {sidebarView === 'bookmarks' ? (
-          bookmarks.length === 0 ? (
+          safeBookmarks.length === 0 ? (
             <div className="px-4 py-10 text-xs text-stone-500 dark:text-stone-400 text-center space-y-1.5">
               <Bookmark className="w-5 h-5 mx-auto text-stone-400" />
               <p className="font-medium text-stone-700 dark:text-stone-300">No bookmarked pages yet</p>
               <p>Click the Bookmark button in the Reader bar to save any page for quick revision.</p>
             </div>
           ) : (
-            bookmarks.map((pg) => {
+            safeBookmarks.map((pg) => {
               const ch = chapters.find((c) => pg >= c.startPage && pg <= c.endPage);
               const isCurr = pg === currentPage;
               return (

@@ -1,6 +1,19 @@
 import * as pdfjsLib from 'pdfjs-dist';
 import type { PDFDocumentProxy, RenderTask } from 'pdfjs-dist/types/src/display/api';
-import type { ChapterItem, ExtractedFigure, ParsedPage, TextBlock } from '../types';
+import type {
+  ChapterItem,
+  ExtractedFigure,
+  OcrScriptMode,
+  ParsedPage,
+  TextBlock,
+} from '../types';
+import {
+  OCR_SCRIPT_OPTIONS,
+  detectTextLanguageCode,
+  getLanguageOption,
+  hasNonLatinScript,
+  isTextPredominantlyRtl,
+} from './languages';
 
 // Configure PDF.js worker using Vite asset URL resolution
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
@@ -304,7 +317,7 @@ export async function extractPageContent(
   const words: PositionedWord[] = [];
   for (const item of textContent.items) {
     if (!('str' in item)) continue;
-    const str = item.str;
+    const str = item.str.normalize('NFKC');
     if (!str || !str.trim()) continue;
     const tx = item.transform;
     const fontSize = Math.hypot(tx[0], tx[1]) || item.height || 11;
@@ -324,28 +337,67 @@ export async function extractPageContent(
     });
   }
 
-  // Group words into visual lines (by baseline Y proximity)
-  words.sort((a, b) => (Math.abs(a.y - b.y) < 3.5 ? a.x - b.x : a.y - b.y));
+  // Group words into baseline visual line buckets first, then order LTR or RTL cleanly inside each bucket
+  words.sort((a, b) => a.y - b.y || a.x - b.x);
+
+  const lineBuckets: PositionedWord[][] = [];
+  for (const w of words) {
+    const lastBucket = lineBuckets[lineBuckets.length - 1];
+    if (
+      lastBucket &&
+      Math.abs(lastBucket[0].y - w.y) <= Math.max(4, Math.max(lastBucket[0].fontSize, w.fontSize) * 0.45)
+    ) {
+      lastBucket.push(w);
+    } else {
+      lineBuckets.push([w]);
+    }
+  }
+
+  const COMBINING_START_RE = /^[\p{M}\u200C\u200D\u094D\u09CD\u0A4D\u0ACD\u0B4D\u0BCD\u0C4D\u0D4D]/u;
+  const VIRAMA_END_RE = /[\u200C\u200D\u094D\u09CD\u0A4D\u0ACD\u0B4D\u0BCD\u0C4D\u0D4D]$/;
 
   const lines: RawLine[] = [];
-  for (const w of words) {
-    const last = lines[lines.length - 1];
-    if (last && Math.abs(last.y - w.y) <= Math.max(4, w.fontSize * 0.42)) {
-      const gap = w.x - (last.x + last.text.length * last.fontSize * 0.45);
-      const needsSpace =
-        !last.text.endsWith(' ') && !w.str.startsWith(' ') && (gap > -4 || /[A-Za-z0-9]$/.test(last.text));
-      last.text += (needsSpace ? ' ' : '') + w.str;
-      last.fontSize = Math.max(last.fontSize, w.fontSize);
-      last.isBold = last.isBold || w.isBold;
-    } else {
-      lines.push({
-        y: w.y,
-        x: w.x,
-        text: w.str,
-        fontSize: w.fontSize,
-        isBold: w.isBold,
-      });
+  for (const bucket of lineBuckets) {
+    const bucketPreview = bucket.map((b) => b.str).join(' ');
+    const rtlLine = isTextPredominantlyRtl(bucketPreview);
+    bucket.sort((a, b) => (rtlLine ? b.x - a.x : a.x - b.x));
+
+    let text = '';
+    let maxFontSize = bucket[0]?.fontSize ?? 11;
+    let isBold = false;
+    let prev = bucket[0];
+
+    for (let i = 0; i < bucket.length; i++) {
+      const w = bucket[i];
+      maxFontSize = Math.max(maxFontSize, w.fontSize);
+      isBold = isBold || w.isBold;
+      if (i === 0) {
+        text = w.str;
+      } else {
+        const gap = rtlLine
+          ? prev.x - (w.x + w.width)
+          : w.x - (prev.x + prev.width);
+        const isCombiningJoin =
+          COMBINING_START_RE.test(w.str) || VIRAMA_END_RE.test(text);
+        const needsSpace =
+          !isCombiningJoin &&
+          !text.endsWith(' ') &&
+          !w.str.startsWith(' ') &&
+          gap > Math.max(1.2, w.fontSize * 0.14);
+        text += (needsSpace ? ' ' : '') + w.str;
+      }
+      prev = w;
     }
+
+    const leftX = Math.min(...bucket.map((b) => b.x));
+    const avgY = bucket.reduce((acc, b) => acc + b.y, 0) / bucket.length;
+    lines.push({
+      y: avgY,
+      x: leftX,
+      text,
+      fontSize: maxFontSize,
+      isBold,
+    });
   }
 
   // Filter out running book headers at very top & standalone page numbers at very bottom
@@ -519,6 +571,12 @@ export async function extractPageContent(
     }
   }
 
+  const combinedText = blocks.map((b) => b.text).join(' ');
+  const looksGarbled = detectGarbledBlocks(blocks);
+  const scriptDirection: 'ltr' | 'rtl' = isTextPredominantlyRtl(combinedText) ? 'rtl' : 'ltr';
+  const detectedLangCode = detectTextLanguageCode(combinedText);
+  const detectedLang = getLanguageOption(detectedLangCode).name;
+
   return {
     pageNumber,
     width: pageWidth,
@@ -526,7 +584,74 @@ export async function extractPageContent(
     blocks,
     figures,
     isBlank: blocks.length === 0 && figures.length === 0,
+    looksGarbled,
+    scriptDirection,
+    detectedLang,
   };
+}
+
+/**
+ * Detects legacy non-Unicode custom font encodings (KrutiDev, Chanakya, Walkman, broken CMaps)
+ * or scrambled Tesseract/PDF mojibake so the reader can auto-recover clean Unicode text.
+ */
+export function detectGarbledBlocks(blocks: TextBlock[]): boolean {
+  if (!blocks || blocks.length === 0) return false;
+  const fullText = blocks.map((b) => b.text).join(' ').replace(/\s+/g, ' ').trim();
+  if (!fullText) return false;
+
+  const nonSpace = fullText.replace(/\s+/g, '');
+  if (nonSpace.length < 12) return false;
+
+  // 1. Replacement chars or Private-Use-Area glyphs almost always mean broken font ToUnicode CMap
+  const brokenGlyphs = (fullText.match(/[\uFFFD\uE000-\uF8FF]/g) ?? []).length;
+  if (brokenGlyphs >= 3 || brokenGlyphs / nonSpace.length > 0.025) {
+    return true;
+  }
+
+  // 2. Stray control/symbol noise characters common in mojibake / bad English-only OCR of Indic/RTL pages
+  const weirdSymbols = (
+    fullText.match(/[~`|^\\<>@#$%*=+_{}[\]©®°±×÷¤¦¨ª«¬¯²³´µ¶¸¹º»¿ØÞƒ†‡]/g) ?? []
+  ).length;
+  if (weirdSymbols / nonSpace.length > 0.055) {
+    return true;
+  }
+
+  // 3. Classic legacy Indian non-Unicode ASCII font encoding markers (KrutiDev / Chanakya / Shusha)
+  if (!hasNonLatinScript(fullText)) {
+    const legacyIndicMatches =
+      fullText.match(
+        /\b(?:vkSj|dks|gSa|gS|esa|dh|fd|ls|ij|bl|dk|ds|ugha|rFkk|iz|v\/;|\w+[\[\]{};\\]+\w+)\b/g
+      ) ?? [];
+    if (legacyIndicMatches.length >= 3) {
+      return true;
+    }
+    // Excessive mixed-case inside lowercase ASCII words or digits embedded inside words
+    const tokens = fullText.split(/\s+/).filter(Boolean);
+    if (tokens.length >= 6) {
+      const suspiciousTokens = tokens.filter(
+        (t) =>
+          (t.length >= 3 && /[a-z][A-Z]|[;'\[\]{}~`]/.test(t)) ||
+          /^[.,:;!?~`|><\-_=+]+$/.test(t)
+      ).length;
+      if (suspiciousTokens / tokens.length > 0.34) {
+        return true;
+      }
+    }
+  }
+
+  // 4. Severe line fragmentation: too many tiny symbol/1-2 char garbage blocks
+  if (blocks.length >= 5) {
+    const tinyGarbageBlocks = blocks.filter((b) => {
+      const t = b.text.trim();
+      const letters = t.replace(/[\s\p{P}\p{S}\d]/gu, '');
+      return t.length <= 4 && letters.length <= 2;
+    }).length;
+    if (tinyGarbageBlocks / blocks.length > 0.45) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 // Auto-detect book chapters from PDF Outline OR Table of Contents pages
@@ -776,61 +901,157 @@ export interface OcrProgressUpdate {
   stage: string;
 }
 
-// On-demand client-side OCR via Tesseract.js for scanned PDFs or image label extraction
+export interface OcrRunOptions {
+  scale?: number;
+  scriptMode?: OcrScriptMode;
+  preferAiVision?: boolean;
+}
+
+function cleanOcrFallbackText(rawText: string): string[] {
+  return rawText
+    .split(/\n{2,}/)
+    .map((p) => p.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim())
+    .filter((p) => {
+      if (p.length <= 1) return false;
+      // Drop pure punctuation/symbol noise lines while preserving real words in any Unicode script
+      const letters = p.replace(/[\s\p{P}\p{S}]/gu, '');
+      return letters.length >= 2;
+    });
+}
+
+// Universal On-Demand OCR: uses Gemini AI Vision (/api/ocr-page) for near-100% fidelity across
+// Sanskrit, Hindi, Marathi, Urdu, Arabic, Bengali, Tamil, Telugu, Gujarati, Punjabi & English,
+// with multilingual Tesseract.js fallback for offline reading.
 export async function runClientOcrOnPage(
   pdf: PDFDocumentProxy,
   pageNumber: number,
   onProgress?: (update: OcrProgressUpdate) => void,
-  options?: { scale?: number }
+  options?: OcrRunOptions
 ): Promise<ParsedPage> {
   const scale = options?.scale ?? 2.0;
+  const scriptMode: OcrScriptMode = options?.scriptMode ?? 'auto';
+  const preferAiVision = options?.preferAiVision !== false;
+
   onProgress?.({
-    progress: 6,
+    progress: 8,
     stage: scale > 2.1 ? 'Rendering high-DPI page snapshot…' : 'Rendering page snapshot…',
   });
-  const { dataUrl, width, height } = await renderPageToDataUrl(
+
+  // Render clean JPEG for fast AI Vision upload (fallback PNG only if needed for Tesseract)
+  const { dataUrl: jpegUrl, width, height } = await renderPageToDataUrl(
     pdf,
     pageNumber,
     scale,
-    'image/png'
+    'image/jpeg',
+    0.92
   );
 
-  onProgress?.({ progress: 15, stage: 'Loading OCR engine…' });
-  const Tesseract = await import('tesseract.js');
-  const result = await Tesseract.recognize(dataUrl, 'eng', {
-    logger: (m) => {
-      const p = typeof m.progress === 'number' ? Math.max(0, Math.min(1, m.progress)) : 0;
-      if (m.status === 'loading tesseract core' || m.status === 'initializing tesseract') {
-        onProgress?.({
-          progress: Math.round(18 + p * 8),
-          stage: 'Initializing OCR core…',
+  // Path A: Universal Multilingual AI Vision OCR (reads every script verbatim without gibberish)
+  if (preferAiVision && (typeof navigator === 'undefined' || navigator.onLine !== false)) {
+    try {
+      onProgress?.({
+        progress: 34,
+        stage: 'Reading exact script & layout with AI Vision OCR…',
+      });
+
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), 36000);
+      try {
+        const res = await fetch('/api/ocr-page', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            imageBase64: jpegUrl,
+            pageNumber,
+            scriptMode,
+          }),
+          signal: controller.signal,
         });
-      } else if (m.status === 'loading language traineddata') {
-        onProgress?.({
-          progress: Math.round(26 + p * 10),
-          stage: 'Loading language model…',
-        });
-      } else if (m.status === 'initializing api') {
-        onProgress?.({
-          progress: 38,
-          stage: 'Preparing layout recognizer…',
-        });
-      } else if (m.status === 'recognizing text') {
-        onProgress?.({
-          progress: Math.round(40 + p * 57),
-          stage: 'Recognizing text from page layout…',
-        });
+
+        if (res.ok) {
+          onProgress?.({ progress: 92, stage: 'Structuring exact extracted text blocks…' });
+          const data = (await res.json()) as {
+            detectedLang?: string;
+            scriptDirection?: 'ltr' | 'rtl';
+            blocks?: TextBlock[];
+          };
+
+          const aiBlocks = Array.isArray(data.blocks)
+            ? data.blocks.filter((b) => b && typeof b.text === 'string' && b.text.trim().length > 0)
+            : [];
+
+          onProgress?.({ progress: 100, stage: 'Multilingual OCR extraction ready for review' });
+          return {
+            pageNumber,
+            width: width / scale,
+            height: height / scale,
+            blocks: aiBlocks,
+            figures: [],
+            isBlank: aiBlocks.length === 0,
+            isOcr: true,
+            ocrEngine: 'ai-vision',
+            looksGarbled: false,
+            detectedLang: data.detectedLang || 'Auto',
+            scriptDirection: data.scriptDirection === 'rtl' ? 'rtl' : 'ltr',
+          };
+        }
+      } finally {
+        window.clearTimeout(timeoutId);
       }
-    },
+    } catch {
+      // Gracefully fall through to offline multilingual Tesseract OCR
+    }
+  }
+
+  // Path B: Multilingual Tesseract.js Offline Fallback
+  const scriptOpt =
+    OCR_SCRIPT_OPTIONS.find((opt) => opt.id === scriptMode) ?? OCR_SCRIPT_OPTIONS[0];
+  onProgress?.({
+    progress: 18,
+    stage: `Loading offline ${scriptOpt.shortLabel} OCR engine…`,
   });
+
+  const Tesseract = await import('tesseract.js');
+  const recognizeWithLang = async (langs: string) =>
+    Tesseract.recognize(jpegUrl, langs, {
+      logger: (m) => {
+        const p = typeof m.progress === 'number' ? Math.max(0, Math.min(1, m.progress)) : 0;
+        if (m.status === 'loading tesseract core' || m.status === 'initializing tesseract') {
+          onProgress?.({
+            progress: Math.round(20 + p * 10),
+            stage: 'Initializing offline OCR core…',
+          });
+        } else if (m.status === 'loading language traineddata') {
+          onProgress?.({
+            progress: Math.round(30 + p * 15),
+            stage: `Loading ${scriptOpt.shortLabel} language model…`,
+          });
+        } else if (m.status === 'initializing api') {
+          onProgress?.({
+            progress: 46,
+            stage: 'Preparing multilingual recognizer…',
+          });
+        } else if (m.status === 'recognizing text') {
+          onProgress?.({
+            progress: Math.round(48 + p * 48),
+            stage: `Recognizing ${scriptOpt.shortLabel} text…`,
+          });
+        }
+      },
+    });
+
+  let result;
+  try {
+    result = await recognizeWithLang(scriptOpt.tesseractLangs);
+  } catch {
+    // Secondary fallback if combined traineddata fails to fetch offline
+    result = await recognizeWithLang('eng');
+  }
 
   onProgress?.({ progress: 99, stage: 'Structuring extracted text blocks…' });
 
-  const rawText = result.data.text ?? '';
-  const paragraphs = rawText
-    .split(/\n{2,}/)
-    .map((p) => p.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim())
-    .filter((p) => p.length > 2);
+  const rawText = (result.data.text ?? '').normalize('NFKC');
+  const paragraphs = cleanOcrFallbackText(rawText);
 
   const blocks: TextBlock[] = paragraphs.map((text, idx) => ({
     id: `p${pageNumber}-ocr-${idx + 1}`,
@@ -839,6 +1060,9 @@ export async function runClientOcrOnPage(
     yPercent: Math.round(((idx + 1) / (paragraphs.length + 1)) * 90),
     fontSize: idx === 0 ? 15 : 11,
   }));
+
+  const combined = blocks.map((b) => b.text).join(' ');
+  const detectedCode = detectTextLanguageCode(combined);
 
   onProgress?.({ progress: 100, stage: 'OCR extraction ready for review' });
 
@@ -850,5 +1074,9 @@ export async function runClientOcrOnPage(
     figures: [],
     isBlank: blocks.length === 0,
     isOcr: true,
+    ocrEngine: 'tesseract',
+    looksGarbled: detectGarbledBlocks(blocks),
+    detectedLang: getLanguageOption(detectedCode).name,
+    scriptDirection: isTextPredominantlyRtl(combined) ? 'rtl' : 'ltr',
   };
 }

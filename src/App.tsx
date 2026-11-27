@@ -59,6 +59,7 @@ import {
 } from './lib/voiceProfiles';
 import {
   detectChapters,
+  detectGarbledBlocks,
   extractPageContent,
   loadPdfFromBuffer,
   loadPdfFromUrl,
@@ -69,6 +70,7 @@ import {
 import {
   deleteBook,
   getBook,
+  getBookPdfData,
   getParsedPage,
   getTranslation,
   listAllTranslationCountsByBook,
@@ -78,6 +80,7 @@ import {
   saveBook,
   saveParsedPage,
   saveTranslation,
+  stripBookBinary,
   toggleBookBookmark,
   toggleBookSavedBookmark,
   updateBookProgress,
@@ -95,12 +98,14 @@ import {
   translatePageBlocks,
   translatePagesBatchFast,
 } from './lib/translatorClient';
+import { logDevError } from './lib/devErrorLog';
 import type {
   BatchTranslationProgress,
   ChapterItem,
   ChapterSummaryResult,
   DiscoveredBook,
   LanguageCode,
+  OcrScriptMode,
   ParsedPage,
   ReadingTheme,
   StoredBook,
@@ -160,8 +165,10 @@ export default function App() {
   const [activeBook, setActiveBook] = useState<StoredBook | null>(null);
   const [loadedPdf, setLoadedPdf] = useState<LoadedPdf | null>(null);
   const [isInitializing, setIsInitializing] = useState(true);
+  const [isLoadingActivePdf, setIsLoadingActivePdf] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [appBanner, setAppBanner] = useState<string | null>(null);
+  const lazyOpenInFlightRef = useRef<string | null>(null);
 
   // Reader State
   const [currentPage, setCurrentPage] = useState(1);
@@ -204,6 +211,22 @@ export default function App() {
   const [isRunningOcr, setIsRunningOcr] = useState(false);
   const [ocrProgress, setOcrProgress] = useState(0);
   const [ocrStage, setOcrStage] = useState('');
+  const [ocrScriptMode, setOcrScriptMode] = useState<OcrScriptMode>(() => {
+    if (typeof window === 'undefined') return 'auto';
+    const saved = localStorage.getItem('bhashabook-ocr-script');
+    const allowed: OcrScriptMode[] = [
+      'auto',
+      'devanagari',
+      'persoarabic',
+      'bengali',
+      'tamil',
+      'telugu',
+      'gujarati',
+      'gurmukhi',
+      'latin',
+    ];
+    return allowed.includes(saved as OcrScriptMode) ? (saved as OcrScriptMode) : 'auto';
+  });
   const [pendingOcrReview, setPendingOcrReview] = useState<PendingOcrReview | null>(null);
   const [batchProgress, setBatchProgress] = useState<BatchTranslationProgress | null>(null);
   const batchCancelRef = useRef(false);
@@ -212,11 +235,14 @@ export default function App() {
 
   // Deduplicated Background Auto-Translate & Auto-Save Tracking
   const inFlightTranslationsRef = useRef<Map<string, Promise<TranslatedPageRecord>>>(new Map());
+  const autoOcrInFlightRef = useRef<Map<string, Promise<ParsedPage>>>(new Map());
   const [inFlightKeys, setInFlightKeys] = useState<Set<string>>(() => new Set());
   const [prefetchErrorKeys, setPrefetchErrorKeys] = useState<Set<string>>(() => new Set());
   const activeBookIdRef = useRef<string | null>(null);
   const currentPageRef = useRef<number>(1);
   const targetLangRef = useRef<LanguageCode>('hi');
+  const aiAvailableRef = useRef<boolean>(false);
+  const ocrScriptModeRef = useRef<OcrScriptMode>('auto');
 
   // Audiobook Playback Sync State
   const [activeSentenceIndex, setActiveSentenceIndex] = useState<number | null>(null);
@@ -232,6 +258,8 @@ export default function App() {
     action: DiscoverBookAction;
     status: string;
   } | null>(null);
+  const bookmarkPendingRef = useRef<Set<string>>(new Set());
+  const bookmarkSeqRef = useRef(0);
   const [pendingPostLoadAction, setPendingPostLoadAction] = useState<{
     bookId: string;
     action: 'translate' | 'listen';
@@ -291,9 +319,19 @@ export default function App() {
     setDailyReadingGoal(setDailyReadingGoalPages(pages));
   }, []);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem('bhashabook-ocr-script', ocrScriptMode);
+    } catch {
+      // ignore storage errors
+    }
+  }, [ocrScriptMode]);
+
   activeBookIdRef.current = activeBook?.id ?? null;
   currentPageRef.current = currentPage;
   targetLangRef.current = targetLang;
+  aiAvailableRef.current = aiAvailable;
+  ocrScriptModeRef.current = ocrScriptMode;
 
   const customTerms = useMemo(
     () =>
@@ -337,7 +375,10 @@ export default function App() {
   }, []);
 
   const booksCacheSignature = useMemo(
-    () => books.map((b) => `${b.id}:${b.pdfData && b.pdfData.byteLength > 0 ? 1 : 0}`).join('|'),
+    () =>
+      books
+        .map((b) => `${b.id}:${b.hasLocalPdf || (b.pdfData && b.pdfData.byteLength > 0) ? 1 : 0}`)
+        .join('|'),
     [books]
   );
   const booksRef = useRef(books);
@@ -353,103 +394,232 @@ export default function App() {
     }
   }, [isOnline, swStatus]);
 
-  // Keep in-memory Library list & activeBook synchronized and ordered by most recently used
+  const activeBookRef = useRef<StoredBook | null>(null);
+  activeBookRef.current = activeBook;
+
+  // Keep in-memory Library list & activeBook synchronized immutably and ordered by most recently used
   const syncUpdatedBookInState = useCallback((updated: StoredBook, syncActive = true) => {
+    const stripped = stripBookBinary(updated);
+    const normalized: StoredBook = {
+      ...stripped,
+      chapters: Array.isArray(stripped.chapters) ? stripped.chapters : [],
+      bookmarks: Array.isArray(stripped.bookmarks)
+        ? [...stripped.bookmarks].filter((n) => typeof n === 'number' && Number.isFinite(n))
+        : stripped.bookmarks,
+    };
+
     setBooks((prev) => {
-      const exists = prev.some((b) => b.id === updated.id);
+      const exists = prev.some((b) => b.id === normalized.id);
       const next = exists
-        ? prev.map((b) => (b.id === updated.id ? updated : b))
-        : [updated, ...prev];
+        ? prev.map((b) => (b.id === normalized.id ? normalized : b))
+        : [normalized, ...prev];
       return [...next].sort(
         (a, b) => (b.lastOpenedAt ?? b.addedAt) - (a.lastOpenedAt ?? a.addedAt)
       );
     });
+
     if (syncActive) {
-      setActiveBook((curr) => (curr && curr.id === updated.id ? updated : curr));
+      setActiveBook((curr) => {
+        if (!curr || curr.id !== normalized.id) return curr;
+        return {
+          ...curr,
+          ...normalized,
+          bookmarks: normalized.bookmarks ? [...normalized.bookmarks] : undefined,
+        };
+      });
     }
   }, []);
 
-  // Open a StoredBook into the active PDF.js instance (offline-first: IndexedDB -> SW Cache -> Network)
+  // Reconcile activeBook immutably whenever books metadata updates, preventing stale or null state renders
+  useEffect(() => {
+    setActiveBook((curr) => {
+      if (!curr) return curr;
+      const match = books.find((b) => b.id === curr.id);
+      if (!match) return curr;
+      const cleanMatch = stripBookBinary(match);
+      const currBookmarks = Array.isArray(curr.bookmarks) ? curr.bookmarks : [];
+      const nextBookmarks = Array.isArray(cleanMatch.bookmarks) ? cleanMatch.bookmarks : [];
+      const bookmarksChanged =
+        currBookmarks.length !== nextBookmarks.length ||
+        currBookmarks.some((p, i) => p !== nextBookmarks[i]);
+
+      if (
+        !bookmarksChanged &&
+        curr.isBookmarked === cleanMatch.isBookmarked &&
+        curr.lastPage === cleanMatch.lastPage &&
+        curr.annotations === cleanMatch.annotations &&
+        curr.hasLocalPdf === cleanMatch.hasLocalPdf &&
+        curr.numPages === cleanMatch.numPages &&
+        curr.chapters.length === (cleanMatch.chapters?.length ?? 0)
+      ) {
+        return curr;
+      }
+
+      return {
+        ...curr,
+        ...cleanMatch,
+        bookmarks: cleanMatch.bookmarks ? [...nextBookmarks] : undefined,
+      };
+    });
+  }, [books]);
+
+  // Hydrate PDF binary, chapters & cover on demand for lightweight bookmarked Discover books
+  const hydrateDiscoveredBookPdf = useCallback(
+    async (
+      book: StoredBook,
+      onStatus?: (message: string) => void
+    ): Promise<{ book: StoredBook; pdf: LoadedPdf; buffer: ArrayBuffer }> => {
+      if (!book.discoveredBook) {
+        throw new Error('PDF source data missing for this book.');
+      }
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        throw new Error(
+          'This bookmarked book has not been downloaded for offline reading yet. Reconnect once and open or save it offline.'
+        );
+      }
+
+      const { buffer, fileName } = await fetchExternalBookAsPdfBuffer(
+        book.discoveredBook,
+        onStatus
+      );
+      onStatus?.(`Preparing chapters & cover for “${book.title}”…`);
+
+      const pdf = await loadPdfFromBuffer(buffer);
+      const [{ chapters, detectedTitle, detectedAuthor }, coverRes, p1] = await Promise.all([
+        detectChapters(pdf),
+        renderPageToDataUrl(pdf, 1, 1.25, 'image/jpeg', 0.85),
+        pdf.getPage(1),
+      ]);
+      const vp1 = p1.getViewport({ scale: 1.0 });
+      const ch1 = chapters.find((c) => c.index === 1) ?? chapters[0];
+      const defaultStartPage =
+        ch1 && ch1.startPage > 1 ? ch1.startPage : pdf.numPages > 1 ? 2 : 1;
+
+      const hydrated: StoredBook = {
+        ...book,
+        title: book.title || detectedTitle || 'Public Domain E-Book',
+        author: book.author || detectedAuthor || '',
+        fileName: fileName || book.fileName,
+        numPages: pdf.numPages,
+        coverDataUrl: coverRes.dataUrl || book.coverDataUrl,
+        chapters: chapters.length > 0 ? chapters : book.chapters,
+        pdfData: buffer,
+        hasLocalPdf: true,
+        lastPage: book.lastPage > 1 ? Math.min(pdf.numPages, book.lastPage) : defaultStartPage,
+        lastOpenedAt: Date.now(),
+        pageWidth: vp1.width,
+        pageHeight: vp1.height,
+      };
+
+      await saveBook(hydrated);
+      cacheBookForOffline(hydrated).catch(() => {});
+      const stripped = stripBookBinary(hydrated);
+      syncUpdatedBookInState(stripped, false);
+      return { book: stripped, pdf, buffer };
+    },
+    [syncUpdatedBookInState]
+  );
+
+  // Open a StoredBook into the active PDF.js instance (offline-first: IndexedDB -> SW Cache -> Network -> Lazy Discover Hydration)
   const openStoredBook = useCallback(
     async (
       book: StoredBook,
       options?: { pageOverride?: number; restoreAudioState?: boolean }
     ) => {
       setAppBanner(null);
-      let pdfDoc: LoadedPdf;
-      if (book.pdfData && book.pdfData.byteLength > 0) {
-        pdfDoc = await loadPdfFromBuffer(book.pdfData);
-      } else {
-        const cachedSwBuffer = await getCachedBookBufferFromSW(book);
-        if (cachedSwBuffer) {
-          pdfDoc = await loadPdfFromBuffer(cachedSwBuffer);
-        } else if (book.sourceUrl) {
-          if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-            throw new Error(
-              'This PDF has not been saved for offline reading yet. Reconnect once and click “Save Offline” in My Library.'
-            );
-          }
-          pdfDoc = await loadPdfFromUrl(book.sourceUrl);
-          // Persist into Service Worker cache & IndexedDB in background so future offline opens work immediately
-          cacheBookForOffline(book)
-            .then((cached) => {
-              syncUpdatedBookInState(cached);
-            })
-            .catch(() => {});
+      setIsLoadingActivePdf(true);
+      try {
+        let resolvedBook = book;
+        let pdfDoc: LoadedPdf;
+        let localPdfData =
+          book.pdfData && book.pdfData.byteLength > 0 ? book.pdfData : undefined;
+        if (!localPdfData && book.hasLocalPdf) {
+          localPdfData = await getBookPdfData(book.id);
+        }
+
+        if (localPdfData && localPdfData.byteLength > 0) {
+          pdfDoc = await loadPdfFromBuffer(localPdfData);
         } else {
-          throw new Error('PDF source data missing for this book.');
+          const cachedSwBuffer = await getCachedBookBufferFromSW(book);
+          if (cachedSwBuffer) {
+            pdfDoc = await loadPdfFromBuffer(cachedSwBuffer);
+          } else if (book.sourceUrl) {
+            if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+              throw new Error(
+                'This PDF has not been saved for offline reading yet. Reconnect once and click “Save Offline” in My Library.'
+              );
+            }
+            pdfDoc = await loadPdfFromUrl(book.sourceUrl);
+            // Persist into Service Worker cache in background so future offline opens work immediately
+            cacheBookForOffline(book)
+              .then((cached) => {
+                syncUpdatedBookInState(cached);
+              })
+              .catch(() => {});
+          } else if (book.discoveredBook) {
+            const hydrated = await hydrateDiscoveredBookPdf(book);
+            resolvedBook = hydrated.book;
+            pdfDoc = hydrated.pdf;
+          } else {
+            throw new Error('PDF source data missing for this book.');
+          }
         }
-      }
 
-      const targetPage = Math.max(
-        1,
-        Math.min(
-          book.numPages,
-          options?.pageOverride ??
-            (options?.restoreAudioState ? book.lastAudioPage ?? book.lastPage : book.lastPage) ??
-            1
-        )
-      );
+        const targetPage = Math.max(
+          1,
+          Math.min(
+            resolvedBook.numPages,
+            options?.pageOverride ??
+              (options?.restoreAudioState
+                ? resolvedBook.lastAudioPage ?? resolvedBook.lastPage
+                : resolvedBook.lastPage) ??
+              1
+          )
+        );
 
-      const now = Date.now();
-      const updatedBook =
-        (await updateBookProgress(book.id, {
-          lastPage: targetPage,
-          lastOpenedAt: now,
-        }).catch(() => undefined)) ?? { ...book, lastPage: targetPage, lastOpenedAt: now };
+        const now = Date.now();
+        const updatedBook = stripBookBinary(
+          (await updateBookProgress(resolvedBook.id, {
+            lastPage: targetPage,
+            lastOpenedAt: now,
+          }).catch(() => undefined)) ?? { ...resolvedBook, lastPage: targetPage, lastOpenedAt: now }
+        );
 
-      setLoadedPdf((prev) => {
-        if (prev && prev !== pdfDoc) {
-          prev.cleanup().catch(() => {});
+        setLoadedPdf((prev) => {
+          if (prev && prev !== pdfDoc) {
+            prev.cleanup().catch(() => {});
+          }
+          return pdfDoc;
+        });
+        setActiveBook(updatedBook);
+        syncUpdatedBookInState(updatedBook);
+        setCurrentPage(targetPage);
+
+        if (options?.restoreAudioState) {
+          if (updatedBook.lastTargetLang) {
+            setTargetLang(updatedBook.lastTargetLang);
+          }
+          if (updatedBook.lastNarrationSource) {
+            setNarrationSource(updatedBook.lastNarrationSource);
+          }
         }
-        return pdfDoc;
-      });
-      setActiveBook(updatedBook);
-      syncUpdatedBookInState(updatedBook);
-      setCurrentPage(targetPage);
 
-      if (options?.restoreAudioState) {
-        if (updatedBook.lastTargetLang) {
-          setTargetLang(updatedBook.lastTargetLang);
+        if (
+          updatedBook.lastAudioPage === targetPage &&
+          typeof updatedBook.lastSentenceIndex === 'number'
+        ) {
+          setActiveSentenceIndex(updatedBook.lastSentenceIndex);
+        } else {
+          setActiveSentenceIndex(null);
         }
-        if (updatedBook.lastNarrationSource) {
-          setNarrationSource(updatedBook.lastNarrationSource);
-        }
-      }
-
-      if (
-        updatedBook.lastAudioPage === targetPage &&
-        typeof updatedBook.lastSentenceIndex === 'number'
-      ) {
-        setActiveSentenceIndex(updatedBook.lastSentenceIndex);
-      } else {
-        setActiveSentenceIndex(null);
+      } finally {
+        setIsLoadingActivePdf(false);
       }
     },
-    [syncUpdatedBookInState]
+    [hydrateDiscoveredBookPdf, syncUpdatedBookInState]
   );
 
-  // Boot: non-blocking IndexedDB load first so Discover & Library render immediately, then preload sample guidebook in background
+  // Boot: lightweight IndexedDB metadata load only so Discover & Library render fast with low memory
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -473,87 +643,19 @@ export default function App() {
           .catch(() => {});
 
         const existingBooks = await listBooks();
-        if (!cancelled) {
-          setBooks(existingBooks);
-          setIsInitializing(false);
-          refreshLibraryCounts(existingBooks, targetLang).catch(() => {});
-        }
+        if (cancelled) return;
 
-        const existingObs = existingBooks.find((b) => b.id === PRELOADED_OBS_BOOK_ID);
-        if (existingObs) {
-          if (!cancelled) {
-            await openStoredBook(existingObs).catch(() => {});
-          }
-          return;
-        }
+        setBooks(existingBooks);
+        refreshLibraryCounts(existingBooks, targetLang).catch(() => {});
 
-        if (existingBooks.length > 0) {
-          if (!cancelled) {
-            await openStoredBook(existingBooks[0]).catch(() => {});
-          }
-          return;
-        }
-
-        // First-ever visit with empty library: preload sample guidebook in the background without blocking Discover UI
-        if (typeof navigator === 'undefined' || navigator.onLine !== false) {
-          try {
-            const pdf = await loadPdfFromUrl(PRELOADED_OBS_BOOK_URL);
-            if (cancelled) {
-              pdf.cleanup().catch(() => {});
-              return;
-            }
-            const [{ chapters, detectedTitle, detectedAuthor }, coverRes, p1] = await Promise.all([
-              detectChapters(pdf),
-              renderPageToDataUrl(pdf, 1, 1.35, 'image/jpeg', 0.88),
-              pdf.getPage(1),
-            ]);
-            const vp1 = p1.getViewport({ scale: 1.0 });
-            const ch1 = chapters.find((c) => c.index === 1) ?? chapters[0];
-            const initialPage = ch1 ? ch1.startPage : 1;
-
-            const obsBook: StoredBook = {
-              id: PRELOADED_OBS_BOOK_ID,
-              title: detectedTitle || 'The OBS Superuser Guidebook',
-              author: detectedAuthor || 'Paul Richards',
-              fileName: 'OBS ADVANCED BOOK 6 x 9 in.docx.pdf',
-              numPages: pdf.numPages,
-              coverDataUrl: coverRes.dataUrl,
-              chapters,
-              sourceUrl: PRELOADED_OBS_BOOK_URL,
-              addedAt: Date.now(),
-              lastPage: initialPage,
-              pageWidth: vp1.width,
-              pageHeight: vp1.height,
-            };
-            await saveBook(obsBook);
-            cacheBookForOffline(obsBook)
-              .then((cachedObs) => {
-                if (!cancelled) {
-                  setBooks((prev) =>
-                    prev.map((b) => (b.id === cachedObs.id ? cachedObs : b))
-                  );
-                  setActiveBook((prev) =>
-                    prev && prev.id === cachedObs.id ? cachedObs : prev
-                  );
-                }
-              })
-              .catch(() => {});
-            const updatedList = await listBooks();
-            if (!cancelled) {
-              setBooks(updatedList);
-              refreshLibraryCounts(updatedList, targetLang).catch(() => {});
-              // Only attach as active book if user hasn't already opened another book
-              if (!activeBookIdRef.current) {
-                setLoadedPdf(pdf);
-                setActiveBook(obsBook);
-                setCurrentPage(initialPage);
-              } else {
-                pdf.cleanup().catch(() => {});
-              }
-            }
-          } catch {
-            // Non-fatal: user can browse Discover or upload any local PDF directly
-          }
+        const initialBook =
+          existingBooks.find((b) => b.id === PRELOADED_OBS_BOOK_ID) ?? existingBooks[0];
+        if (initialBook && !activeBookIdRef.current) {
+          const stripped = stripBookBinary(initialBook);
+          setActiveBook(stripped);
+          setCurrentPage(
+            Math.max(1, Math.min(stripped.numPages, stripped.lastPage ?? 1))
+          );
         }
       } finally {
         if (!cancelled) setIsInitializing(false);
@@ -564,6 +666,108 @@ export default function App() {
       cancelled = true;
     };
   }, []);
+
+  // Lazy-load the active PDF (or initialize the sample guidebook on first Reader/Export visit)
+  const activeBookIdForLazy = activeBook?.id ?? null;
+  useEffect(() => {
+    if (isInitializing) return;
+    if (activeTab !== 'reader' && activeTab !== 'export') return;
+    if (loadedPdf) return;
+
+    let cancelled = false;
+    const targetBook = activeBookRef.current;
+
+    if (targetBook && activeBookIdForLazy === targetBook.id) {
+      if (lazyOpenInFlightRef.current === targetBook.id) return;
+      lazyOpenInFlightRef.current = targetBook.id;
+      openStoredBook(targetBook)
+        .catch(() => {})
+        .finally(() => {
+          if (lazyOpenInFlightRef.current === targetBook.id) {
+            lazyOpenInFlightRef.current = null;
+          }
+        });
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    if (
+      books.length === 0 &&
+      (typeof navigator === 'undefined' || navigator.onLine !== false) &&
+      lazyOpenInFlightRef.current !== PRELOADED_OBS_BOOK_ID
+    ) {
+      lazyOpenInFlightRef.current = PRELOADED_OBS_BOOK_ID;
+      setIsLoadingActivePdf(true);
+      (async () => {
+        try {
+          const pdf = await loadPdfFromUrl(PRELOADED_OBS_BOOK_URL);
+          if (cancelled) {
+            pdf.cleanup().catch(() => {});
+            return;
+          }
+          const [{ chapters, detectedTitle, detectedAuthor }, coverRes, p1] = await Promise.all([
+            detectChapters(pdf),
+            renderPageToDataUrl(pdf, 1, 1.35, 'image/jpeg', 0.88),
+            pdf.getPage(1),
+          ]);
+          const vp1 = p1.getViewport({ scale: 1.0 });
+          const ch1 = chapters.find((c) => c.index === 1) ?? chapters[0];
+          const initialPage = ch1 ? ch1.startPage : 1;
+
+          const obsBook: StoredBook = {
+            id: PRELOADED_OBS_BOOK_ID,
+            title: detectedTitle || 'The OBS Superuser Guidebook',
+            author: detectedAuthor || 'Paul Richards',
+            fileName: 'OBS ADVANCED BOOK 6 x 9 in.docx.pdf',
+            numPages: pdf.numPages,
+            coverDataUrl: coverRes.dataUrl,
+            chapters,
+            sourceUrl: PRELOADED_OBS_BOOK_URL,
+            addedAt: Date.now(),
+            lastPage: initialPage,
+            pageWidth: vp1.width,
+            pageHeight: vp1.height,
+          };
+          await saveBook(obsBook);
+          cacheBookForOffline(obsBook)
+            .then((cachedObs) => {
+              if (!cancelled) {
+                syncUpdatedBookInState(cachedObs);
+              }
+            })
+            .catch(() => {});
+          const updatedList = await listBooks();
+          if (!cancelled) {
+            setBooks(updatedList);
+            refreshLibraryCounts(updatedList, targetLangRef.current).catch(() => {});
+            if (!activeBookIdRef.current) {
+              setLoadedPdf(pdf);
+              setActiveBook(stripBookBinary(obsBook));
+              setCurrentPage(initialPage);
+            } else {
+              pdf.cleanup().catch(() => {});
+            }
+          } else {
+            pdf.cleanup().catch(() => {});
+          }
+        } catch {
+          // Non-fatal: user can upload any local PDF or browse Discover
+        } finally {
+          if (lazyOpenInFlightRef.current === PRELOADED_OBS_BOOK_ID) {
+            lazyOpenInFlightRef.current = null;
+          }
+          if (!cancelled) {
+            setIsLoadingActivePdf(false);
+          }
+        }
+      })();
+    }
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeBookIdForLazy, activeTab, books.length, isInitializing, loadedPdf, openStoredBook, refreshLibraryCounts, syncUpdatedBookInState]);
 
   // Load all cached translations for the active book + target language
   const activeBookId = activeBook?.id ?? null;
@@ -626,7 +830,7 @@ export default function App() {
         setTranslatedPage(cachedTr ?? null);
       }
 
-      // 2. Check cached parsed page or extract fresh from PDF.js
+      // 2. Check cached parsed page or extract fresh from PDF.js (and auto-recover garbled/scanned pages with AI Vision OCR)
       let parsed = await getParsedPage(activeBookId, currentPage);
       if (!parsed) {
         try {
@@ -647,6 +851,26 @@ export default function App() {
         setParsedPage(parsed);
       }
 
+      const looksGarbled =
+        !parsed.isOcr &&
+        (parsed.isBlank || parsed.looksGarbled || detectGarbledBlocks(parsed.blocks));
+      if (
+        looksGarbled &&
+        aiAvailableRef.current &&
+        (typeof navigator === 'undefined' || navigator.onLine !== false)
+      ) {
+        const cleanParsed = await ensureCleanParsedPage(
+          activeBookId,
+          loadedPdf,
+          currentPage,
+          parsed
+        ).catch(() => parsed);
+        if (!cancelled && cleanParsed && cleanParsed !== parsed) {
+          parsed = cleanParsed;
+          setParsedPage(cleanParsed);
+        }
+      }
+
       // 3. If a background auto-translation for this exact page is already in flight, attach cleanly without duplicating the request
       if (!cachedTr) {
         const key = makeTranslationKey(activeBookId, targetLang, currentPage);
@@ -659,6 +883,7 @@ export default function App() {
               setTranslatedPage(record);
             }
           } catch (err) {
+            logDevError('app', err, `In-flight translation attach (page ${currentPage})`);
             if (!cancelled) {
               setTranslationError(err instanceof Error ? err.message : 'Translation failed.');
             }
@@ -675,6 +900,28 @@ export default function App() {
       cancelled = true;
     };
   }, [activeBookId, loadedPdf, currentPage, targetLang, activeTab, syncUpdatedBookInState]);
+
+  // If AI capability resolves or device comes online while viewing a garbled/scanned page, auto-recover clean book text
+  useEffect(() => {
+    if (!aiAvailable || !isOnline || !activeBookId || !loadedPdf || !parsedPage) return;
+    if (parsedPage.pageNumber !== currentPage || parsedPage.isOcr) return;
+    const needsClean =
+      parsedPage.isBlank || parsedPage.looksGarbled || detectGarbledBlocks(parsedPage.blocks);
+    if (!needsClean) return;
+
+    let cancelled = false;
+    ensureCleanParsedPage(activeBookId, loadedPdf, currentPage, parsedPage)
+      .then((cleanParsed) => {
+        if (!cancelled && cleanParsed !== parsedPage && cleanParsed.blocks.length > 0) {
+          setParsedPage(cleanParsed);
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
+  }, [aiAvailable, isOnline, activeBookId, loadedPdf, currentPage, parsedPage]);
 
   // Upload a new PDF file from disk
   const handleUploadPdf = async (file: File) => {
@@ -720,10 +967,11 @@ export default function App() {
         if (prev && prev !== pdf) prev.cleanup().catch(() => {});
         return pdf;
       });
-      setActiveBook(newBook);
+      setActiveBook(stripBookBinary(newBook));
       setCurrentPage(startPage);
       setActiveTab('reader');
     } catch (err) {
+      logDevError('app', err, `Upload PDF (${file.name})`);
       setAppBanner(
         err instanceof Error ? `Failed to parse PDF: ${err.message}` : 'Failed to load PDF file.'
       );
@@ -757,7 +1005,14 @@ export default function App() {
       setCachingBookId(book.id);
       setAppBanner(null);
       try {
-        const cached = await cacheBookForOffline(book);
+        let cached: StoredBook;
+        if (!book.hasLocalPdf && !book.sourceUrl && book.discoveredBook) {
+          const hydrated = await hydrateDiscoveredBookPdf(book);
+          hydrated.pdf.cleanup().catch(() => {});
+          cached = hydrated.book;
+        } else {
+          cached = await cacheBookForOffline(book);
+        }
         await warmPdfEngineOfflineAssets();
         const updatedList = await listBooks();
         setBooks(updatedList);
@@ -767,6 +1022,7 @@ export default function App() {
         await refreshOfflineInspection(updatedList);
         setAppBanner(`“${book.title}” is now cached in your browser for offline reading.`);
       } catch (err) {
+        logDevError('app', err, `Cache book offline (${book.title})`);
         setAppBanner(
           err instanceof Error
             ? `Could not cache “${book.title}” offline: ${err.message}`
@@ -776,7 +1032,13 @@ export default function App() {
         setCachingBookId(null);
       }
     },
-    [activeBook?.id, cachingBookId, isSyncingAllOffline, refreshOfflineInspection]
+    [
+      activeBook?.id,
+      cachingBookId,
+      hydrateDiscoveredBookPdf,
+      isSyncingAllOffline,
+      refreshOfflineInspection,
+    ]
   );
 
   const handleSyncAllOffline = useCallback(async () => {
@@ -789,7 +1051,12 @@ export default function App() {
       await warmPdfEngineOfflineAssets();
       for (const book of books) {
         try {
-          await cacheBookForOffline(book);
+          if (!book.hasLocalPdf && !book.sourceUrl && book.discoveredBook) {
+            const hydrated = await hydrateDiscoveredBookPdf(book);
+            hydrated.pdf.cleanup().catch(() => {});
+          } else {
+            await cacheBookForOffline(book);
+          }
           newlyCached++;
         } catch {
           failed++;
@@ -812,19 +1079,31 @@ export default function App() {
     } finally {
       setIsSyncingAllOffline(false);
     }
-  }, [books, isSyncingAllOffline, refreshOfflineInspection]);
+  }, [books, hydrateDiscoveredBookPdf, isSyncingAllOffline, refreshOfflineInspection]);
 
-  // Toggle Book-level Bookmark / Save (distinct from page bookmarks)
+  // Toggle Book-level Bookmark / Save (distinct from page bookmarks; metadata-only, crash-safe)
   const handleToggleBookSavedBookmark = useCallback(
     async (bookId: string) => {
-      const updated = await toggleBookSavedBookmark(bookId);
-      if (updated) {
-        syncUpdatedBookInState(updated);
+      const lockKey = `book:${bookId}`;
+      if (bookmarkPendingRef.current.has(lockKey)) return;
+      bookmarkPendingRef.current.add(lockKey);
+      try {
+        const updated = await toggleBookSavedBookmark(bookId);
+        if (updated) {
+          syncUpdatedBookInState(updated);
+          setAppBanner(
+            updated.isBookmarked
+              ? `Bookmarked “${updated.title}” in My Library.`
+              : `Removed “${updated.title}” from Bookmarks.`
+          );
+        }
+      } catch (err) {
+        logDevError('app', err, `Toggle book bookmark (${bookId})`);
         setAppBanner(
-          updated.isBookmarked
-            ? `Bookmarked “${updated.title}” in My Library.`
-            : `Removed “${updated.title}” from Bookmarks.`
+          err instanceof Error ? `Could not update bookmark: ${err.message}` : 'Could not update bookmark.'
         );
+      } finally {
+        bookmarkPendingRef.current.delete(lockKey);
       }
     },
     [syncUpdatedBookInState]
@@ -851,6 +1130,7 @@ export default function App() {
           narrationSource: book.lastNarrationSource,
         });
       } catch (err) {
+        logDevError('app', err, `Listen stored book (${book.title})`);
         setAppBanner(
           err instanceof Error ? err.message : 'Unable to start audio for this book.'
         );
@@ -868,6 +1148,7 @@ export default function App() {
         setMobilePane('translated');
         setPendingPostLoadAction({ bookId: book.id, action: 'translate' });
       } catch (err) {
+        logDevError('app', err, `Translate stored book (${book.title})`);
         setAppBanner(
           err instanceof Error ? err.message : 'Unable to open this book for translation.'
         );
@@ -885,6 +1166,9 @@ export default function App() {
       try {
         let buffer: ArrayBuffer | null =
           book.pdfData && book.pdfData.byteLength > 0 ? book.pdfData : null;
+        if (!buffer && book.hasLocalPdf) {
+          buffer = (await getBookPdfData(book.id)) ?? null;
+        }
         if (!buffer) {
           buffer = await getCachedBookBufferFromSW(book);
         }
@@ -892,6 +1176,11 @@ export default function App() {
           const resp = await fetch(book.sourceUrl);
           if (!resp.ok) throw new Error(`Could not fetch PDF (${resp.status}).`);
           buffer = await resp.arrayBuffer();
+        }
+        if (!buffer && book.discoveredBook) {
+          const hydrated = await hydrateDiscoveredBookPdf(book);
+          buffer = hydrated.buffer;
+          hydrated.pdf.cleanup().catch(() => {});
         }
         if (!buffer) {
           throw new Error('PDF file data is not cached locally yet.');
@@ -907,6 +1196,7 @@ export default function App() {
         if (updated) syncUpdatedBookInState(updated);
         setAppBanner(`Downloaded “${book.title}” (${safeName}).`);
       } catch (err) {
+        logDevError('app', err, `Download stored book (${book.title})`);
         setAppBanner(
           err instanceof Error ? err.message : 'Unable to download this PDF right now.'
         );
@@ -914,7 +1204,7 @@ export default function App() {
         setDownloadingBookId(null);
       }
     },
-    [downloadingBookId, syncUpdatedBookInState]
+    [downloadingBookId, hydrateDiscoveredBookPdf, syncUpdatedBookInState]
   );
 
   // Load, translate, listen, bookmark, or download a book from Global E-Book Discovery Hub
@@ -937,25 +1227,92 @@ export default function App() {
         await handleToggleBookSavedBookmark(existing.id);
         return;
       }
-      if (action === 'download') {
-        await handleDownloadStoredBook(existing);
-        return;
+
+      const needsHydration =
+        !existing.hasLocalPdf && !existing.sourceUrl && Boolean(existing.discoveredBook);
+      if (needsHydration) {
+        setLoadingBookAction({
+          bookId: book.id,
+          action,
+          status: `Downloading & preparing “${book.title}”…`,
+        });
       }
-      if (action === 'listen') {
-        await handleListenStoredBook(existing);
-        return;
-      }
-      if (action === 'translate') {
-        await handleTranslateStoredBook(existing);
-        return;
-      }
+
       try {
+        if (action === 'download') {
+          await handleDownloadStoredBook(existing);
+          return;
+        }
+        if (action === 'listen') {
+          await handleListenStoredBook(existing);
+          return;
+        }
+        if (action === 'translate') {
+          await handleTranslateStoredBook(existing);
+          return;
+        }
         await openStoredBook(existing);
         setActiveTab('reader');
       } catch (err) {
+        logDevError('app', err, `Open saved discover book "${action}" (${book.title})`);
         setAppBanner(
           err instanceof Error ? err.message : 'Unable to open this saved book.'
         );
+      } finally {
+        if (needsHydration) {
+          setLoadingBookAction(null);
+        }
+      }
+      return;
+    }
+
+    // Bookmarking a discovered book MUST stay lightweight & instant (metadata-only, zero PDF download/parsing)
+    if (action === 'bookmark') {
+      const lockKey = `discover-bookmark:${storedId}`;
+      if (bookmarkPendingRef.current.has(lockKey)) return;
+      bookmarkPendingRef.current.add(lockKey);
+      try {
+        const safeSlug =
+          book.title
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-|-$/g, '')
+            .slice(0, 48) || 'ebook';
+        const now = Date.now();
+        const lightBook: StoredBook = {
+          id: storedId,
+          discoveredBookId: book.id,
+          discoveredBook: book,
+          title: book.title || 'Public Domain E-Book',
+          author: book.author || '',
+          fileName: `${safeSlug}.pdf`,
+          numPages: Math.max(1, book.pageCount || 1),
+          coverDataUrl: book.coverUrl
+            ? `/api/books/proxy-cover?url=${encodeURIComponent(book.coverUrl)}`
+            : '',
+          chapters: [],
+          hasLocalPdf: false,
+          addedAt: now,
+          lastOpenedAt: now,
+          lastPage: 1,
+          lastTargetLang: targetLang,
+          isBookmarked: true,
+          bookmarkedAt: now,
+          externalSource: book.source,
+          externalUrl: book.readOnlineUrl,
+        };
+        await saveBook(lightBook);
+        syncUpdatedBookInState(lightBook, false);
+        setAppBanner(`Bookmarked “${lightBook.title}” — saved in My Library.`);
+      } catch (err) {
+        logDevError('app', err, `Bookmark discover book (${book.title})`);
+        setAppBanner(
+          err instanceof Error
+            ? `Could not bookmark “${book.title}”: ${err.message}`
+            : 'Could not bookmark this book.'
+        );
+      } finally {
+        bookmarkPendingRef.current.delete(lockKey);
       }
       return;
     }
@@ -963,10 +1320,7 @@ export default function App() {
     setLoadingBookAction({
       bookId: book.id,
       action,
-      status:
-        action === 'bookmark'
-          ? `Bookmarking & saving "${book.title}" to My Library…`
-          : `Preparing "${book.title}"…`,
+      status: `Preparing "${book.title}"…`,
     });
 
     try {
@@ -1001,6 +1355,7 @@ export default function App() {
       const newBook: StoredBook = {
         id: storedId,
         discoveredBookId: book.id,
+        discoveredBook: book,
         title: book.title || detectedTitle || 'Public Domain E-Book',
         author: book.author || detectedAuthor || '',
         fileName,
@@ -1012,8 +1367,7 @@ export default function App() {
         lastOpenedAt: now,
         lastPage: startPage,
         lastTargetLang: targetLang,
-        isBookmarked: action === 'bookmark',
-        bookmarkedAt: action === 'bookmark' ? now : undefined,
+        isBookmarked: false,
         pageWidth: vp1.width,
         pageHeight: vp1.height,
         externalSource: book.source,
@@ -1034,19 +1388,11 @@ export default function App() {
         return;
       }
 
-      if (action === 'bookmark') {
-        pdf.cleanup().catch(() => {});
-        setAppBanner(
-          `Bookmarked “${newBook.title}” — saved in My Library for reading, listening & PDF download.`
-        );
-        return;
-      }
-
       setLoadedPdf((prev) => {
         if (prev && prev !== pdf) prev.cleanup().catch(() => {});
         return pdf;
       });
-      setActiveBook(newBook);
+      setActiveBook(stripBookBinary(newBook));
       setCurrentPage(startPage);
       setActiveSentenceIndex(null);
       setActiveTab('reader');
@@ -1060,6 +1406,7 @@ export default function App() {
         });
       }
     } catch (err) {
+      logDevError('app', err, `Discover book action "${action}" (${book.title})`);
       setAppBanner(
         err instanceof Error
           ? err.message
@@ -1070,14 +1417,51 @@ export default function App() {
     }
   };
 
-  // Toggle Bookmark for the active page
+  // Toggle Bookmark for the active page (immutable activeBook update, serialized against race conditions)
   const handleToggleCurrentPageBookmark = useCallback(async () => {
-    if (!activeBook) return;
-    const updated = await toggleBookBookmark(activeBook.id, currentPage);
-    if (updated) {
-      syncUpdatedBookInState(updated);
+    const targetBook = activeBookRef.current;
+    if (!targetBook) return;
+    const bookId = targetBook.id;
+    const targetPage = Math.max(1, Math.min(targetBook.numPages || currentPage, currentPage));
+    const lockKey = `page:${bookId}:${targetPage}`;
+    if (bookmarkPendingRef.current.has(lockKey)) return;
+
+    bookmarkPendingRef.current.add(lockKey);
+    const seq = ++bookmarkSeqRef.current;
+    try {
+      const updated = await toggleBookBookmark(bookId, targetPage);
+      if (!updated) return;
+      if (seq !== bookmarkSeqRef.current && activeBookIdRef.current !== bookId) {
+        return;
+      }
+
+      const nextBookmarks = Array.isArray(updated.bookmarks)
+        ? [...updated.bookmarks]
+        : [];
+      const immutableBook: StoredBook = {
+        ...stripBookBinary(updated),
+        bookmarks: nextBookmarks,
+      };
+
+      setActiveBook((curr) =>
+        curr && curr.id === bookId
+          ? {
+              ...curr,
+              ...immutableBook,
+              bookmarks: [...nextBookmarks],
+            }
+          : curr
+      );
+      syncUpdatedBookInState(immutableBook, false);
+    } catch (err) {
+      logDevError('app', err, `Toggle page bookmark (${bookId}, p.${targetPage})`);
+      setAppBanner(
+        err instanceof Error ? `Could not mark page: ${err.message}` : 'Could not update page bookmark.'
+      );
+    } finally {
+      bookmarkPendingRef.current.delete(lockKey);
     }
-  }, [activeBook, currentPage, syncUpdatedBookInState]);
+  }, [currentPage, syncUpdatedBookInState]);
 
   // One-Click Chapter Summarizer & Key Takeaways
   const handleSummarizeChapter = useCallback(
@@ -1141,6 +1525,65 @@ export default function App() {
     );
   }, [activeBook, bookTranslations, targetLang]);
 
+  // Auto-upgrade scanned or legacy-font garbled pages via AI Vision OCR (deduplicated per book+page)
+  const ensureCleanParsedPage = useCallback(
+    async (
+      bookId: string,
+      pdf: LoadedPdf,
+      pageNum: number,
+      existingParsed?: ParsedPage | null
+    ): Promise<ParsedPage> => {
+      let parsed = existingParsed ?? (await getParsedPage(bookId, pageNum));
+      if (!parsed) {
+        parsed = await extractPageContent(pdf, pageNum);
+        await saveParsedPage(bookId, parsed);
+      }
+
+      const needsCleanOcr =
+        !parsed.isOcr &&
+        (parsed.isBlank || parsed.looksGarbled || detectGarbledBlocks(parsed.blocks));
+
+      if (
+        !needsCleanOcr ||
+        !aiAvailableRef.current ||
+        (typeof navigator !== 'undefined' && navigator.onLine === false)
+      ) {
+        return parsed;
+      }
+
+      const ocrKey = `${bookId}::${pageNum}`;
+      const existingTask = autoOcrInFlightRef.current.get(ocrKey);
+      if (existingTask) return existingTask;
+
+      const task = (async (): Promise<ParsedPage> => {
+        try {
+          const ocrResult = await runClientOcrOnPage(pdf, pageNum, undefined, {
+            scale: 2.0,
+            scriptMode: ocrScriptModeRef.current,
+            preferAiVision: true,
+          });
+          if (ocrResult.blocks.length > 0 && !detectGarbledBlocks(ocrResult.blocks)) {
+            const upgraded: ParsedPage = {
+              ...ocrResult,
+              figures: parsed.figures,
+            };
+            await saveParsedPage(bookId, upgraded);
+            return upgraded;
+          }
+          return parsed;
+        } catch {
+          return parsed;
+        } finally {
+          autoOcrInFlightRef.current.delete(ocrKey);
+        }
+      })();
+
+      autoOcrInFlightRef.current.set(ocrKey, task);
+      return task;
+    },
+    []
+  );
+
   // Helper to translate a single page with deduplication and auto-save to IndexedDB
   const translateSinglePageInternal = useCallback(
     async (
@@ -1162,17 +1605,19 @@ export default function App() {
       }
 
       const task = (async (): Promise<TranslatedPageRecord> => {
-        let parsed = await getParsedPage(book.id, pageNum);
-        if (!parsed) {
-          parsed = await extractPageContent(pdf, pageNum);
-          await saveParsedPage(book.id, parsed);
-        }
+        const parsed = await ensureCleanParsedPage(book.id, pdf, pageNum);
 
-        // If Smart AI mode is active and the page contains diagrams or figures, attach a compressed page screenshot
+        // If Smart AI mode is active and the page has figures, scarce text, or looks garbled, attach a compressed page image
         let pageImageBase64: string | undefined;
-        if (engine === 'ai' && (parsed.figures.length > 0 || parsed.blocks.length <= 2)) {
+        if (
+          engine === 'ai' &&
+          (parsed.figures.length > 0 ||
+            parsed.blocks.length <= 2 ||
+            parsed.looksGarbled ||
+            detectGarbledBlocks(parsed.blocks))
+        ) {
           try {
-            const snap = await renderPageToDataUrl(pdf, pageNum, 1.25, 'image/jpeg', 0.8);
+            const snap = await renderPageToDataUrl(pdf, pageNum, 1.35, 'image/jpeg', 0.84);
             pageImageBase64 = snap.dataUrl;
           } catch {
             // proceed text-only
@@ -1223,7 +1668,7 @@ export default function App() {
         });
       }
     },
-    [engine, preserveTerms, customTerms]
+    [engine, preserveTerms, customTerms, ensureCleanParsedPage]
   );
 
   // Merge a newly saved translation into local state if it belongs to the active book & language
@@ -1289,6 +1734,7 @@ export default function App() {
         ) {
           return;
         }
+        logDevError('app', err, `Translate page ${currentPage} (${targetLang})`);
         setTranslationError(err instanceof Error ? err.message : 'Translation failed.');
       } finally {
         if (pageTranslateAbortRef.current === controller) {
@@ -1520,12 +1966,8 @@ export default function App() {
       };
 
       const loadParsedPageSafe = async (pNum: number): Promise<ParsedPage> => {
-        const cachedParsed = await getParsedPage(book.id, pNum);
-        if (cachedParsed) return cachedParsed;
         try {
-          const fresh = await extractPageContent(pdf, pNum);
-          await saveParsedPage(book.id, fresh);
-          return fresh;
+          return await ensureCleanParsedPage(book.id, pdf, pNum);
         } catch {
           return {
             pageNumber: pNum,
@@ -1802,6 +2244,7 @@ export default function App() {
           );
           return { records: sortedRecords, cancelled: true };
         }
+        logDevError('app', err, `Batch fast translate (${options.label ?? 'range'})`);
         setTranslationError(
           err instanceof Error
             ? `Fast translation paused: ${err.message}`
@@ -1825,6 +2268,7 @@ export default function App() {
       customTerms,
       commitSavedBatchToState,
       commitSavedTranslationToState,
+      ensureCleanParsedPage,
       translateSinglePageInternal,
     ]
   );
@@ -1850,7 +2294,7 @@ export default function App() {
     setPendingOcrReview(null);
   }, [activeBook?.id, currentPage]);
 
-  // Run client-side Tesseract OCR on current page and stage result for visual verification before saving
+  // Run multilingual OCR (AI Vision first when online, Tesseract fallback) on current page and stage for review
   const handleRunOcr = async (opts?: { highRes?: boolean }) => {
     if (!activeBook || !loadedPdf || isRunningOcr) return;
     const targetPage = currentPage;
@@ -1867,7 +2311,7 @@ export default function App() {
 
     setIsRunningOcr(true);
     setOcrProgress(4);
-    setOcrStage('Preparing page for OCR…');
+    setOcrStage('Preparing page for multilingual OCR…');
     setTranslationError(null);
     try {
       const ocrParsed = await runClientOcrOnPage(
@@ -1877,7 +2321,11 @@ export default function App() {
           setOcrProgress(progress);
           setOcrStage(stage);
         },
-        { scale: dpiScale }
+        {
+          scale: dpiScale,
+          scriptMode: ocrScriptModeRef.current,
+          preferAiVision: aiAvailableRef.current,
+        }
       );
       const mergedOcrPage: ParsedPage = {
         ...ocrParsed,
@@ -1892,11 +2340,15 @@ export default function App() {
           dpiScale,
           completedAt: Date.now(),
         });
+        const engineLabel =
+          mergedOcrPage.ocrEngine === 'ai-vision' ? 'AI Vision OCR' : 'Offline OCR';
+        const langTag = mergedOcrPage.detectedLang ? ` · ${mergedOcrPage.detectedLang}` : '';
         setAppBanner(
-          `OCR pass #${prevRunCount + 1} ready for Page ${targetPage} (${mergedOcrPage.blocks.length} blocks). Verify against the PDF layout before saving.`
+          `${engineLabel} pass #${prevRunCount + 1} ready for Page ${targetPage} (${mergedOcrPage.blocks.length} blocks${langTag}). Verify against the PDF before saving.`
         );
       }
     } catch (err) {
+      logDevError('app', err, `OCR pass on page ${targetPage}`);
       setAppBanner(err instanceof Error ? `OCR failed: ${err.message}` : 'OCR failed.');
     } finally {
       setIsRunningOcr(false);
@@ -1910,9 +2362,18 @@ export default function App() {
     await saveParsedPage(activeBook.id, savedPage);
     setParsedPage(savedPage);
     setPendingOcrReview(null);
-    setAppBanner(
-      `Saved OCR text for Page ${savedPage.pageNumber} (${savedPage.blocks.length} blocks). Click Re-translate to translate the updated text.`
-    );
+    const hadTranslationOnPage = translatedPage?.pageNumber === savedPage.pageNumber;
+    if (hadTranslationOnPage || targetLang === 'orig') {
+      setTranslatedPage(null);
+      setAppBanner(
+        `Saved ${savedPage.detectedLang || 'book'} text for Page ${savedPage.pageNumber}. Refreshing reader view…`
+      );
+      void handleTranslateCurrentPage(true);
+    } else {
+      setAppBanner(
+        `Saved ${savedPage.detectedLang || 'OCR'} text for Page ${savedPage.pageNumber} (${savedPage.blocks.length} blocks). Click Translate to translate this exact text.`
+      );
+    }
   };
 
   const handleKeepOriginalOcr = () => {
@@ -2280,9 +2741,8 @@ export default function App() {
   );
 
   const langOption = getLanguageOption(targetLang);
-  const isCurrentPageBookmarked = Boolean(
-    activeBook?.bookmarks?.includes(currentPage)
-  );
+  const isCurrentPageBookmarked =
+    Array.isArray(activeBook?.bookmarks) && activeBook.bookmarks.includes(currentPage);
 
   const cycleTheme = () => {
     setReadingTheme((curr) =>
@@ -2852,21 +3312,28 @@ export default function App() {
             onGoToReader={() => setActiveTab('reader')}
           />
         ) : !activeBook ? (
-          <div className="flex-1 flex flex-col items-center justify-center gap-4 px-6 py-20 text-center">
-            <BookOpen className="w-10 h-10 text-stone-400" />
-            <h1 className="font-display text-2xl font-semibold">No Book Loaded</h1>
-            <p className="text-sm text-stone-600 dark:text-stone-400 max-w-md">
-              Discover free public-domain PDFs and e-books or upload your own illustrated PDF to
-              start translating, listening, and exporting with the original cover preserved.
-            </p>
-            <button
-              type="button"
-              onClick={() => setActiveTab('discover')}
-              className="h-9 px-4 rounded-md text-xs font-medium bg-amber-700 hover:bg-amber-800 text-white cursor-pointer"
-            >
-              Browse Global E-Book Search
-            </button>
-          </div>
+          isLoadingActivePdf ? (
+            <div className="flex-1 flex flex-col items-center justify-center gap-3 py-20 text-stone-600 dark:text-stone-400">
+              <Loader2 className="w-6 h-6 animate-spin text-amber-700 dark:text-amber-500" />
+              <p className="text-sm font-medium">Opening book &amp; preparing reader…</p>
+            </div>
+          ) : (
+            <div className="flex-1 flex flex-col items-center justify-center gap-4 px-6 py-20 text-center">
+              <BookOpen className="w-10 h-10 text-stone-400" />
+              <h1 className="font-display text-2xl font-semibold">No Book Loaded</h1>
+              <p className="text-sm text-stone-600 dark:text-stone-400 max-w-md">
+                Discover free public-domain PDFs and e-books or upload your own illustrated PDF to
+                start translating, listening, and exporting with the original cover preserved.
+              </p>
+              <button
+                type="button"
+                onClick={() => setActiveTab('discover')}
+                className="h-9 px-4 rounded-md text-xs font-medium bg-amber-700 hover:bg-amber-800 text-white cursor-pointer"
+              >
+                Browse Global E-Book Search
+              </button>
+            </div>
+          )
         ) : (
           /* Split-Screen Desktop / Tabbed Mobile Reader */
           <div className="flex-1 flex min-h-0 min-h-[calc(100dvh-190px)] lg:h-[calc(100vh-160px)] w-full max-w-full">
@@ -2959,6 +3426,8 @@ export default function App() {
                   isRunningOcr={isRunningOcr}
                   ocrProgress={ocrProgress}
                   ocrStage={ocrStage}
+                  ocrScriptMode={ocrScriptMode}
+                  onChangeOcrScriptMode={setOcrScriptMode}
                   pendingOcrReview={
                     pendingOcrReview && pendingOcrReview.pageNumber === currentPage
                       ? pendingOcrReview
@@ -2966,10 +3435,7 @@ export default function App() {
                   }
                   onReachPageEnd={handleReachPageEnd}
                   onBookMetadataUpdated={(updatedBook) => {
-                    setActiveBook((curr) => (curr?.id === updatedBook.id ? updatedBook : curr));
-                    setBooks((prev) =>
-                      prev.map((b) => (b.id === updatedBook.id ? updatedBook : b))
-                    );
+                    syncUpdatedBookInState(updatedBook);
                   }}
                 />
               </div>
@@ -3000,6 +3466,8 @@ export default function App() {
                   onTranslatePage={handleTranslateCurrentPage}
                   onCancelTranslation={handleCancelPageTranslation}
                   onTranslateChapter={handleTranslateChapter}
+                  onRunOcr={() => handleRunOcr({ highRes: false })}
+                  isRunningOcr={isRunningOcr}
                   onUpdateBlockText={handleUpdateBlockText}
                   onUpdateHighlights={handleUpdatePageHighlights}
                   onClickSentence={handleClickSentence}

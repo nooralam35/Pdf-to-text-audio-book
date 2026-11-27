@@ -9,6 +9,7 @@ import {
   Upload,
 } from 'lucide-react';
 import type { ServiceWorkerStatus } from '../lib/offlineCache';
+import { openDevDebugPanel } from '../lib/devErrorLog';
 
 export type ActiveTab = 'discover' | 'reader' | 'library' | 'export';
 
@@ -37,6 +38,11 @@ export const TopBar: React.FC<TopBarProps> = ({
   librarySync,
 }) => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const devTapStateRef = useRef<{ count: number; lastTapAt: number }>({
+    count: 0,
+    lastTapAt: 0,
+  });
+  const devHoldTimerRef = useRef<number | null>(null);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -44,6 +50,39 @@ export const TopBar: React.FC<TopBarProps> = ({
       onUploadPdf(file);
     }
     e.target.value = '';
+  };
+
+  const handleBrandClick = () => {
+    if (import.meta.env.DEV) {
+      const now = Date.now();
+      const prev = devTapStateRef.current;
+      const nextCount = now - prev.lastTapAt < 1500 ? prev.count + 1 : 1;
+      devTapStateRef.current = { count: nextCount, lastTapAt: now };
+      if (nextCount >= 5) {
+        devTapStateRef.current = { count: 0, lastTapAt: 0 };
+        openDevDebugPanel();
+        return;
+      }
+    }
+    onSelectTab('discover');
+  };
+
+  const handleBrandPointerDown = () => {
+    if (!import.meta.env.DEV) return;
+    if (devHoldTimerRef.current !== null) {
+      window.clearTimeout(devHoldTimerRef.current);
+    }
+    devHoldTimerRef.current = window.setTimeout(() => {
+      devHoldTimerRef.current = null;
+      openDevDebugPanel();
+    }, 700);
+  };
+
+  const clearBrandHold = () => {
+    if (devHoldTimerRef.current !== null) {
+      window.clearTimeout(devHoldTimerRef.current);
+      devHoldTimerRef.current = null;
+    }
   };
 
   const navItems: Array<{ id: ActiveTab; label: string }> = [
@@ -139,7 +178,11 @@ export const TopBar: React.FC<TopBarProps> = ({
         {/* Zone 1: Brand Wordmark */}
         <button
           type="button"
-          onClick={() => onSelectTab('discover')}
+          onClick={handleBrandClick}
+          onPointerDown={handleBrandPointerDown}
+          onPointerUp={clearBrandHold}
+          onPointerCancel={clearBrandHold}
+          onPointerLeave={clearBrandHold}
           className="flex items-center gap-2 text-stone-900 sepia:text-[#2E241A] dark:text-stone-100 whitespace-nowrap shrink-0 focus:outline-none group cursor-pointer"
         >
           <BookOpen className="w-5 h-5 text-amber-700 dark:text-amber-500 transition-transform group-hover:scale-105" />

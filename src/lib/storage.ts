@@ -34,13 +34,21 @@ interface BhashaBookDB extends DBSchema {
     value: PageAnnotationRecord;
     indexes: { 'by-book': string };
   };
+  bookBinaries: {
+    key: string; // bookId
+    value: {
+      bookId: string;
+      pdfData: ArrayBuffer;
+      updatedAt: number;
+    };
+  };
 }
 
 let dbPromise: Promise<IDBPDatabase<BhashaBookDB>> | null = null;
 
 function getDb(): Promise<IDBPDatabase<BhashaBookDB>> {
   if (!dbPromise) {
-    dbPromise = openDB<BhashaBookDB>('bhashabook-offline-v1', 2, {
+    dbPromise = openDB<BhashaBookDB>('bhashabook-offline-v1', 3, {
       upgrade(db, oldVersion) {
         if (oldVersion < 1) {
           const bookStore = db.createObjectStore('books', { keyPath: 'id' });
@@ -55,6 +63,11 @@ function getDb(): Promise<IDBPDatabase<BhashaBookDB>> {
           const annStore = db.createObjectStore('annotations', { keyPath: 'key' });
           annStore.createIndex('by-book', 'bookId');
         }
+        if (oldVersion < 3) {
+          if (!db.objectStoreNames.contains('bookBinaries')) {
+            db.createObjectStore('bookBinaries', { keyPath: 'bookId' });
+          }
+        }
       },
     });
   }
@@ -65,20 +78,79 @@ export function makeTranslationKey(bookId: string, lang: LanguageCode, pageNumbe
   return `${bookId}::${lang}::${pageNumber}`;
 }
 
+export function stripBookBinary(book: StoredBook): StoredBook {
+  const hasLocal = Boolean(book.hasLocalPdf || (book.pdfData && book.pdfData.byteLength > 0));
+  if (!book.pdfData && book.hasLocalPdf === hasLocal) {
+    return book;
+  }
+  return {
+    ...book,
+    pdfData: undefined,
+    hasLocalPdf: hasLocal,
+  };
+}
+
 export async function saveBook(book: StoredBook): Promise<void> {
   const db = await getDb();
-  await db.put('books', book);
+  const hasBinary = Boolean(book.pdfData && book.pdfData.byteLength > 0);
+  if (hasBinary && book.pdfData) {
+    await db.put('bookBinaries', {
+      bookId: book.id,
+      pdfData: book.pdfData,
+      updatedAt: Date.now(),
+    });
+  }
+  const metadataOnly: StoredBook = stripBookBinary({
+    ...book,
+    hasLocalPdf: Boolean(book.hasLocalPdf || hasBinary),
+  });
+  await db.put('books', metadataOnly);
 }
 
 export async function getBook(bookId: string): Promise<StoredBook | undefined> {
   const db = await getDb();
-  return db.get('books', bookId);
+  const book = await db.get('books', bookId);
+  return book ? stripBookBinary(book) : undefined;
+}
+
+export async function getBookPdfData(bookId: string): Promise<ArrayBuffer | undefined> {
+  const db = await getDb();
+  const binaryRow = await db.get('bookBinaries', bookId);
+  if (binaryRow?.pdfData && binaryRow.pdfData.byteLength > 0) {
+    return binaryRow.pdfData;
+  }
+
+  // Transparently migrate any legacy inline pdfData row out of the 'books' store
+  const legacyBook = await db.get('books', bookId);
+  if (legacyBook?.pdfData && legacyBook.pdfData.byteLength > 0) {
+    const buffer = legacyBook.pdfData;
+    try {
+      await db.put('bookBinaries', {
+        bookId,
+        pdfData: buffer,
+        updatedAt: Date.now(),
+      });
+      await db.put('books', stripBookBinary({ ...legacyBook, hasLocalPdf: true }));
+    } catch {
+      // Non-fatal migration error; still return the buffer
+    }
+    return buffer;
+  }
+
+  return undefined;
 }
 
 export async function listBooks(): Promise<StoredBook[]> {
   const db = await getDb();
-  const all = await db.getAllFromIndex('books', 'by-added');
-  return all.sort(
+  const summaries: StoredBook[] = [];
+  const tx = db.transaction('books', 'readonly');
+  let cursor = await tx.store.index('by-added').openCursor();
+  while (cursor) {
+    summaries.push(stripBookBinary(cursor.value));
+    cursor = await cursor.continue();
+  }
+  await tx.done;
+  return summaries.sort(
     (a, b) => (b.lastOpenedAt ?? b.addedAt) - (a.lastOpenedAt ?? a.addedAt)
   );
 }
@@ -94,19 +166,53 @@ export interface BookProgressPatch {
   bookmarkedAt?: number;
 }
 
+const bookWriteQueues = new Map<string, Promise<unknown>>();
+
+function withBookWriteLock<T>(bookId: string, fn: () => Promise<T>): Promise<T> {
+  const previous = bookWriteQueues.get(bookId) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(fn);
+  const cleanup = next.finally(() => {
+    if (bookWriteQueues.get(bookId) === cleanup) {
+      bookWriteQueues.delete(bookId);
+    }
+  });
+  bookWriteQueues.set(bookId, cleanup);
+  return next;
+}
+
+async function mutateBookMetadata(
+  bookId: string,
+  mutator: (cleanExisting: StoredBook) => StoredBook
+): Promise<StoredBook | undefined> {
+  return withBookWriteLock(bookId, async () => {
+    const db = await getDb();
+    const raw = await db.get('books', bookId);
+    if (!raw) return undefined;
+
+    // If a legacy row still carries inline pdfData, migrate it safely before writing metadata
+    if (raw.pdfData && raw.pdfData.byteLength > 0) {
+      await db.put('bookBinaries', {
+        bookId,
+        pdfData: raw.pdfData,
+        updatedAt: Date.now(),
+      });
+    }
+
+    const cleanExisting = stripBookBinary(raw);
+    const updated = stripBookBinary(mutator(cleanExisting));
+    await db.put('books', updated);
+    return updated;
+  });
+}
+
 export async function updateBookProgress(
   bookId: string,
   patch: BookProgressPatch
 ): Promise<StoredBook | undefined> {
-  const db = await getDb();
-  const existing = await db.get('books', bookId);
-  if (!existing) return undefined;
-  const updated: StoredBook = {
+  return mutateBookMetadata(bookId, (existing) => ({
     ...existing,
     ...patch,
-  };
-  await db.put('books', updated);
-  return updated;
+  }));
 }
 
 export async function updateBookLastPage(bookId: string, lastPage: number): Promise<void> {
@@ -116,41 +222,44 @@ export async function updateBookLastPage(bookId: string, lastPage: number): Prom
 export async function toggleBookSavedBookmark(
   bookId: string
 ): Promise<StoredBook | undefined> {
-  const db = await getDb();
-  const existing = await db.get('books', bookId);
-  if (!existing) return undefined;
-  const nextBookmarked = !existing.isBookmarked;
-  const updated: StoredBook = {
-    ...existing,
-    isBookmarked: nextBookmarked,
-    bookmarkedAt: nextBookmarked ? Date.now() : undefined,
-    lastOpenedAt: Date.now(),
-  };
-  await db.put('books', updated);
-  return updated;
+  return mutateBookMetadata(bookId, (existing) => {
+    const nextBookmarked = !existing.isBookmarked;
+    return {
+      ...existing,
+      isBookmarked: nextBookmarked,
+      bookmarkedAt: nextBookmarked ? Date.now() : undefined,
+      lastOpenedAt: Date.now(),
+    };
+  });
 }
 
 export async function toggleBookBookmark(
   bookId: string,
   pageNumber: number
 ): Promise<StoredBook | undefined> {
-  const db = await getDb();
-  const existing = await db.get('books', bookId);
-  if (!existing) return undefined;
-  const current = new Set<number>(existing.bookmarks ?? []);
-  if (current.has(pageNumber)) {
-    current.delete(pageNumber);
-  } else {
-    current.add(pageNumber);
-  }
-  existing.bookmarks = Array.from(current).sort((a, b) => a - b);
-  await db.put('books', existing);
-  return existing;
+  const safePage = Math.max(1, Math.floor(pageNumber));
+  return mutateBookMetadata(bookId, (existing) => {
+    const baseList = Array.isArray(existing.bookmarks)
+      ? existing.bookmarks.filter((n) => typeof n === 'number' && Number.isFinite(n))
+      : [];
+    const current = new Set<number>(baseList);
+    if (current.has(safePage)) {
+      current.delete(safePage);
+    } else {
+      current.add(safePage);
+    }
+    const nextBookmarks = Array.from(current).sort((a, b) => a - b);
+    return {
+      ...existing,
+      bookmarks: nextBookmarks,
+    };
+  });
 }
 
 export async function deleteBook(bookId: string): Promise<void> {
   const db = await getDb();
   await db.delete('books', bookId);
+  await db.delete('bookBinaries', bookId);
 
   const txTr = db.transaction('translations', 'readwrite');
   let cursor = await txTr.store.openCursor();
@@ -254,24 +363,27 @@ export async function saveBookPageAnnotation(
   pageNumber: number,
   layer: PageAnnotationLayer
 ): Promise<StoredBook | undefined> {
-  const db = await getDb();
-  const book = await db.get('books', bookId);
-  if (!book) return undefined;
+  const updatedBook = await mutateBookMetadata(bookId, (existing) => {
+    const nextAnnotations: Record<number, PageAnnotationLayer> = {
+      ...(existing.annotations ?? {}),
+    };
 
-  const nextAnnotations: Record<number, PageAnnotationLayer> = {
-    ...(book.annotations ?? {}),
-  };
+    if (layer.strokes.length === 0 && layer.notes.length === 0) {
+      delete nextAnnotations[pageNumber];
+    } else {
+      nextAnnotations[pageNumber] = layer;
+    }
 
-  if (layer.strokes.length === 0 && layer.notes.length === 0) {
-    delete nextAnnotations[pageNumber];
-  } else {
-    nextAnnotations[pageNumber] = layer;
-  }
+    return {
+      ...existing,
+      annotations: nextAnnotations,
+    };
+  });
 
-  book.annotations = nextAnnotations;
-  await db.put('books', book);
+  if (!updatedBook) return undefined;
 
   // Also keep standalone annotations store synced for fast lookups
+  const db = await getDb();
   await db.put('annotations', {
     key: makeAnnotationKey(bookId, pageNumber),
     bookId,
@@ -279,7 +391,7 @@ export async function saveBookPageAnnotation(
     ...layer,
   });
 
-  return book;
+  return updatedBook;
 }
 
 export async function getBookPageAnnotation(

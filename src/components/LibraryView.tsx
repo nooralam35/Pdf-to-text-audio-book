@@ -209,7 +209,9 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   const [activeFilter, setActiveFilter] = useState<LibraryFilterTab>('all');
 
   const isBookOfflineReady = (book: StoredBook): boolean =>
-    cachedBookIds.has(book.id) || Boolean(book.pdfData && book.pdfData.byteLength > 0);
+    cachedBookIds.has(book.id) ||
+    Boolean(book.hasLocalPdf) ||
+    Boolean(book.pdfData && book.pdfData.byteLength > 0);
 
   const offlineReadyCount = useMemo(
     () => books.filter((b) => isBookOfflineReady(b)).length,
@@ -611,6 +613,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                     <img
                       src={book.coverDataUrl}
                       alt={`${book.title} cover`}
+                      loading="lazy"
+                      onError={(e) => {
+                        e.currentTarget.style.display = 'none';
+                      }}
                       className="h-full w-auto object-contain rounded-[2px] shadow-[0_6px_20px_rgba(28,25,23,0.16)] border border-stone-200 dark:border-stone-700"
                     />
                   ) : (

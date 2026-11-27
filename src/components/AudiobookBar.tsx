@@ -30,7 +30,7 @@ import {
   registerMediaSessionHandlers,
   updateMediaSessionState,
 } from '../lib/backgroundAudio';
-import { getLanguageOption } from '../lib/languages';
+import { detectTextLanguageCode, getLanguageOption } from '../lib/languages';
 import {
   buildAudiobookText,
   downloadBlob,
@@ -87,6 +87,8 @@ function getTeacherSampleLine(lang: LanguageCode, voiceName: string): string {
   switch (lang) {
     case 'hi':
       return `नमस्ते! मैं ${voiceName} हूँ। आज हम इस अध्याय को सहज उतार-चढ़ाव, स्पष्ट विराम और अनुभवी शिक्षक की लय के साथ समझेंगे — क्या आप तैयार हैं?`;
+    case 'sa':
+      return `नमो नमः! अहं ${voiceName} अस्मि। अद्य वयं एतम् अध्यायं स्पष्टोच्चारणेन सहजस्वरेण च पठिष्यामः — किं भवन्तः सज्जाः सन्ति?`;
     case 'hinglish':
       return `Namaste! Main ${voiceName} hoon. Aaj hum is chapter ko bilkul natural rise-and-fall, clear pauses aur experienced teacher ki laya ke saath samjhenge — kya aap taiyaar hain?`;
     case 'bn':
@@ -97,6 +99,10 @@ function getTeacherSampleLine(lang: LanguageCode, voiceName: string): string {
       return `నమస్కారం! నేను ${voiceName}. ఈ రోజు ఈ అధ్యాయాన్ని సహజమైన స్వర మార్పులు, స్పష్టమైన విరామాలతో అనుభవజ్ఞుడైన ఉపాధ్యాయుడిలా అర్థం చేసుకుందాం — సిద్ధమా?`;
     case 'mr':
       return `नमस्कार! मी ${voiceName} आहे. आज आपण हा धडा नैसर्गिक चढ-उतार, स्पष्ट विराम आणि अनुभवी शिक्षकाच्या लयीत समजून घेऊया — तुम्ही तयार आहात का?`;
+    case 'gu':
+      return `નમસ્તે! હું ${voiceName} છું. આજે આપણે આ પ્રકરણને સરળ ઉચ્ચારણ અને અનુભવી શિક્ષકના લય સાથે સમજીશું — શું તમે તૈયાર છો?`;
+    case 'pa':
+      return `ਸਤ ਸ੍ਰੀ ਅਕਾਲ! ਮੈਂ ${voiceName} ਹਾਂ। ਅੱਜ ਅਸੀਂ ਇਸ ਅਧਿਆਏ ਨੂੰ ਸਪਸ਼ਟ ਉਚਾਰਨ ਅਤੇ ਅਨੁਭਵੀ ਅਧਿਆਪਕ ਦੀ ਲੈਅ ਨਾਲ ਸਮਝਾਂਗੇ — ਕੀ ਤੁਸੀਂ ਤਿਆਰ ਹੋ?`;
     case 'ur':
       return `السلام علیکم! میں ${voiceName} ہوں۔ آج ہم اس باب کو فطری اتار چڑھاؤ، واضح وقفوں اور ایک تجربہ کار استاد کے انداز میں سمجھیں گے — کیا آپ تیار ہیں؟`;
     case 'es':
@@ -276,7 +282,15 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
   } | null>(null);
   const sentenceStartedAtRef = useRef<number>(0);
 
-  const effectiveAudioLang: LanguageCode = narrationSource === 'original' ? 'en' : targetLang;
+  const detectedOriginalLang: LanguageCode = useMemo(() => {
+    const sample = parsedPage?.blocks.slice(0, 6).map((b) => b.text).join(' ') ?? '';
+    return detectTextLanguageCode(sample, parsedPage?.detectedLang);
+  }, [parsedPage]);
+
+  const effectiveAudioLang: LanguageCode =
+    narrationSource === 'original' || targetLang === 'orig'
+      ? detectedOriginalLang
+      : targetLang;
   const langOption = getLanguageOption(effectiveAudioLang);
   const activeVoiceProfile = useMemo(
     () => getAiVoiceProfile(aiVoiceProfileId),
@@ -2153,7 +2167,8 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     setIsDownloadingAudio(true);
     setAudioMessage(null);
     try {
-      const effectiveLang: LanguageCode = useOriginal ? 'en' : targetLang;
+      const effectiveLang: LanguageCode =
+        useOriginal || targetLang === 'orig' ? detectedOriginalLang : targetLang;
       const effectiveLangOption = getLanguageOption(effectiveLang);
       const prefOption = getVoiceStylePreferenceOption(voiceStylePrefRef.current);
       const { blob, ext, model } = await synthesizePageAudio({

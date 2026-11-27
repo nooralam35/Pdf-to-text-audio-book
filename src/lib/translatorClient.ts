@@ -7,6 +7,7 @@ import type {
   TranslatedPageRecord,
   TranslationEngine,
 } from '../types';
+import { hasNonLatinScript } from './languages';
 import { makeTranslationKey } from './storage';
 
 export interface ServerCapabilities {
@@ -75,8 +76,11 @@ export async function translatePageBlocks(
     };
   }
 
-  // English clean script mode with free engine needs no network hop
-  if (targetLang === 'en' && engine === 'free') {
+  const pageCombinedText = parsedPage.blocks.map((b) => b.text).join(' ');
+  const pageIsAsciiLatin = !hasNonLatinScript(pageCombinedText);
+
+  // Original Book ("same to same") mode or already-English page with free engine needs no network hop
+  if (targetLang === 'orig' || (targetLang === 'en' && engine === 'free' && pageIsAsciiLatin)) {
     const blocks: TranslatedBlock[] = parsedPage.blocks.map((b) => ({
       ...b,
       translatedText: b.text,
@@ -255,7 +259,10 @@ export async function translatePagesBatchFast(
         imageExplanations: [],
         updatedAt: Date.now(),
       });
-    } else if (targetLang === 'en') {
+    } else if (
+      targetLang === 'orig' ||
+      (targetLang === 'en' && !hasNonLatinScript(parsedPage.blocks.map((b) => b.text).join(' ')))
+    ) {
       results.set(parsedPage.pageNumber, {
         key,
         bookId,

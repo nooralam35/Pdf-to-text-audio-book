@@ -36,9 +36,16 @@ import {
   getBookPageAnnotation,
   saveBookPageAnnotation,
 } from '../lib/storage';
+import {
+  OCR_SCRIPT_OPTIONS,
+  detectTextLanguageCode,
+  getLanguageOption,
+  isTextPredominantlyRtl,
+} from '../lib/languages';
 import type {
   AnnotationStroke,
   AnnotationTool,
+  OcrScriptMode,
   PageAnnotationLayer,
   ParsedPage,
   StickyNote,
@@ -84,6 +91,8 @@ interface PdfViewerPaneProps {
   isRunningOcr: boolean;
   ocrProgress: number;
   ocrStage?: string;
+  ocrScriptMode?: OcrScriptMode;
+  onChangeOcrScriptMode?: (mode: OcrScriptMode) => void;
   pendingOcrReview?: PendingOcrReview | null;
   onBookMetadataUpdated?: (updatedBook: StoredBook) => void;
   onReachPageEnd?: () => void;
@@ -118,6 +127,8 @@ export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
   isRunningOcr,
   ocrProgress,
   ocrStage = '',
+  ocrScriptMode = 'auto',
+  onChangeOcrScriptMode,
   pendingOcrReview = null,
   onBookMetadataUpdated,
   onReachPageEnd,
@@ -577,12 +588,29 @@ export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
             <ZoomIn className="w-3.5 h-3.5" />
           </button>
 
+          {onChangeOcrScriptMode && (
+            <select
+              aria-label="OCR book script"
+              title="Select PDF script for OCR (Auto detects Sanskrit, Hindi, Marathi, Urdu, Arabic, Bengali, Tamil, Telugu & English)"
+              disabled={isRunningOcr || !pdf}
+              value={ocrScriptMode}
+              onChange={(e) => onChangeOcrScriptMode(e.target.value as OcrScriptMode)}
+              className="hidden sm:inline-block h-7 max-w-[116px] px-1.5 rounded border border-stone-300 dark:border-stone-700 bg-white dark:bg-[#1F1E1B] text-[11px] font-medium text-stone-700 dark:text-stone-200 focus:outline-none focus:border-amber-700 disabled:opacity-45 cursor-pointer"
+            >
+              {OCR_SCRIPT_OPTIONS.map((opt) => (
+                <option key={opt.id} value={opt.id}>
+                  {opt.shortLabel}
+                </option>
+              ))}
+            </select>
+          )}
+
           <button
             type="button"
             onClick={onRunOcr}
             disabled={isRunningOcr || !pdf}
-            title="Run client-side Tesseract OCR on scanned pages or screenshot labels"
-            className="ml-1 inline-flex items-center gap-1.5 h-7 px-2.5 rounded border border-stone-300 dark:border-stone-700 text-xs font-medium text-stone-700 dark:text-stone-300 hover:bg-stone-200/70 dark:hover:bg-stone-800 disabled:opacity-45 cursor-pointer whitespace-nowrap"
+            title="Run universal multilingual OCR (Sanskrit, Hindi, Marathi, Urdu, Arabic, Bengali, Tamil, Telugu, English)"
+            className="ml-0.5 inline-flex items-center gap-1.5 h-7 px-2.5 rounded border border-stone-300 dark:border-stone-700 text-xs font-medium text-stone-700 dark:text-stone-300 hover:bg-stone-200/70 dark:hover:bg-stone-800 disabled:opacity-45 cursor-pointer whitespace-nowrap"
           >
             <ScanText className="w-3.5 h-3.5" />
             <span>{isRunningOcr ? `OCR ${ocrProgress}%` : 'OCR'}</span>
@@ -939,6 +967,12 @@ export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
                   </span>
                   <span className="text-[11px] font-mono-num tabular-nums text-stone-500 dark:text-stone-400">
                     Pass #{pendingOcrReview.runCount} · {pendingOcrReview.dpiScale.toFixed(1)}× DPI
+                    {pendingOcrReview.ocrPage.detectedLang
+                      ? ` · ${pendingOcrReview.ocrPage.detectedLang}`
+                      : ''}
+                    {pendingOcrReview.ocrPage.ocrEngine === 'ai-vision'
+                      ? ' · AI Vision'
+                      : ' · Offline OCR'}
                   </span>
                 </div>
                 <p className="text-[11px] text-stone-500 sepia:text-[#66543F] dark:text-stone-400 font-mono-num tabular-nums">
@@ -1026,10 +1060,30 @@ export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
                     </div>
                     {pendingOcrReview.originalPage &&
                     pendingOcrReview.originalPage.blocks.length > 0 ? (
-                      <div className="space-y-2 text-xs leading-relaxed text-stone-700 sepia:text-[#3B2F23] dark:text-stone-300">
+                      <div
+                        dir={
+                          pendingOcrReview.originalPage.scriptDirection === 'rtl' ||
+                          isTextPredominantlyRtl(
+                            pendingOcrReview.originalPage.blocks.map((b) => b.text).join(' ')
+                          )
+                            ? 'rtl'
+                            : 'ltr'
+                        }
+                        className={`space-y-2 text-xs leading-relaxed text-stone-700 sepia:text-[#3B2F23] dark:text-stone-300 ${
+                          getLanguageOption(
+                            detectTextLanguageCode(
+                              pendingOcrReview.originalPage.blocks.map((b) => b.text).join(' '),
+                              pendingOcrReview.originalPage.detectedLang
+                            )
+                          ).cssClass
+                        }`}
+                      >
                         {pendingOcrReview.originalPage.blocks.map((block, idx) => (
                           <div key={block.id} className="flex items-start gap-2">
-                            <span className="text-[10px] font-mono-num tabular-nums text-stone-400 mt-0.5 shrink-0 w-5">
+                            <span
+                              dir="ltr"
+                              className="text-[10px] font-mono-num tabular-nums text-stone-400 mt-0.5 shrink-0 w-5"
+                            >
                               {idx + 1}.
                             </span>
                             <p
@@ -1064,10 +1118,30 @@ export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
                       </span>
                     </div>
                     {pendingOcrReview.ocrPage.blocks.length > 0 ? (
-                      <div className="space-y-2 text-xs leading-relaxed text-stone-800 sepia:text-[#2E241A] dark:text-stone-200">
+                      <div
+                        dir={
+                          pendingOcrReview.ocrPage.scriptDirection === 'rtl' ||
+                          isTextPredominantlyRtl(
+                            pendingOcrReview.ocrPage.blocks.map((b) => b.text).join(' ')
+                          )
+                            ? 'rtl'
+                            : 'ltr'
+                        }
+                        className={`space-y-2 text-xs leading-relaxed text-stone-800 sepia:text-[#2E241A] dark:text-stone-200 ${
+                          getLanguageOption(
+                            detectTextLanguageCode(
+                              pendingOcrReview.ocrPage.blocks.map((b) => b.text).join(' '),
+                              pendingOcrReview.ocrPage.detectedLang
+                            )
+                          ).cssClass
+                        }`}
+                      >
                         {pendingOcrReview.ocrPage.blocks.map((block, idx) => (
                           <div key={block.id} className="flex items-start gap-2">
-                            <span className="text-[10px] font-mono-num tabular-nums text-amber-700/80 dark:text-amber-400/80 mt-0.5 shrink-0 w-5">
+                            <span
+                              dir="ltr"
+                              className="text-[10px] font-mono-num tabular-nums text-amber-700/80 dark:text-amber-400/80 mt-0.5 shrink-0 w-5"
+                            >
                               {idx + 1}.
                             </span>
                             <p
@@ -1084,8 +1158,8 @@ export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
                       </div>
                     ) : (
                       <p className="text-xs italic text-amber-900/80 dark:text-amber-300/80">
-                        No readable text detected in this OCR pass. Try High-DPI Re-run or keep the
-                        original layout text.
+                        No readable text detected in this OCR pass. Select the book script or try
+                        High-DPI Re-run.
                       </p>
                     )}
                   </div>
@@ -1094,7 +1168,7 @@ export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
             </div>
           )}
 
-          {/* Decision Footer: Keep Original | Re-run OCR | Save OCR Text */}
+          {/* Decision Footer: Keep Original | Script | Re-run OCR | Save OCR Text */}
           <div className="px-3 sm:px-4 py-2 border-t border-stone-200/80 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#F5F3EE] sepia:bg-[#EFE5CF] dark:bg-[#161513] flex flex-wrap items-center justify-between gap-2">
             <div className="flex flex-wrap items-center gap-2">
               <button
@@ -1104,6 +1178,22 @@ export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
               >
                 <span>Keep Original</span>
               </button>
+
+              {onChangeOcrScriptMode && (
+                <select
+                  aria-label="Select script for OCR re-run"
+                  disabled={isRunningOcr || !pdf}
+                  value={ocrScriptMode}
+                  onChange={(e) => onChangeOcrScriptMode(e.target.value as OcrScriptMode)}
+                  className="h-7 px-2 rounded border border-stone-300 sepia:border-[#CBB994] dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] text-[11px] font-medium text-stone-700 sepia:text-[#3B2F23] dark:text-stone-200 focus:outline-none focus:border-amber-700 cursor-pointer"
+                >
+                  {OCR_SCRIPT_OPTIONS.map((opt) => (
+                    <option key={opt.id} value={opt.id}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              )}
 
               <button
                 type="button"

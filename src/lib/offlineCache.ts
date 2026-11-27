@@ -1,6 +1,6 @@
 import { registerSW } from 'virtual:pwa-register';
 import type { StoredBook } from '../types';
-import { saveBook } from './storage';
+import { getBookPdfData, saveBook, stripBookBinary } from './storage';
 
 export const OFFLINE_LIBRARY_CACHE = 'bhashabook-library-offline-v1';
 export const PDFJS_ASSETS_CACHE = 'bhashabook-pdfjs-assets-v1';
@@ -62,6 +62,30 @@ export function initOfflineServiceWorker(): void {
   emitSwStatus('registering');
 
   try {
+    // In Vite dev mode, register the lightweight classic /sw.js served by Express
+    // (avoids VitePWA dev-dist module/importScripts conflicts and reload loops).
+    if (import.meta.env.DEV) {
+      navigator.serviceWorker
+        .register('/sw.js', { scope: '/' })
+        .then((registration) => {
+          if (registration.active || navigator.serviceWorker.controller) {
+            emitSwStatus('active');
+          }
+          return navigator.serviceWorker.ready;
+        })
+        .then(() => {
+          emitSwStatus('active');
+        })
+        .catch(() => {
+          emitSwStatus('error');
+        });
+
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        emitSwStatus('active');
+      });
+      return;
+    }
+
     registerSW({
       immediate: true,
       onRegisteredSW(_swUrl, registration) {
@@ -131,40 +155,46 @@ async function putPdfBufferIntoCache(
  * the preloaded guidebook), downloads the PDF once and persists it offline.
  */
 export async function cacheBookForOffline(book: StoredBook): Promise<StoredBook> {
-  let updatedBook = book;
+  const localBuffer =
+    book.pdfData && book.pdfData.byteLength > 0
+      ? book.pdfData
+      : book.hasLocalPdf
+      ? await getBookPdfData(book.id)
+      : undefined;
 
-  if (book.pdfData && book.pdfData.byteLength > 0) {
-    await putPdfBufferIntoCache(getOfflineBookCacheUrl(book.id), book.pdfData, book.fileName);
+  if (localBuffer && localBuffer.byteLength > 0) {
+    await putPdfBufferIntoCache(getOfflineBookCacheUrl(book.id), localBuffer, book.fileName);
     if (book.sourceUrl) {
-      await putPdfBufferIntoCache(book.sourceUrl, book.pdfData, book.fileName);
+      await putPdfBufferIntoCache(book.sourceUrl, localBuffer, book.fileName);
     }
-    return updatedBook;
+    return stripBookBinary({ ...book, hasLocalPdf: true });
   }
 
   if (book.sourceUrl) {
     // Check Service Worker Cache Storage first before hitting the network
-    let buffer: ArrayBuffer | null = null;
+    let cachedHit = false;
     if (typeof caches !== 'undefined') {
       try {
         const cachedResp =
           (await caches.match(book.sourceUrl)) ??
           (await caches.match(getOfflineBookCacheUrl(book.id)));
         if (cachedResp && cachedResp.ok) {
-          buffer = await cachedResp.arrayBuffer();
+          cachedHit = true;
         }
       } catch {
         // fallback to fetch
       }
     }
 
-    if (!buffer) {
-      const resp = await fetch(book.sourceUrl);
-      if (!resp.ok) {
-        throw new Error(`Could not download PDF for offline access (HTTP ${resp.status}).`);
-      }
-      buffer = await resp.arrayBuffer();
+    if (cachedHit) {
+      return stripBookBinary(book);
     }
 
+    const resp = await fetch(book.sourceUrl);
+    if (!resp.ok) {
+      throw new Error(`Could not download PDF for offline access (HTTP ${resp.status}).`);
+    }
+    const buffer = await resp.arrayBuffer();
     if (buffer.byteLength === 0) {
       throw new Error('Downloaded PDF file was empty.');
     }
@@ -172,12 +202,12 @@ export async function cacheBookForOffline(book: StoredBook): Promise<StoredBook>
     await putPdfBufferIntoCache(book.sourceUrl, buffer, book.fileName);
     await putPdfBufferIntoCache(getOfflineBookCacheUrl(book.id), buffer, book.fileName);
 
-    updatedBook = {
-      ...book,
-      pdfData: buffer,
-    };
-    await saveBook(updatedBook);
-    return updatedBook;
+    // Only duplicate binary into IndexedDB if Cache Storage API is unavailable
+    if (typeof caches === 'undefined') {
+      await saveBook({ ...book, pdfData: buffer, hasLocalPdf: true });
+      return stripBookBinary({ ...book, hasLocalPdf: true });
+    }
+    return stripBookBinary(book);
   }
 
   throw new Error('This book has no local PDF binary or downloadable URL.');
@@ -252,15 +282,6 @@ export async function warmPdfEngineOfflineAssets(): Promise<void> {
         }
       })
     );
-
-    const libraryCache = await caches.open(OFFLINE_LIBRARY_CACHE);
-    const appShellHit = await libraryCache.match('/');
-    if (!appShellHit) {
-      const resp = await fetch('/');
-      if (resp.ok) {
-        await libraryCache.put('/', resp);
-      }
-    }
   } catch {
     // non-fatal warm-up
   }
@@ -276,9 +297,9 @@ export async function inspectOfflineLibraryCache(
   const cachedBookIds = new Set<string>();
   let swCacheEntries = 0;
 
-  // Check IndexedDB pdfData first
+  // Check IndexedDB pdfData / hasLocalPdf flag first
   for (const book of books) {
-    if (book.pdfData && book.pdfData.byteLength > 0) {
+    if (book.hasLocalPdf || (book.pdfData && book.pdfData.byteLength > 0)) {
       cachedBookIds.add(book.id);
     }
   }
