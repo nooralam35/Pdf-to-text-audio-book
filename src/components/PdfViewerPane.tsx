@@ -1,7 +1,11 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Check,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
+  Columns2,
   Download,
   Eraser,
   Eye,
@@ -13,6 +17,7 @@ import {
   MousePointer2,
   PenTool,
   Redo2,
+  RotateCcw,
   ScanText,
   StickyNote as StickyNoteIcon,
   Trash2,
@@ -35,6 +40,7 @@ import type {
   AnnotationStroke,
   AnnotationTool,
   PageAnnotationLayer,
+  ParsedPage,
   StickyNote,
   StoredBook,
 } from '../types';
@@ -43,6 +49,25 @@ import {
   PdfAnnotationLayer,
   renderStrokesToDataUrl,
 } from './PdfAnnotationLayer';
+
+export interface PendingOcrReview {
+  pageNumber: number;
+  originalPage: ParsedPage | null;
+  ocrPage: ParsedPage;
+  runCount: number;
+  dpiScale: number;
+  completedAt: number;
+}
+
+type OcrCompareMode = 'original' | 'rerun' | 'compare';
+
+function countPageWords(page: ParsedPage | null): number {
+  if (!page || page.blocks.length === 0) return 0;
+  return page.blocks.reduce((sum, block) => {
+    const words = block.text.trim().split(/\s+/).filter(Boolean).length;
+    return sum + words;
+  }, 0);
+}
 
 interface PdfViewerPaneProps {
   bookId: string;
@@ -53,8 +78,13 @@ interface PdfViewerPaneProps {
   figureCount: number;
   onChangePage: (page: number) => void;
   onRunOcr: () => void;
+  onRerunOcr?: (highRes: boolean) => void;
+  onSaveOcrReview?: () => void;
+  onKeepOriginalOcr?: () => void;
   isRunningOcr: boolean;
   ocrProgress: number;
+  ocrStage?: string;
+  pendingOcrReview?: PendingOcrReview | null;
   onBookMetadataUpdated?: (updatedBook: StoredBook) => void;
   onReachPageEnd?: () => void;
 }
@@ -82,8 +112,13 @@ export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
   figureCount,
   onChangePage,
   onRunOcr,
+  onRerunOcr,
+  onSaveOcrReview,
+  onKeepOriginalOcr,
   isRunningOcr,
   ocrProgress,
+  ocrStage = '',
+  pendingOcrReview = null,
   onBookMetadataUpdated,
   onReachPageEnd,
 }) => {
@@ -98,6 +133,34 @@ export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
     width: 0,
     height: 0,
   });
+
+  // OCR Verification & Comparison Toggle State
+  const [ocrCompareMode, setOcrCompareMode] = useState<OcrCompareMode>('compare');
+  const [ocrPanelExpanded, setOcrPanelExpanded] = useState(true);
+  const [ocrHighDpiRerun, setOcrHighDpiRerun] = useState(true);
+
+  useEffect(() => {
+    if (pendingOcrReview) {
+      setOcrPanelExpanded(true);
+      const hasOriginalBlocks = (pendingOcrReview.originalPage?.blocks.length ?? 0) > 0;
+      setOcrCompareMode(hasOriginalBlocks ? 'compare' : 'rerun');
+    }
+  }, [pendingOcrReview?.completedAt]);
+
+  const ocrStats = useMemo(() => {
+    if (!pendingOcrReview) return null;
+    const origBlocks = pendingOcrReview.originalPage?.blocks.length ?? 0;
+    const origWords = countPageWords(pendingOcrReview.originalPage);
+    const ocrBlocks = pendingOcrReview.ocrPage.blocks.length;
+    const ocrWords = countPageWords(pendingOcrReview.ocrPage);
+    return {
+      origBlocks,
+      origWords,
+      ocrBlocks,
+      ocrWords,
+      wordDelta: ocrWords - origWords,
+    };
+  }, [pendingOcrReview]);
 
   // HTML5 Canvas Brush, Opacity, Color & Sticky Note Controls
   const [tool, setTool] = useState<AnnotationTool>('cursor');
@@ -831,6 +894,252 @@ export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
           </div>
         )}
       </div>
+
+      {/* Visual OCR Progress Bar */}
+      {isRunningOcr && (
+        <div
+          role="progressbar"
+          aria-label="OCR text extraction progress"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={Math.max(0, Math.min(100, ocrProgress))}
+          className="px-3 sm:px-4 py-2.5 border-b border-amber-200/90 sepia:border-[#D4C29E] dark:border-amber-900/60 bg-amber-50/90 sepia:bg-[#EFE4CA] dark:bg-[#1E1A13] shrink-0"
+        >
+          <div className="flex items-center justify-between gap-2 text-xs mb-1.5">
+            <div className="flex items-center gap-2 min-w-0">
+              <Loader2 className="w-3.5 h-3.5 text-amber-700 dark:text-amber-400 animate-spin shrink-0" />
+              <span className="font-medium text-amber-950 sepia:text-[#3B2F23] dark:text-amber-100 truncate">
+                {ocrStage || `Scanning Page ${pageNumber} layout with OCR…`}
+              </span>
+            </div>
+            <span className="font-mono-num tabular-nums font-semibold text-amber-900 sepia:text-[#5E3A14] dark:text-amber-300 shrink-0">
+              {Math.max(0, Math.min(100, ocrProgress))}%
+            </span>
+          </div>
+          <div className="w-full h-2 rounded-sm bg-amber-200/80 sepia:bg-[#DFD0AE] dark:bg-stone-800 overflow-hidden">
+            <div
+              className="h-full bg-amber-700 dark:bg-amber-500 transition-[width] duration-200 ease-out"
+              style={{ width: `${Math.max(4, Math.min(100, ocrProgress))}%` }}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Pre-Save OCR Verification & Keep Original / Re-run Comparison Panel */}
+      {!isRunningOcr && pendingOcrReview && pendingOcrReview.pageNumber === pageNumber && ocrStats && (
+        <div className="border-b border-stone-300 sepia:border-[#D4C6AA] dark:border-stone-700 bg-[#FAF9F5] sepia:bg-[#F7EFE0] dark:bg-[#191816] shrink-0">
+          {/* Verification Header & Comparison Toggle */}
+          <div className="px-3 sm:px-4 py-2 flex flex-wrap items-center justify-between gap-2 border-b border-stone-200/80 sepia:border-[#DFD4BC] dark:border-stone-800">
+            <div className="flex items-center gap-2 min-w-0">
+              <ScanText className="w-4 h-4 text-amber-700 dark:text-amber-500 shrink-0" />
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-xs font-semibold text-stone-900 sepia:text-[#2E241A] dark:text-stone-100">
+                    Verify OCR Before Saving
+                  </span>
+                  <span className="text-[11px] font-mono-num tabular-nums text-stone-500 dark:text-stone-400">
+                    Pass #{pendingOcrReview.runCount} · {pendingOcrReview.dpiScale.toFixed(1)}× DPI
+                  </span>
+                </div>
+                <p className="text-[11px] text-stone-500 sepia:text-[#66543F] dark:text-stone-400 font-mono-num tabular-nums">
+                  Original: {ocrStats.origBlocks} blk / {ocrStats.origWords}w · OCR:{' '}
+                  {ocrStats.ocrBlocks} blk / {ocrStats.ocrWords}w (
+                  {ocrStats.wordDelta >= 0 ? `+${ocrStats.wordDelta}` : ocrStats.wordDelta}w)
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-1.5">
+              {/* Keep Original / Re-run / Compare Segmented Toggle */}
+              <div
+                role="tablist"
+                aria-label="Compare original and OCR extracted text"
+                className="inline-flex items-center rounded-md border border-stone-300 sepia:border-[#D4C6AA] dark:border-stone-700 bg-stone-100/90 sepia:bg-[#EAE0C8] dark:bg-[#121110] p-0.5"
+              >
+                {(
+                  [
+                    { id: 'original', label: 'Keep Original' },
+                    { id: 'rerun', label: 'OCR Re-run' },
+                    { id: 'compare', label: 'Compare' },
+                  ] as const
+                ).map((tab) => {
+                  const active = ocrCompareMode === tab.id;
+                  return (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      role="tab"
+                      aria-selected={active}
+                      onClick={() => {
+                        setOcrCompareMode(tab.id);
+                        if (!ocrPanelExpanded) setOcrPanelExpanded(true);
+                      }}
+                      className={`h-6 px-2 rounded text-[11px] font-medium transition-colors whitespace-nowrap cursor-pointer inline-flex items-center gap-1 ${
+                        active
+                          ? 'bg-white sepia:bg-[#FBF6E9] dark:bg-stone-800 text-stone-950 sepia:text-[#2E241A] dark:text-stone-50 shadow-xs'
+                          : 'text-stone-600 sepia:text-[#5C4936] dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-200'
+                      }`}
+                    >
+                      {tab.id === 'compare' && <Columns2 className="w-3 h-3" />}
+                      <span>{tab.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setOcrPanelExpanded((v) => !v)}
+                aria-label={ocrPanelExpanded ? 'Collapse OCR comparison' : 'Expand OCR comparison'}
+                title={ocrPanelExpanded ? 'Collapse preview to inspect full PDF' : 'Expand preview'}
+                className="h-7 w-7 inline-flex items-center justify-center rounded text-stone-500 hover:text-stone-900 dark:text-stone-400 dark:hover:text-stone-100 hover:bg-stone-200/70 dark:hover:bg-stone-800 cursor-pointer"
+              >
+                {ocrPanelExpanded ? (
+                  <ChevronUp className="w-4 h-4" />
+                ) : (
+                  <ChevronDown className="w-4 h-4" />
+                )}
+              </button>
+            </div>
+          </div>
+
+          {/* Extracted Text Comparison Body */}
+          {ocrPanelExpanded && (
+            <div className="px-3 sm:px-4 py-2.5 max-h-56 overflow-y-auto bg-white/80 sepia:bg-[#FBF6E9]/85 dark:bg-[#141311]">
+              <div
+                className={
+                  ocrCompareMode === 'compare'
+                    ? 'grid grid-cols-1 md:grid-cols-2 gap-3'
+                    : 'space-y-2'
+                }
+              >
+                {/* Original Extracted Text Column */}
+                {(ocrCompareMode === 'original' || ocrCompareMode === 'compare') && (
+                  <div className="rounded border border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#FAF9F5] sepia:bg-[#F4ECD8]/70 dark:bg-[#191816] p-2.5">
+                    <div className="flex items-center justify-between gap-2 pb-1.5 mb-2 border-b border-stone-200/80 sepia:border-[#DFD4BC] dark:border-stone-800">
+                      <span className="text-[11px] font-semibold uppercase tracking-wider text-stone-600 sepia:text-[#5C4936] dark:text-stone-400">
+                        Original PDF Layer
+                      </span>
+                      <span className="text-[11px] font-mono-num tabular-nums text-stone-500 dark:text-stone-400">
+                        {ocrStats.origBlocks} blocks · {ocrStats.origWords} words
+                      </span>
+                    </div>
+                    {pendingOcrReview.originalPage &&
+                    pendingOcrReview.originalPage.blocks.length > 0 ? (
+                      <div className="space-y-2 text-xs leading-relaxed text-stone-700 sepia:text-[#3B2F23] dark:text-stone-300">
+                        {pendingOcrReview.originalPage.blocks.map((block, idx) => (
+                          <div key={block.id} className="flex items-start gap-2">
+                            <span className="text-[10px] font-mono-num tabular-nums text-stone-400 mt-0.5 shrink-0 w-5">
+                              {idx + 1}.
+                            </span>
+                            <p
+                              className={
+                                block.kind === 'heading'
+                                  ? 'font-semibold text-stone-900 dark:text-stone-100'
+                                  : ''
+                              }
+                            >
+                              {block.text}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-xs italic text-stone-500 dark:text-stone-400">
+                        No embedded text layer found on this page (likely a scanned image).
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                {/* OCR Re-run Extracted Text Column */}
+                {(ocrCompareMode === 'rerun' || ocrCompareMode === 'compare') && (
+                  <div className="rounded border border-amber-300/80 sepia:border-[#C9B387] dark:border-amber-800/70 bg-amber-50/40 sepia:bg-[#F7EED7] dark:bg-amber-950/15 p-2.5">
+                    <div className="flex items-center justify-between gap-2 pb-1.5 mb-2 border-b border-amber-200/80 sepia:border-[#D9C6A0] dark:border-amber-900/50">
+                      <span className="text-[11px] font-semibold uppercase tracking-wider text-amber-900 sepia:text-[#6B3A10] dark:text-amber-300">
+                        OCR Extracted (Pass #{pendingOcrReview.runCount})
+                      </span>
+                      <span className="text-[11px] font-mono-num tabular-nums text-amber-800/80 dark:text-amber-400/90">
+                        {ocrStats.ocrBlocks} blocks · {ocrStats.ocrWords} words
+                      </span>
+                    </div>
+                    {pendingOcrReview.ocrPage.blocks.length > 0 ? (
+                      <div className="space-y-2 text-xs leading-relaxed text-stone-800 sepia:text-[#2E241A] dark:text-stone-200">
+                        {pendingOcrReview.ocrPage.blocks.map((block, idx) => (
+                          <div key={block.id} className="flex items-start gap-2">
+                            <span className="text-[10px] font-mono-num tabular-nums text-amber-700/80 dark:text-amber-400/80 mt-0.5 shrink-0 w-5">
+                              {idx + 1}.
+                            </span>
+                            <p
+                              className={
+                                block.kind === 'heading'
+                                  ? 'font-semibold text-stone-950 dark:text-stone-50'
+                                  : ''
+                              }
+                            >
+                              {block.text}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-xs italic text-amber-900/80 dark:text-amber-300/80">
+                        No readable text detected in this OCR pass. Try High-DPI Re-run or keep the
+                        original layout text.
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Decision Footer: Keep Original | Re-run OCR | Save OCR Text */}
+          <div className="px-3 sm:px-4 py-2 border-t border-stone-200/80 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#F5F3EE] sepia:bg-[#EFE5CF] dark:bg-[#161513] flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={onKeepOriginalOcr}
+                className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded border border-stone-300 sepia:border-[#CBB994] dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] text-xs font-medium text-stone-700 sepia:text-[#3B2F23] dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 transition-colors whitespace-nowrap cursor-pointer"
+              >
+                <span>Keep Original</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => (onRerunOcr ? onRerunOcr(ocrHighDpiRerun) : onRunOcr())}
+                disabled={isRunningOcr || !pdf}
+                title="Re-run OCR on this page to compare a fresh extraction before saving"
+                className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded border border-amber-300 sepia:border-[#C9B387] dark:border-amber-700/80 bg-amber-50 sepia:bg-[#F4E6C5] dark:bg-amber-950/40 text-xs font-medium text-amber-900 sepia:text-[#6B3A10] dark:text-amber-300 hover:bg-amber-100/80 dark:hover:bg-amber-900/45 transition-colors whitespace-nowrap cursor-pointer disabled:opacity-45"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>Re-run OCR {ocrHighDpiRerun ? '(2.6×)' : '(2.0×)'}</span>
+              </button>
+
+              <label className="inline-flex items-center gap-1.5 text-[11px] text-stone-600 sepia:text-[#5C4936] dark:text-stone-400 cursor-pointer select-none whitespace-nowrap">
+                <input
+                  type="checkbox"
+                  checked={ocrHighDpiRerun}
+                  onChange={(e) => setOcrHighDpiRerun(e.target.checked)}
+                  className="rounded border-stone-300 accent-amber-700 cursor-pointer"
+                />
+                <span>High-DPI scan</span>
+              </label>
+            </div>
+
+            <button
+              type="button"
+              onClick={onSaveOcrReview}
+              disabled={pendingOcrReview.ocrPage.blocks.length === 0}
+              title="Save this OCR text as the active extracted text for this page"
+              className="inline-flex items-center gap-1.5 h-7 px-3 rounded bg-stone-900 text-stone-50 hover:bg-stone-800 dark:bg-amber-600 dark:text-stone-950 dark:hover:bg-amber-500 text-xs font-medium transition-colors whitespace-nowrap cursor-pointer disabled:opacity-40"
+            >
+              <Check className="w-3.5 h-3.5" />
+              <span>Save OCR Text</span>
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Canvas Viewport with Overlaid HTML5 Canvas & Sticky Notes Layer */}
       <div

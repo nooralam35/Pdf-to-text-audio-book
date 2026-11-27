@@ -13,6 +13,7 @@ import {
   Image as ImageIcon,
   Languages,
   Loader2,
+  LocateFixed,
   RefreshCw,
   Share2,
   Sparkles,
@@ -235,6 +236,12 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
   const [editingBlockId, setEditingBlockId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState('');
   const [showOriginalRef, setShowOriginalRef] = useState(false);
+  const [autoScrollEnabled, setAutoScrollEnabled] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return true;
+    const saved = localStorage.getItem('bhashabook-audio-autoscroll');
+    return saved === null ? true : saved === 'true';
+  });
+  const [autoScrollPausedByUser, setAutoScrollPausedByUser] = useState(false);
 
   // Text selection highlighting, note-taking & dictionary popover state
   const [popover, setPopover] = useState<SelectionPopoverState | null>(null);
@@ -252,6 +259,14 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
   const reachedKeyRef = useRef<string | null>(null);
   const onReachPageEndRef = useRef(onReachPageEnd);
   onReachPageEndRef.current = onReachPageEnd;
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('bhashabook-audio-autoscroll', String(autoScrollEnabled));
+    } catch {
+      // ignore storage errors
+    }
+  }, [autoScrollEnabled]);
 
   const langOption = getLanguageOption(targetLang);
   const pageHighlights = useMemo(
@@ -275,11 +290,81 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
     setEditingBlockId(null);
     setEditDraft('');
     closePopover();
+    setAutoScrollPausedByUser(false);
     reachedKeyRef.current = null;
     if (scrollContainerRef.current) {
       scrollContainerRef.current.scrollTop = 0;
     }
   }, [pageNumber, targetLang, closePopover]);
+
+  // Reset user scroll pause when audiobook stops playing
+  useEffect(() => {
+    if (!isSpeaking) {
+      setAutoScrollPausedByUser(false);
+    }
+  }, [isSpeaking]);
+
+  // Pause auto-scroll gracefully when the user manually scrolls the reading pane during playback
+  useEffect(() => {
+    if (!isSpeaking || !autoScrollEnabled) return;
+    const container = scrollContainerRef.current;
+    if (!container) return;
+
+    const pauseOnManualScroll = () => {
+      setAutoScrollPausedByUser(true);
+    };
+
+    const handleKeyScroll = (e: KeyboardEvent) => {
+      if (
+        e.key === 'PageUp' ||
+        e.key === 'PageDown' ||
+        e.key === 'Home' ||
+        e.key === 'End'
+      ) {
+        setAutoScrollPausedByUser(true);
+      }
+    };
+
+    container.addEventListener('wheel', pauseOnManualScroll, { passive: true });
+    container.addEventListener('touchmove', pauseOnManualScroll, { passive: true });
+    container.addEventListener('keydown', handleKeyScroll);
+
+    return () => {
+      container.removeEventListener('wheel', pauseOnManualScroll);
+      container.removeEventListener('touchmove', pauseOnManualScroll);
+      container.removeEventListener('keydown', handleKeyScroll);
+    };
+  }, [isSpeaking, autoScrollEnabled]);
+
+  // Center the actively spoken sentence vertically within the reader scroll container
+  const centerActiveSentence = useCallback((instant = false) => {
+    const container = scrollContainerRef.current;
+    const activeEl = activeSentenceRef.current;
+    if (!container || !activeEl) return;
+
+    const containerRect = container.getBoundingClientRect();
+    const sentenceRect = activeEl.getBoundingClientRect();
+    if (containerRect.height <= 0) return;
+
+    const sentenceCenterInContainer =
+      sentenceRect.top - containerRect.top + container.scrollTop + sentenceRect.height / 2;
+    const maxScrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
+    const targetScrollTop = Math.max(
+      0,
+      Math.min(maxScrollTop, sentenceCenterInContainer - container.clientHeight / 2)
+    );
+
+    if (Math.abs(container.scrollTop - targetScrollTop) < 4) return;
+
+    const prefersReducedMotion =
+      typeof window !== 'undefined' &&
+      window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+
+    container.scrollTo({
+      top: targetScrollTop,
+      behavior: instant || prefersReducedMotion ? 'auto' : 'smooth',
+    });
+  }, []);
 
   // Dismiss popover on Escape or clicking outside
   useEffect(() => {
@@ -307,15 +392,36 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
     };
   }, [popover, closePopover]);
 
-  // Smoothly keep the actively spoken sentence visible during audiobook playback
+  // Smoothly keep the actively spoken sentence vertically centered during audiobook playback
   useEffect(() => {
-    if (isSpeaking && activeSentenceIndex !== null && activeSentenceRef.current) {
-      activeSentenceRef.current.scrollIntoView({
-        behavior: 'smooth',
-        block: 'nearest',
-      });
+    if (
+      !isSpeaking ||
+      activeSentenceIndex === null ||
+      !autoScrollEnabled ||
+      autoScrollPausedByUser ||
+      editingBlockId !== null ||
+      popover !== null
+    ) {
+      return;
     }
-  }, [activeSentenceIndex, isSpeaking]);
+
+    const frameId = window.requestAnimationFrame(() => {
+      centerActiveSentence(false);
+    });
+    return () => window.cancelAnimationFrame(frameId);
+  }, [
+    activeSentenceIndex,
+    isSpeaking,
+    autoScrollEnabled,
+    autoScrollPausedByUser,
+    editingBlockId,
+    popover,
+    translatedPage,
+    readerFontSize,
+    readerLineHeight,
+    showOriginalRef,
+    centerActiveSentence,
+  ]);
 
   // Automatically trigger next-page translation & auto-save when the reader reaches the end of the page
   useEffect(() => {
@@ -829,6 +935,7 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
               if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) {
                 return;
               }
+              setAutoScrollPausedByUser(false);
               onClickSentence(span.globalIndex);
             }}
             title="Click to read aloud · Drag to highlight, take notes, or define"
@@ -924,6 +1031,44 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
                   <span className="hidden sm:inline">Notes</span>
                 </button>
               )}
+
+              <button
+                type="button"
+                onClick={() => {
+                  if (!autoScrollEnabled) {
+                    setAutoScrollEnabled(true);
+                    setAutoScrollPausedByUser(false);
+                    if (isSpeaking && activeSentenceIndex !== null) {
+                      window.requestAnimationFrame(() => centerActiveSentence(false));
+                    }
+                  } else if (autoScrollPausedByUser && isSpeaking) {
+                    setAutoScrollPausedByUser(false);
+                    window.requestAnimationFrame(() => centerActiveSentence(false));
+                  } else {
+                    setAutoScrollEnabled(false);
+                  }
+                }}
+                aria-pressed={autoScrollEnabled && !autoScrollPausedByUser}
+                className={`inline-flex items-center gap-1.5 h-7 px-2 rounded text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                  autoScrollEnabled && !autoScrollPausedByUser
+                    ? isSpeaking
+                      ? 'bg-amber-100/90 sepia:bg-[#E7D8B6] dark:bg-amber-950/60 text-amber-900 sepia:text-[#6B3A10] dark:text-amber-300'
+                      : 'text-stone-700 sepia:text-[#3B2F23] dark:text-stone-200 hover:bg-stone-200/70 dark:hover:bg-stone-800'
+                    : 'text-stone-400 dark:text-stone-500 hover:bg-stone-200/70 dark:hover:bg-stone-800'
+                }`}
+                title={
+                  autoScrollEnabled
+                    ? autoScrollPausedByUser && isSpeaking
+                      ? 'Auto-scroll paused while browsing — click to re-center on speaking sentence'
+                      : 'Auto-scroll active: keeps the currently speaking sentence vertically centered'
+                    : 'Auto-scroll off — click to keep the speaking sentence centered while playing'
+                }
+              >
+                <LocateFixed className="w-3.5 h-3.5" />
+                <span className="hidden xl:inline">
+                  {autoScrollEnabled ? (autoScrollPausedByUser && isSpeaking ? 'Re-center' : 'Auto-scroll') : 'Scroll Off'}
+                </span>
+              </button>
 
               <button
                 type="button"
@@ -1653,6 +1798,24 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
             </article>
           )}
         </div>
+
+        {/* Floating Re-center Action when user scrolled away during active narration */}
+        {isSpeaking && activeSentenceIndex !== null && (autoScrollPausedByUser || !autoScrollEnabled) && (
+          <div className="sticky bottom-3 flex justify-end pointer-events-none mt-2">
+            <button
+              type="button"
+              onClick={() => {
+                setAutoScrollEnabled(true);
+                setAutoScrollPausedByUser(false);
+                window.requestAnimationFrame(() => centerActiveSentence(false));
+              }}
+              className="pointer-events-auto inline-flex items-center gap-1.5 h-8 px-3 rounded-md border border-amber-300 sepia:border-[#C9B387] dark:border-amber-700/80 bg-[#FAF9F5]/95 sepia:bg-[#F4ECD8]/95 dark:bg-[#1C1B19]/95 text-xs font-medium text-amber-900 sepia:text-[#5E3A14] dark:text-amber-300 shadow-md hover:bg-amber-50 dark:hover:bg-amber-950/70 transition-colors cursor-pointer whitespace-nowrap"
+            >
+              <LocateFixed className="w-3.5 h-3.5" />
+              <span>Re-center speaking sentence</span>
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Collapsible Page Highlights & Study Notes Tray */}

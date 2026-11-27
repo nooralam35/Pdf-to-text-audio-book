@@ -28,7 +28,7 @@ import {
 import { TopBar, type ActiveTab } from './components/TopBar';
 import { DiscoverView, type DiscoverBookAction } from './components/DiscoverView';
 import { ChapterSidebar } from './components/ChapterSidebar';
-import { PdfViewerPane } from './components/PdfViewerPane';
+import { PdfViewerPane, type PendingOcrReview } from './components/PdfViewerPane';
 import {
   TranslatedReaderPane,
   type NextPagePrefetchStatus,
@@ -203,6 +203,8 @@ export default function App() {
   const [translationError, setTranslationError] = useState<string | null>(null);
   const [isRunningOcr, setIsRunningOcr] = useState(false);
   const [ocrProgress, setOcrProgress] = useState(0);
+  const [ocrStage, setOcrStage] = useState('');
+  const [pendingOcrReview, setPendingOcrReview] = useState<PendingOcrReview | null>(null);
   const [batchProgress, setBatchProgress] = useState<BatchTranslationProgress | null>(null);
   const batchCancelRef = useRef(false);
   const batchAbortRef = useRef<AbortController | null>(null);
@@ -1843,24 +1845,81 @@ export default function App() {
     [handleFastTranslateRange]
   );
 
-  // Run client-side Tesseract OCR on current page
-  const handleRunOcr = async () => {
+  // Clear any unsaved OCR verification panel when switching books or pages
+  useEffect(() => {
+    setPendingOcrReview(null);
+  }, [activeBook?.id, currentPage]);
+
+  // Run client-side Tesseract OCR on current page and stage result for visual verification before saving
+  const handleRunOcr = async (opts?: { highRes?: boolean }) => {
     if (!activeBook || !loadedPdf || isRunningOcr) return;
+    const targetPage = currentPage;
+    const bookIdAtStart = activeBook.id;
+    const dpiScale = opts?.highRes ? 2.6 : 2.0;
+    const baseOriginal =
+      pendingOcrReview && pendingOcrReview.pageNumber === targetPage
+        ? pendingOcrReview.originalPage
+        : parsedPage;
+    const prevRunCount =
+      pendingOcrReview && pendingOcrReview.pageNumber === targetPage
+        ? pendingOcrReview.runCount
+        : 0;
+
     setIsRunningOcr(true);
-    setOcrProgress(0);
+    setOcrProgress(4);
+    setOcrStage('Preparing page for OCR…');
     setTranslationError(null);
     try {
-      const ocrParsed = await runClientOcrOnPage(loadedPdf, currentPage, setOcrProgress);
-      await saveParsedPage(activeBook.id, ocrParsed);
-      setParsedPage(ocrParsed);
-      setAppBanner(
-        `OCR completed on Page ${currentPage} (${ocrParsed.blocks.length} text blocks extracted). Click Re-translate to translate the OCR text.`
+      const ocrParsed = await runClientOcrOnPage(
+        loadedPdf,
+        targetPage,
+        ({ progress, stage }) => {
+          setOcrProgress(progress);
+          setOcrStage(stage);
+        },
+        { scale: dpiScale }
       );
+      const mergedOcrPage: ParsedPage = {
+        ...ocrParsed,
+        figures: baseOriginal?.figures ?? ocrParsed.figures,
+      };
+      if (activeBookIdRef.current === bookIdAtStart && currentPageRef.current === targetPage) {
+        setPendingOcrReview({
+          pageNumber: targetPage,
+          originalPage: baseOriginal,
+          ocrPage: mergedOcrPage,
+          runCount: prevRunCount + 1,
+          dpiScale,
+          completedAt: Date.now(),
+        });
+        setAppBanner(
+          `OCR pass #${prevRunCount + 1} ready for Page ${targetPage} (${mergedOcrPage.blocks.length} blocks). Verify against the PDF layout before saving.`
+        );
+      }
     } catch (err) {
       setAppBanner(err instanceof Error ? `OCR failed: ${err.message}` : 'OCR failed.');
     } finally {
       setIsRunningOcr(false);
+      setOcrStage('');
     }
+  };
+
+  const handleSaveOcrReview = async () => {
+    if (!activeBook || !pendingOcrReview) return;
+    const savedPage = pendingOcrReview.ocrPage;
+    await saveParsedPage(activeBook.id, savedPage);
+    setParsedPage(savedPage);
+    setPendingOcrReview(null);
+    setAppBanner(
+      `Saved OCR text for Page ${savedPage.pageNumber} (${savedPage.blocks.length} blocks). Click Re-translate to translate the updated text.`
+    );
+  };
+
+  const handleKeepOriginalOcr = () => {
+    if (!pendingOcrReview) return;
+    const pg = pendingOcrReview.pageNumber;
+    setPendingOcrReview(null);
+    setAppBanner(`Kept original extracted text for Page ${pg}.`);
   };
 
   // Inline edit of a translated block -> persists to IndexedDB immediately and re-anchors any text highlights
@@ -2231,6 +2290,28 @@ export default function App() {
     );
   };
 
+  const cachedLibraryBookCount = useMemo(
+    () => books.reduce((count, b) => count + (cachedBookIds.has(b.id) ? 1 : 0), 0),
+    [books, cachedBookIds]
+  );
+
+  const handleHeaderSyncClick = useCallback(() => {
+    const hasPending = books.length > cachedLibraryBookCount;
+    if (swStatus === 'active' && isOnline && hasPending && !isSyncingAllOffline && !cachingBookId) {
+      handleSyncAllOffline();
+      return;
+    }
+    setActiveTab('library');
+  }, [
+    books.length,
+    cachedLibraryBookCount,
+    swStatus,
+    isOnline,
+    isSyncingAllOffline,
+    cachingBookId,
+    handleSyncAllOffline,
+  ]);
+
   return (
     <div className="min-h-screen w-full max-w-full overflow-x-hidden flex flex-col bg-[#FAF9F5] sepia:bg-[#F4ECD8] dark:bg-[#090908] text-stone-900 sepia:text-[#3B2F23] dark:text-stone-100">
       {/* Top 3-Zone Navigation Bar */}
@@ -2239,6 +2320,14 @@ export default function App() {
         onSelectTab={setActiveTab}
         onUploadPdf={handleUploadPdf}
         isUploading={isUploading}
+        librarySync={{
+          swStatus,
+          isOnline,
+          totalBooks: books.length,
+          cachedBooks: cachedLibraryBookCount,
+          isSyncing: isSyncingAllOffline || Boolean(cachingBookId),
+          onSyncAction: handleHeaderSyncClick,
+        }}
       />
 
       {/* Offline Mode Connectivity Bar */}
@@ -2863,9 +2952,18 @@ export default function App() {
                   numPages={activeBook.numPages}
                   figureCount={parsedPage?.figures.length ?? 0}
                   onChangePage={setCurrentPage}
-                  onRunOcr={handleRunOcr}
+                  onRunOcr={() => handleRunOcr({ highRes: false })}
+                  onRerunOcr={(highRes) => handleRunOcr({ highRes })}
+                  onSaveOcrReview={handleSaveOcrReview}
+                  onKeepOriginalOcr={handleKeepOriginalOcr}
                   isRunningOcr={isRunningOcr}
                   ocrProgress={ocrProgress}
+                  ocrStage={ocrStage}
+                  pendingOcrReview={
+                    pendingOcrReview && pendingOcrReview.pageNumber === currentPage
+                      ? pendingOcrReview
+                      : null
+                  }
                   onReachPageEnd={handleReachPageEnd}
                   onBookMetadataUpdated={(updatedBook) => {
                     setActiveBook((curr) => (curr?.id === updatedBook.id ? updatedBook : curr));

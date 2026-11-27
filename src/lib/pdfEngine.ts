@@ -771,21 +771,60 @@ export async function detectChapters(pdf: PDFDocumentProxy): Promise<{
   return { chapters, detectedTitle, detectedAuthor };
 }
 
+export interface OcrProgressUpdate {
+  progress: number;
+  stage: string;
+}
+
 // On-demand client-side OCR via Tesseract.js for scanned PDFs or image label extraction
 export async function runClientOcrOnPage(
   pdf: PDFDocumentProxy,
   pageNumber: number,
-  onProgress?: (pct: number) => void
+  onProgress?: (update: OcrProgressUpdate) => void,
+  options?: { scale?: number }
 ): Promise<ParsedPage> {
-  const { dataUrl, width, height } = await renderPageToDataUrl(pdf, pageNumber, 2.0, 'image/png');
+  const scale = options?.scale ?? 2.0;
+  onProgress?.({
+    progress: 6,
+    stage: scale > 2.1 ? 'Rendering high-DPI page snapshot…' : 'Rendering page snapshot…',
+  });
+  const { dataUrl, width, height } = await renderPageToDataUrl(
+    pdf,
+    pageNumber,
+    scale,
+    'image/png'
+  );
+
+  onProgress?.({ progress: 15, stage: 'Loading OCR engine…' });
   const Tesseract = await import('tesseract.js');
   const result = await Tesseract.recognize(dataUrl, 'eng', {
     logger: (m) => {
-      if (m.status === 'recognizing text' && typeof m.progress === 'number') {
-        onProgress?.(Math.round(m.progress * 100));
+      const p = typeof m.progress === 'number' ? Math.max(0, Math.min(1, m.progress)) : 0;
+      if (m.status === 'loading tesseract core' || m.status === 'initializing tesseract') {
+        onProgress?.({
+          progress: Math.round(18 + p * 8),
+          stage: 'Initializing OCR core…',
+        });
+      } else if (m.status === 'loading language traineddata') {
+        onProgress?.({
+          progress: Math.round(26 + p * 10),
+          stage: 'Loading language model…',
+        });
+      } else if (m.status === 'initializing api') {
+        onProgress?.({
+          progress: 38,
+          stage: 'Preparing layout recognizer…',
+        });
+      } else if (m.status === 'recognizing text') {
+        onProgress?.({
+          progress: Math.round(40 + p * 57),
+          stage: 'Recognizing text from page layout…',
+        });
       }
     },
   });
+
+  onProgress?.({ progress: 99, stage: 'Structuring extracted text blocks…' });
 
   const rawText = result.data.text ?? '';
   const paragraphs = rawText
@@ -801,10 +840,12 @@ export async function runClientOcrOnPage(
     fontSize: idx === 0 ? 15 : 11,
   }));
 
+  onProgress?.({ progress: 100, stage: 'OCR extraction ready for review' });
+
   return {
     pageNumber,
-    width: width / 2,
-    height: height / 2,
+    width: width / scale,
+    height: height / scale,
     blocks,
     figures: [],
     isBlank: blocks.length === 0,
