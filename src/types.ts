@@ -48,6 +48,8 @@ export type OcrScriptMode =
 
 export type TranslationEngine = 'free' | 'ai';
 
+export type TranslationStyle = 'faithful' | 'tutor';
+
 export interface LanguageOption {
   code: LanguageCode;
   name: string;
@@ -139,6 +141,7 @@ export interface TranslatedPageRecord {
   pageNumber: number;
   lang: LanguageCode;
   engine: TranslationEngine;
+  translationStyle?: TranslationStyle;
   blocks: TranslatedBlock[];
   figures: ExtractedFigure[];
   imageExplanations: string[];

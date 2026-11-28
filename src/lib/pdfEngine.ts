@@ -1,4 +1,5 @@
 import * as pdfjsLib from 'pdfjs-dist';
+import { parseJsonResponseSafe } from './translatorClient';
 import type { PDFDocumentProxy, RenderTask } from 'pdfjs-dist/types/src/display/api';
 import type {
   ChapterItem,
@@ -970,30 +971,32 @@ export async function runClientOcrOnPage(
 
         if (res.ok) {
           onProgress?.({ progress: 92, stage: 'Structuring exact extracted text blocks…' });
-          const data = (await res.json()) as {
+          const parsedRes = await parseJsonResponseSafe<{
             detectedLang?: string;
             scriptDirection?: 'ltr' | 'rtl';
             blocks?: TextBlock[];
-          };
+          }>(res);
+          if (parsedRes.ok && parsedRes.data) {
+            const data = parsedRes.data;
+            const aiBlocks = Array.isArray(data.blocks)
+              ? data.blocks.filter((b) => b && typeof b.text === 'string' && b.text.trim().length > 0)
+              : [];
 
-          const aiBlocks = Array.isArray(data.blocks)
-            ? data.blocks.filter((b) => b && typeof b.text === 'string' && b.text.trim().length > 0)
-            : [];
-
-          onProgress?.({ progress: 100, stage: 'Multilingual OCR extraction ready for review' });
-          return {
-            pageNumber,
-            width: width / scale,
-            height: height / scale,
-            blocks: aiBlocks,
-            figures: [],
-            isBlank: aiBlocks.length === 0,
-            isOcr: true,
-            ocrEngine: 'ai-vision',
-            looksGarbled: false,
-            detectedLang: data.detectedLang || 'Auto',
-            scriptDirection: data.scriptDirection === 'rtl' ? 'rtl' : 'ltr',
-          };
+            onProgress?.({ progress: 100, stage: 'Multilingual OCR extraction ready for review' });
+            return {
+              pageNumber,
+              width: width / scale,
+              height: height / scale,
+              blocks: aiBlocks,
+              figures: [],
+              isBlank: aiBlocks.length === 0,
+              isOcr: true,
+              ocrEngine: 'ai-vision',
+              looksGarbled: false,
+              detectedLang: data.detectedLang || 'Auto',
+              scriptDirection: data.scriptDirection === 'rtl' ? 'rtl' : 'ltr',
+            };
+          }
         }
       } finally {
         window.clearTimeout(timeoutId);

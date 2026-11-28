@@ -249,6 +249,55 @@ function parseGtxResponse(data: unknown): string {
   return '';
 }
 
+async function safeParseJsonResponse(response: Response): Promise<unknown | null> {
+  try {
+    const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
+    const raw = await response.text();
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    // Guard against HTML gateway/CAPTCHA/error pages (<!doctype html>, <html>, etc.)
+    if (
+      contentType.includes('text/html') ||
+      trimmed.startsWith('<') ||
+      /^<!doctype/i.test(trimmed)
+    ) {
+      return null;
+    }
+    return JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+}
+
+function safeParseLlmJson<T>(rawText: string | undefined | null): T | null {
+  if (typeof rawText !== 'string') return null;
+  let cleaned = rawText.trim();
+  if (!cleaned) return null;
+  if (cleaned.startsWith('<') || /^<!doctype/i.test(cleaned)) return null;
+
+  // Strip optional markdown code fences (```json ... ```)
+  const fenceMatch = cleaned.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fenceMatch) {
+    cleaned = fenceMatch[1].trim();
+  }
+
+  try {
+    return JSON.parse(cleaned) as T;
+  } catch {
+    // Attempt extracting outermost JSON object if extra prose surrounded it
+    const firstBrace = cleaned.indexOf('{');
+    const lastBrace = cleaned.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace > firstBrace) {
+      try {
+        return JSON.parse(cleaned.slice(firstBrace, lastBrace + 1)) as T;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
 // Fast in-memory LRU cache for translated text blocks (instant <1ms repeat lookups)
 const TRANSLATION_CACHE_MAX = 4000;
 const TRANSLATION_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
@@ -367,7 +416,7 @@ async function translateBatchViaClients5(
     }
     if (!response.ok) return null;
 
-    const data: unknown = await response.json();
+    const data = await safeParseJsonResponse(response);
     if (!Array.isArray(data)) return null;
 
     // Single-input clients5 can return ["translated", "en"] or [["translated", "en"]]
@@ -454,7 +503,7 @@ async function translateFreeSingle(
       });
 
       if (response.ok) {
-        const data = await response.json();
+        const data = await safeParseJsonResponse(response);
         const joined = parseGtxResponse(data);
         if (joined.trim()) return joined;
       } else if (response.status === 429 || response.status === 503 || response.status >= 500) {
@@ -490,7 +539,7 @@ async function translateFreeSingle(
       });
 
       if (response.ok) {
-        const data = await response.json();
+        const data = await safeParseJsonResponse(response);
         const joined = parseGtxResponse(data);
         if (joined.trim()) return joined;
       }
@@ -513,11 +562,11 @@ async function translateFreeSingle(
         if (!response.ok) {
           throw new Error(`MyMemory HTTP ${response.status}`);
         }
-        const data = (await response.json()) as {
+        const data = (await safeParseJsonResponse(response)) as {
           responseStatus?: number;
           responseData?: { translatedText?: string };
-        };
-        if (data.responseStatus === 200 && data.responseData?.translatedText) {
+        } | null;
+        if (data?.responseStatus === 200 && data.responseData?.translatedText) {
           return data.responseData.translatedText;
         }
         throw new Error('MyMemory quota or status error');
@@ -682,7 +731,7 @@ async function translateBlocksFast(
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '15mb' }));
+  app.use(express.json({ limit: '25mb' }));
 
   // Serve PDF.js bundled standard fonts, CMaps, ICC profiles, and WASM image decoders
   // so PDF rendering never falls back to missing OS system fonts (e.g. Helvetica) or fails decoding JPX/JBIG2 images
@@ -792,11 +841,12 @@ CRITICAL FIDELITY RULES:
         },
       });
 
-      const parsed = JSON.parse((response.text ?? '{}').trim()) as {
-        detectedLang?: string;
-        scriptDirection?: string;
-        blocks?: Array<{ kind?: string; text?: string; yPercent?: number }>;
-      };
+      const parsed =
+        safeParseLlmJson<{
+          detectedLang?: string;
+          scriptDirection?: string;
+          blocks?: Array<{ kind?: string; text?: string; yPercent?: number }>;
+        }>(response.text) ?? {};
 
       const allowedKinds = new Set([
         'heading',
@@ -986,16 +1036,11 @@ CRITICAL FIDELITY RULES:
     }
   });
 
-  // Smart Multilingual Book & Diagram AI Translator (Gemini 4 Hydrogen — Server-Side)
+  // Smart Multilingual Book & Diagram AI Translator (Gemini 4 Hydrogen — Server-Side with Automatic Free Fallback)
   app.post('/api/translate-ai', async (req, res) => {
     try {
-      const ai = getGeminiClient();
-      if (!ai) {
-        return res.status(503).json({
-          error:
-            'Smart AI mode requires GEMINI_API_KEY in Settings > Secrets. Switch to Free Open Engine for zero-cost translation.',
-        });
-      }
+      const DEFAULT_TUTOR_PROMPT =
+        'Act as an expert translator and tutor. Translate and explain the content in simple, conversational Hindi, breaking down complex concepts with everyday examples familiar to an Indian audience.';
 
       const {
         blocks,
@@ -1005,6 +1050,8 @@ CRITICAL FIDELITY RULES:
         pageImageBase64,
         bookTitle = 'Book',
         pageNumber = 1,
+        translationStyle = 'tutor',
+        tutorPrompt,
       } = req.body ?? {};
 
       if (!Array.isArray(blocks) || blocks.length === 0 || blocks.length > 80) {
@@ -1013,6 +1060,17 @@ CRITICAL FIDELITY RULES:
       if (typeof targetLang !== 'string' || !ALLOWED_LANGS[targetLang]) {
         return res.status(400).json({ error: 'Unsupported target language.' });
       }
+
+      const effectiveStyle: 'faithful' | 'tutor' =
+        translationStyle === 'faithful' ? 'faithful' : 'tutor';
+      const cleanedTutorPrompt =
+        typeof tutorPrompt === 'string' && tutorPrompt.trim().length > 0
+          ? tutorPrompt.trim().slice(0, 800)
+          : DEFAULT_TUTOR_PROMPT;
+
+      const safeCustomTerms = Array.isArray(customTerms)
+        ? customTerms.filter((t): t is string => typeof t === 'string').slice(0, 60)
+        : [];
 
       const safeBlocks = blocks
         .filter(
@@ -1034,16 +1092,59 @@ CRITICAL FIDELITY RULES:
           translations,
           imageExplanations: [],
           engine: 'gemini-4-hydrogen',
+          translationStyle: effectiveStyle,
         });
+      }
+
+      const runFreeFallback = async (reason?: string) => {
+        const { translations } = await translateBlocksFast(
+          safeBlocks,
+          targetLang,
+          Boolean(preserveTerms),
+          safeCustomTerms,
+          4,
+          false
+        );
+        return res.json({
+          translations,
+          imageExplanations: [],
+          engine: 'free-open',
+          fallbackUsed: true,
+          fallbackReason: reason,
+        });
+      };
+
+      const ai = getGeminiClient();
+      if (!ai) {
+        return await runFreeFallback('AI key unavailable; used Free Open Engine automatically.');
       }
 
       const langName = ALLOWED_LANGS[targetLang].name;
       const extraTermsNote =
-        Array.isArray(customTerms) && customTerms.length > 0
-          ? `Additional terms to keep untranslated when present: ${customTerms.slice(0, 40).join(', ')}.`
+        safeCustomTerms.length > 0
+          ? `Additional terms to keep untranslated when present: ${safeCustomTerms.slice(0, 40).join(', ')}.`
           : '';
 
-      const systemInstruction = `You are a faithful multilingual book translator and audiobook narrator translating "${String(bookTitle).slice(0, 120)}" (Page ${Number(pageNumber) || 1}).
+      const languageGuidance =
+        targetLang === 'hi'
+          ? 'simple, warm, conversational Hindi (Devanagari script, everyday spoken style that any Indian reader understands easily — avoid overly stiff or archaic phrasing)'
+          : targetLang === 'hinglish'
+            ? 'simple, warm, conversational Hindi written clearly in Latin/English script (natural Indian Hinglish)'
+            : `simple, warm, conversational ${langName}`;
+
+      const systemInstruction =
+        effectiveStyle === 'tutor'
+          ? `${cleanedTutorPrompt}
+
+You are translating and tutoring the reader through "${String(bookTitle).slice(0, 120)}" (Page ${Number(pageNumber) || 1}).
+Follow these clear guidelines:
+1. CONVERSATIONAL TRANSLATION + TUTOR EXPLANATION: Deliver every block in ${languageGuidance}. First convey the author's exact idea clearly and accurately, and whenever a paragraph, callout, or bullet introduces a complex, technical, abstract, or dense concept, break it down naturally in 1-2 short, friendly sentences using relatable everyday Indian examples (such as chai, cricket, UPI, Indian Railways, local bazaar/kirana, traffic, or household analogies) so the reader grasps it effortlessly.
+2. STAY GROUNDED IN THE BOOK: Keep all explanations directly tied to what the book actually teaches on this page — never drift off-topic or contradict the author. Keep short headings, subheadings, titles, page labels, and simple factual lines crisp and concise without adding unnecessary analogies.
+3. ANY SOURCE LANGUAGE SUPPORTED: The book may be in English, Sanskrit, Hindi, Marathi, Urdu, Arabic, Bengali, Tamil, Telugu, Gujarati, Punjabi, or any other language. If a page screenshot is attached AND any extracted text block looks garbled/incomplete/legacy-encoded, read the ACTUAL printed words directly from the screenshot first before translating and explaining.
+4. Technical & Proper Term Preservation: ${preserveTerms ? 'Keep proper nouns and key technical/software terms accurate (you may briefly explain technical terms in parentheses in simple words).' : 'Translate naturally into everyday language while keeping proper names accurate.'} ${extraTermsNote}
+5. Audiobook-Ready Smooth Flow: Write smooth, natural spoken sentences without broken mid-sentence line breaks or markdown symbols (no **bold** or # headings) so Text-to-Speech sounds like a friendly Indian teacher reading aloud.
+6. Image & Diagram Context: If a page screenshot is provided and contains genuine diagrams, charts, or UI callouts, add 1-3 short, friendly tutor notes in ${languageGuidance} inside imageExplanations explaining what the visual shows in simple terms. If the page is text-only, return an empty imageExplanations array.`
+          : `You are a faithful multilingual book translator and audiobook narrator translating "${String(bookTitle).slice(0, 120)}" (Page ${Number(pageNumber) || 1}).
 Follow these strict fidelity rules:
 1. STRICT SOURCE FIDELITY: Translate ONLY what is actually written in the book — sentence-for-sentence and meaning-for-meaning — into clear, natural ${langName}${targetLang === 'hinglish' ? ' (conversational Hindi written clearly in Latin/English script)' : ''}. NEVER invent extra ideas, substitute unrelated topics, or alter the author's meaning.
 2. ANY SOURCE LANGUAGE SUPPORTED: The book may be in Sanskrit, Hindi, Marathi, Urdu, Arabic, Bengali, Tamil, Telugu, Gujarati, Punjabi, English, or mixed scripts. If a page screenshot is attached AND any extracted text block looks garbled/incomplete/legacy-encoded, read the ACTUAL printed words directly from the page screenshot first and translate that exact book text faithfully. If the source block is already in ${langName}, keep it faithful and cleanly formatted in ${langName}.
@@ -1052,80 +1153,155 @@ Follow these strict fidelity rules:
 5. Audiobook-Ready Formatting: Write smooth, natural flowing sentences in ${langName} without broken mid-sentence line breaks so Text-to-Speech sounds clear and faithful to the book.
 6. Image & Diagram Context: If a page screenshot is provided and contains genuine diagrams, charts, or UI callouts, add 1-3 concise bracketed notes in ${langName} inside imageExplanations describing only the visible labels in the diagram. If the page is text-only (no diagrams/charts), return an empty imageExplanations array.`;
 
-      const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [];
+      const textPromptPart = {
+        text:
+          effectiveStyle === 'tutor'
+            ? `Translate and explain each JSON block below in ${languageGuidance} as an expert translator and friendly Indian tutor (breaking down complex concepts with everyday Indian examples while keeping headings concise), returning the exact same "id" for every block:\n${JSON.stringify(safeBlocks)}`
+            : `Translate each JSON block below faithfully into ${langName}, returning the exact same "id" for every block:\n${JSON.stringify(safeBlocks)}`,
+      };
 
-      if (typeof pageImageBase64 === 'string' && pageImageBase64.length > 100 && pageImageBase64.length < 8_000_000) {
-        const match = pageImageBase64.match(/^data:(image\/(?:png|jpeg|webp));base64,(.+)$/);
-        if (match) {
+      const imageMatch =
+        typeof pageImageBase64 === 'string' &&
+        pageImageBase64.length > 100 &&
+        pageImageBase64.length < 8_000_000
+          ? pageImageBase64.match(/^data:(image\/(?:png|jpeg|webp));base64,(.+)$/)
+          : null;
+
+      const callGemini = async (includeImage: boolean) => {
+        const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [];
+        if (includeImage && imageMatch) {
           parts.push({
             inlineData: {
-              mimeType: match[1],
-              data: match[2],
+              mimeType: imageMatch[1],
+              data: imageMatch[2],
             },
           });
         }
-      }
+        parts.push(textPromptPart);
 
-      parts.push({
-        text: `Translate each JSON block below faithfully into ${langName}, returning the exact same "id" for every block:\n${JSON.stringify(safeBlocks)}`,
-      });
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: { parts },
-        config: {
-          systemInstruction,
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              items: {
-                type: Type.ARRAY,
+        return await ai.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents: { parts },
+          config: {
+            systemInstruction,
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
                 items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    id: { type: Type.STRING },
-                    translatedText: { type: Type.STRING },
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      id: { type: Type.STRING },
+                      translatedText: { type: Type.STRING },
+                    },
+                    required: ['id', 'translatedText'],
                   },
-                  required: ['id', 'translatedText'],
+                },
+                imageExplanations: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                  description: 'Brief explanations of screenshots/diagrams/callouts visible on the page in the target language.',
                 },
               },
-              imageExplanations: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-                description: 'Brief explanations of screenshots/diagrams/callouts visible on the page in the target language.',
-              },
+              required: ['items', 'imageExplanations'],
             },
-            required: ['items', 'imageExplanations'],
           },
-        },
-      });
-
-      const parsed = JSON.parse((response.text ?? '{}').trim()) as {
-        items?: Array<{ id: string; translatedText: string }>;
-        imageExplanations?: string[];
+        });
       };
 
+      let parsed: {
+        items?: Array<{ id: string; translatedText: string }>;
+        imageExplanations?: string[];
+      } | null = null;
+
+      try {
+        const response = await callGemini(Boolean(imageMatch));
+        parsed = safeParseLlmJson(response.text);
+        // If multimodal request returned unparseable output, retry text-only automatically
+        if ((!parsed || !Array.isArray(parsed.items) || parsed.items.length === 0) && imageMatch) {
+          const textOnlyRes = await callGemini(false);
+          parsed = safeParseLlmJson(textOnlyRes.text);
+        }
+      } catch (aiErr) {
+        // If multimodal request failed, automatically retry text-only once
+        if (imageMatch) {
+          try {
+            const textOnlyRes = await callGemini(false);
+            parsed = safeParseLlmJson(textOnlyRes.text);
+          } catch {
+            parsed = null;
+          }
+        }
+        if (!parsed) {
+          // Seamless server-side self-healing fallback to Free Open Engine
+          try {
+            return await runFreeFallback(
+              aiErr instanceof Error ? aiErr.message.slice(0, 140) : 'Smart AI temporarily busy.'
+            );
+          } catch {
+            // Fall through to clean 502 error below
+          }
+        }
+      }
+
       const translations: Record<string, string> = {};
-      if (Array.isArray(parsed.items)) {
+      if (parsed && Array.isArray(parsed.items)) {
         for (const item of parsed.items) {
           if (item && typeof item.id === 'string' && typeof item.translatedText === 'string') {
-            translations[item.id] = item.translatedText.trim();
+            const trimmedVal = item.translatedText.trim();
+            if (trimmedVal) {
+              translations[item.id] = trimmedVal;
+            }
           }
+        }
+      }
+
+      // If Gemini returned empty/broken JSON, automatically recover via Free Open Engine
+      if (Object.keys(translations).length === 0) {
+        return await runFreeFallback('Smart AI returned an empty response; recovered automatically.');
+      }
+
+      // Fill any individual blocks Gemini omitted using Free Open Engine so no block is left untranslated
+      const missingBlocks = safeBlocks.filter((b) => b.text.trim() && !translations[b.id]);
+      if (missingBlocks.length > 0) {
+        try {
+          const { translations: filled } = await translateBlocksFast(
+            missingBlocks,
+            targetLang,
+            Boolean(preserveTerms),
+            safeCustomTerms,
+            4,
+            true
+          );
+          for (const [id, val] of Object.entries(filled)) {
+            if (val && val.trim()) {
+              translations[id] = val.trim();
+            }
+          }
+        } catch {
+          // keep Gemini blocks
         }
       }
 
       return res.json({
         translations,
-        imageExplanations: Array.isArray(parsed.imageExplanations)
-          ? parsed.imageExplanations.filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
-          : [],
+        imageExplanations:
+          parsed && Array.isArray(parsed.imageExplanations)
+            ? parsed.imageExplanations.filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
+            : [],
         engine: 'gemini-4-hydrogen',
+        translationStyle: effectiveStyle,
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Smart AI translation failed.';
-      return res.status(502).json({ error: message });
+      const rawMsg = err instanceof Error ? err.message : 'Translation service temporarily busy.';
+      const cleanMsg =
+        /unexpected token|<!doctype|<html/i.test(rawMsg)
+          ? 'Translation service is temporarily busy. Retrying automatically.'
+          : rawMsg;
+      return res.status(502).json({ error: cleanMsg });
     }
   });
 
@@ -2905,7 +3081,13 @@ Follow these strict fidelity rules:
   // POST /api/summarize-chapter — One-Click Chapter Summarizer & Key Takeaways (100% Free + Optional AI Upgrade)
   app.post('/api/summarize-chapter', async (req, res) => {
     try {
-      const { chapterTitle, text, targetLang = 'en' } = req.body ?? {};
+      const {
+        chapterTitle,
+        text,
+        targetLang = 'en',
+        translationStyle = 'tutor',
+        tutorPrompt,
+      } = req.body ?? {};
       if (typeof text !== 'string' || text.trim().length < 40) {
         return res.status(400).json({ error: 'Chapter needs at least a few sentences to summarize.' });
       }
@@ -2921,13 +3103,31 @@ Follow these strict fidelity rules:
       const summaryLangInstruction =
         targetLang === 'orig'
           ? 'the exact same language and script as the chapter text'
-          : langMeta.name;
+          : targetLang === 'hi'
+            ? 'simple, conversational Hindi (Devanagari script)'
+            : targetLang === 'hinglish'
+              ? 'simple, conversational Hindi in Latin script (Hinglish)'
+              : langMeta.name;
+      const isTutorSummary = translationStyle !== 'faithful';
+      const effectiveSummaryTutorPrompt =
+        typeof tutorPrompt === 'string' && tutorPrompt.trim().length > 0
+          ? tutorPrompt.trim().slice(0, 800)
+          : 'Act as an expert translator and tutor. Translate and explain the content in simple, conversational Hindi, breaking down complex concepts with everyday examples familiar to an Indian audience.';
 
       // 1. Optional Gemini AI structured summary when API key is configured
       const ai = getGeminiClient();
       if (ai) {
         try {
-          const prompt = `Summarize the following book chapter titled "${safeTitle}" for a student/reader in ${summaryLangInstruction}.
+          const prompt = isTutorSummary
+            ? `Summarize and explain the following book chapter titled "${safeTitle}" in ${summaryLangInstruction}, breaking down any complex concepts with simple everyday examples familiar to an Indian audience.
+Return strict JSON with:
+- "summary": warm, easy-to-understand 2-3 sentence conversational overview in ${summaryLangInstruction}
+- "keyTakeaways": 4 to 6 crisp, conversational bullet-point takeaways in ${summaryLangInstruction} (include brief relatable Indian examples where helpful for tough ideas)
+- "keyTerms": 4 to 6 important concepts/terms mentioned in the chapter.
+
+Chapter text:
+${clipped.slice(0, 14000)}`
+            : `Summarize the following book chapter titled "${safeTitle}" for a student/reader in ${summaryLangInstruction}.
 Return strict JSON with:
 - "summary": concise 2-3 sentence overview in ${summaryLangInstruction}
 - "keyTakeaways": 4 to 6 crisp, actionable bullet-point takeaways in ${summaryLangInstruction}
@@ -2940,6 +3140,7 @@ ${clipped.slice(0, 14000)}`;
             model: 'gemini-4-hydrogen',
             contents: prompt,
             config: {
+              ...(isTutorSummary ? { systemInstruction: effectiveSummaryTutorPrompt } : {}),
               thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
               responseMimeType: 'application/json',
               responseSchema: {
@@ -2954,11 +3155,12 @@ ${clipped.slice(0, 14000)}`;
             },
           });
 
-          const parsed = JSON.parse(response.text || '{}') as {
-            summary?: string;
-            keyTakeaways?: string[];
-            keyTerms?: string[];
-          };
+          const parsed =
+            safeParseLlmJson<{
+              summary?: string;
+              keyTakeaways?: string[];
+              keyTerms?: string[];
+            }>(response.text) ?? {};
           if (parsed.summary && Array.isArray(parsed.keyTakeaways) && parsed.keyTakeaways.length > 0) {
             return res.json({
               chapterTitle: safeTitle,
@@ -3199,6 +3401,11 @@ export class ErrorOverlay extends BaseElement {}
 `);
     });
 
+    // Never allow /api/* routes to fall through to Vite SPA HTML (<!doctype html>)
+    app.all('/api/*', (_req, res) => {
+      return res.status(404).json({ error: 'API endpoint not found.' });
+    });
+
     app.use(vite.middlewares);
   } else {
     const distDir = path.resolve(__dirname, 'dist');
@@ -3207,10 +3414,38 @@ export class ErrorOverlay extends BaseElement {}
       app.use(express.static(publicDir));
     }
     app.use(express.static(distDir));
+    // Never allow /api/* routes to fall through to static SPA index.html
+    app.all('/api/*', (_req, res) => {
+      return res.status(404).json({ error: 'API endpoint not found.' });
+    });
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }
+
+  // Global JSON error handler: guarantees /api/* errors (e.g., PayloadTooLargeError, SyntaxError) NEVER return HTML
+  app.use((err: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (res.headersSent) {
+      return next(err);
+    }
+    if (req.path.startsWith('/api/')) {
+      const errObj = err as { status?: number; statusCode?: number; type?: string; message?: string };
+      const status =
+        typeof errObj?.status === 'number'
+          ? errObj.status
+          : typeof errObj?.statusCode === 'number'
+            ? errObj.statusCode
+            : 500;
+      const message =
+        errObj?.type === 'entity.too.large'
+          ? 'Page payload was too large. Retrying in lightweight mode.'
+          : errObj?.message && !/<!doctype|<html/i.test(errObj.message)
+            ? errObj.message
+            : 'Temporary server error. Please retry.';
+      return res.status(status >= 400 && status < 600 ? status : 500).json({ error: message });
+    }
+    return next(err);
+  });
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`BhashaBook server listening on http://0.0.0.0:${PORT}`);

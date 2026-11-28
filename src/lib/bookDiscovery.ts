@@ -1,4 +1,5 @@
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
+import { parseJsonResponseSafe, sanitizeUserFacingError } from './translatorClient';
 import type {
   BookCategory,
   BookFormatFilter,
@@ -52,20 +53,34 @@ export async function searchGlobalBooks(params: SearchBooksParams): Promise<Sear
     return cached.data;
   }
 
-  const res = await fetch(`/api/books/search?${cacheKey}`, {
-    signal: params.signal,
-  });
-  if (!res.ok) {
-    let msg = `Search failed (${res.status})`;
-    try {
-      const body = (await res.json()) as { error?: string };
-      if (body.error) msg = body.error;
-    } catch {
-      // ignore
+  let data: SearchBooksResponse | null = null;
+  let lastErr: Error | null = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) {
+      await new Promise((r) => window.setTimeout(r, 650));
     }
-    throw new Error(msg);
+    const res = await fetch(`/api/books/search?${cacheKey}`, {
+      headers: { Accept: 'application/json' },
+      signal: params.signal,
+    });
+    const parsed = await parseJsonResponseSafe<SearchBooksResponse & { error?: string }>(res);
+    if (res.ok && parsed.ok && parsed.data) {
+      data = parsed.data;
+      break;
+    }
+    const msg = parsed.data?.error
+      ? sanitizeUserFacingError(parsed.data.error)
+      : parsed.isHtml
+        ? 'Server was briefly reconnecting. Please try again.'
+        : `Search failed (${res.status})`;
+    lastErr = new Error(msg);
+    if (!parsed.isHtml && res.status >= 400 && res.status < 500) {
+      throw lastErr;
+    }
   }
-  const data = (await res.json()) as SearchBooksResponse;
+  if (!data) {
+    throw lastErr ?? new Error('Search failed. Please try again.');
+  }
   if (data.books && data.books.length > 0) {
     if (clientSearchCache.size >= 80) {
       const oldest = clientSearchCache.keys().next().value;
@@ -89,11 +104,14 @@ export interface ResolvedArchiveBook {
 }
 
 export async function resolveArchiveMetadata(identifier: string): Promise<ResolvedArchiveBook> {
-  const res = await fetch(`/api/books/resolve?identifier=${encodeURIComponent(identifier)}`);
-  if (!res.ok) {
+  const res = await fetch(`/api/books/resolve?identifier=${encodeURIComponent(identifier)}`, {
+    headers: { Accept: 'application/json' },
+  });
+  const parsed = await parseJsonResponseSafe<ResolvedArchiveBook>(res);
+  if (!res.ok || !parsed.ok || !parsed.data) {
     throw new Error('Could not resolve book download links.');
   }
-  return (await res.json()) as ResolvedArchiveBook;
+  return parsed.data;
 }
 
 // Sanitize text for WinAnsi StandardFonts inside pdf-lib so Gutenberg Unicode quotes/dashes never crash PDF building
@@ -359,12 +377,8 @@ export async function fetchExternalBookAsPdfBuffer(
         ? `Could not download PDF (${res.status}).`
         : 'PDF download timed out on this source. Try another edition or format.';
       if (res) {
-        try {
-          const body = (await res.json()) as { error?: string };
-          if (body.error) msg = body.error;
-        } catch {
-          // ignore
-        }
+        const parsedErr = await parseJsonResponseSafe<{ error?: string }>(res);
+        if (parsedErr.data?.error) msg = sanitizeUserFacingError(parsedErr.data.error);
       }
       throw new Error(msg);
     }
@@ -378,26 +392,23 @@ export async function fetchExternalBookAsPdfBuffer(
     let res: Response;
     try {
       res = await fetch(`/api/books/fetch-text?url=${encodeURIComponent(textUrl)}`, {
+        headers: { Accept: 'application/json' },
         signal: txtController.signal,
       });
     } finally {
       window.clearTimeout(txtTimer);
     }
-    if (!res.ok) {
-      let msg = `Could not download book text (${res.status}).`;
-      try {
-        const body = (await res.json()) as { error?: string };
-        if (body.error) msg = body.error;
-      } catch {
-        // ignore
-      }
+    const parsedText = await parseJsonResponseSafe<{ text?: string; error?: string }>(res);
+    if (!res.ok || !parsedText.ok || !parsedText.data) {
+      const msg = parsedText.data?.error
+        ? sanitizeUserFacingError(parsedText.data.error)
+        : `Could not download book text (${res.status}).`;
       throw new Error(msg);
     }
-    const data = (await res.json()) as { text?: string };
-    if (!data.text || data.text.trim().length < 40) {
+    if (!parsedText.data.text || parsedText.data.text.trim().length < 40) {
       throw new Error('Downloaded book text was empty.');
     }
-    const buffer = await buildPdfFromPlainText(book, data.text, onStatus);
+    const buffer = await buildPdfFromPlainText(book, parsedText.data.text, onStatus);
     return { buffer, fileName };
   }
 
@@ -410,30 +421,46 @@ export async function summarizeChapterApi(params: {
   chapterTitle: string;
   text: string;
   targetLang: LanguageCode;
+  translationStyle?: 'faithful' | 'tutor';
+  tutorPrompt?: string;
   signal?: AbortSignal;
 }): Promise<ChapterSummaryResult> {
-  const res = await fetch('/api/summarize-chapter', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chapterTitle: params.chapterTitle,
-      text: params.text,
-      targetLang: params.targetLang,
-    }),
-    signal: params.signal,
-  });
-
-  if (!res.ok) {
-    let msg = `Summary failed (${res.status})`;
-    try {
-      const body = (await res.json()) as { error?: string };
-      if (body.error) msg = body.error;
-    } catch {
-      // ignore
+  let lastErr: Error | null = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) {
+      await new Promise((r) => window.setTimeout(r, 700));
     }
-    throw new Error(msg);
+    const res = await fetch('/api/summarize-chapter', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        chapterTitle: params.chapterTitle,
+        text: params.text,
+        targetLang: params.targetLang,
+        translationStyle: params.translationStyle,
+        tutorPrompt: params.tutorPrompt,
+      }),
+      signal: params.signal,
+    });
+
+    const parsed = await parseJsonResponseSafe<ChapterSummaryResult & { error?: string }>(res);
+    if (res.ok && parsed.ok && parsed.data) {
+      return parsed.data;
+    }
+    const msg = parsed.data?.error
+      ? sanitizeUserFacingError(parsed.data.error)
+      : parsed.isHtml
+        ? 'Server was briefly reconnecting. Please try again.'
+        : `Summary failed (${res.status})`;
+    lastErr = new Error(msg);
+    if (!parsed.isHtml && res.status >= 400 && res.status < 500) {
+      throw lastErr;
+    }
   }
-  return (await res.json()) as ChapterSummaryResult;
+  throw lastErr ?? new Error('Chapter summary could not complete. Please try again.');
 }
 
 /**

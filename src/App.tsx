@@ -5,6 +5,7 @@ import {
   CheckCircle2,
   Download,
   FileText,
+  GraduationCap,
   Languages,
   Loader2,
   Moon,
@@ -101,7 +102,9 @@ import {
 } from './lib/readingSpeed';
 import {
   checkServerCapabilities,
+  DEFAULT_TUTOR_PROMPT,
   downloadBlob,
+  sanitizeUserFacingError,
   splitBlocksIntoSentences,
   translatePageBlocks,
   translatePagesBatchFast,
@@ -122,6 +125,7 @@ import type {
   TextHighlightColor,
   TranslatedPageRecord,
   TranslationEngine,
+  TranslationStyle,
 } from './types';
 
 type MobilePane = 'pdf' | 'translated' | 'chapters';
@@ -177,7 +181,29 @@ export default function App() {
   // Reader State
   const [currentPage, setCurrentPage] = useState(1);
   const [targetLang, setTargetLang] = useState<LanguageCode>('hi');
-  const [engine, setEngine] = useState<TranslationEngine>('free');
+  const [engine, setEngineState] = useState<TranslationEngine>(() => {
+    if (typeof window === 'undefined') return 'free';
+    const saved = localStorage.getItem('bhashabook-engine');
+    return saved === 'ai' || saved === 'free' ? saved : 'free';
+  });
+  const setEngine = useCallback((next: TranslationEngine) => {
+    setEngineState(next);
+    try {
+      localStorage.setItem('bhashabook-engine', next);
+    } catch {
+      // ignore storage errors
+    }
+  }, []);
+  const [translationStyle, setTranslationStyle] = useState<TranslationStyle>(() => {
+    if (typeof window === 'undefined') return 'tutor';
+    const saved = localStorage.getItem('bhashabook-translation-style');
+    return saved === 'faithful' ? 'faithful' : 'tutor';
+  });
+  const [tutorPrompt, setTutorPrompt] = useState<string>(() => {
+    if (typeof window === 'undefined') return DEFAULT_TUTOR_PROMPT;
+    const saved = localStorage.getItem('bhashabook-tutor-prompt');
+    return saved && saved.trim().length > 0 ? saved : DEFAULT_TUTOR_PROMPT;
+  });
   const [preserveTerms, setPreserveTerms] = useState(false);
   const [autoPreloadNext, setAutoPreloadNext] = useState<boolean>(() => {
     if (typeof window === 'undefined') return true;
@@ -191,6 +217,22 @@ export default function App() {
     return saved === 'narrator' || saved === 'energetic' ? saved : 'teacher';
   });
   const [showGlossaryPopover, setShowGlossaryPopover] = useState(false);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('bhashabook-translation-style', translationStyle);
+    } catch {
+      // ignore storage errors
+    }
+  }, [translationStyle]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('bhashabook-tutor-prompt', tutorPrompt);
+    } catch {
+      // ignore storage errors
+    }
+  }, [tutorPrompt]);
 
   useEffect(() => {
     try {
@@ -717,7 +759,12 @@ export default function App() {
       try {
         checkServerCapabilities()
           .then((caps) => {
-            if (!cancelled) setAiAvailable(caps.aiAvailable);
+            if (!cancelled) {
+              setAiAvailable(caps.aiAvailable);
+              if (caps.aiAvailable && typeof window !== 'undefined' && !localStorage.getItem('bhashabook-engine')) {
+                setEngineState('ai');
+              }
+            }
             if (!cancelled && !caps.aiAvailable) {
               window.setTimeout(() => {
                 if (cancelled) return;
@@ -725,6 +772,9 @@ export default function App() {
                   .then((retryCaps) => {
                     if (!cancelled && retryCaps.aiAvailable) {
                       setAiAvailable(true);
+                      if (typeof window !== 'undefined' && !localStorage.getItem('bhashabook-engine')) {
+                        setEngineState('ai');
+                      }
                     }
                   })
                   .catch(() => {});
@@ -1506,6 +1556,8 @@ export default function App() {
           chapterTitle: chapter.title,
           text: combined,
           targetLang,
+          translationStyle,
+          tutorPrompt,
         });
         setChapterSummaryModal(summary);
       } catch (err) {
@@ -1516,7 +1568,7 @@ export default function App() {
         setSummarizingChapterId(null);
       }
     },
-    [activeBook, loadedPdf, summarizingChapterId, targetLang]
+    [activeBook, loadedPdf, summarizingChapterId, targetLang, translationStyle, tutorPrompt]
   );
 
   // Export all Highlights, Sticky Notes & Bookmarks as a study summary sheet
@@ -1639,6 +1691,8 @@ export default function App() {
           parsedPage: parsed,
           targetLang: lang,
           engine,
+          translationStyle,
+          tutorPrompt,
           preserveTerms,
           customTerms,
           pageImageBase64,
@@ -1677,7 +1731,7 @@ export default function App() {
         });
       }
     },
-    [engine, preserveTerms, customTerms, ensureCleanParsedPage]
+    [engine, translationStyle, tutorPrompt, preserveTerms, customTerms, ensureCleanParsedPage]
   );
 
   // Merge a newly saved translation into local state if it belongs to the active book & language
@@ -1744,7 +1798,9 @@ export default function App() {
           return;
         }
         logDevError('app', err, `Translate page ${currentPage} (${targetLang})`);
-        setTranslationError(err instanceof Error ? err.message : 'Translation failed.');
+        setTranslationError(
+          sanitizeUserFacingError(err, 'Translation could not complete. Retrying automatically…')
+        );
       } finally {
         if (pageTranslateAbortRef.current === controller) {
           pageTranslateAbortRef.current = null;
@@ -1761,6 +1817,39 @@ export default function App() {
       commitSavedTranslationToState,
     ]
   );
+
+  // Automatic self-healing recovery: if a page translation ever hit a transient network/proxy hiccup,
+  // automatically retry once after a short cooldown (and immediately when connectivity returns)
+  const autoRetryKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!translationError || !isOnline || isTranslatingPage || !activeBook || !loadedPdf) {
+      return;
+    }
+    const retryKey = `${activeBook.id}::${targetLang}::${currentPage}`;
+    if (autoRetryKeyRef.current === retryKey) {
+      return;
+    }
+    autoRetryKeyRef.current = retryKey;
+    const timer = window.setTimeout(() => {
+      void handleTranslateCurrentPage(false);
+    }, 1800);
+    return () => window.clearTimeout(timer);
+  }, [
+    translationError,
+    isOnline,
+    isTranslatingPage,
+    activeBook,
+    loadedPdf,
+    targetLang,
+    currentPage,
+    handleTranslateCurrentPage,
+  ]);
+
+  useEffect(() => {
+    if (!translationError) {
+      autoRetryKeyRef.current = null;
+    }
+  }, [translationError, currentPage, targetLang, activeBook?.id]);
 
   // Background Auto-Translate & Auto-Save for the next page when the user reaches the end of the current page
   const prefetchNextPage = useCallback(
@@ -3164,7 +3253,7 @@ export default function App() {
                 </select>
               </div>
 
-              {/* Engine Selector (Free Open Default + Optional Smart AI) */}
+              {/* Engine & Style Selector (Free Open + AI Tutor + AI Faithful) */}
               <div className="inline-flex rounded border border-stone-300 dark:border-stone-700 bg-white sepia:bg-[#FBF6E9] dark:bg-[#1F1E1B] p-0.5 shrink-0">
                 <button
                   type="button"
@@ -3179,20 +3268,43 @@ export default function App() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setEngine('ai')}
+                  onClick={() => {
+                    setEngine('ai');
+                    setTranslationStyle('tutor');
+                  }}
                   title={
                     aiAvailable
-                      ? 'Uses Gemini AI to explain diagrams/screenshots and refine audiobook flow'
+                      ? 'Expert Translator & Tutor: explains complex concepts in simple conversational Hindi with everyday Indian examples'
                       : 'Requires GEMINI_API_KEY in Settings > Secrets'
                   }
                   className={`inline-flex items-center gap-1 h-7 px-2 sm:px-2.5 rounded-sm text-[11px] sm:text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
-                    engine === 'ai'
+                    engine === 'ai' && translationStyle === 'tutor'
+                      ? 'bg-amber-700 text-white'
+                      : 'text-stone-600 dark:text-stone-300 hover:text-stone-900 dark:hover:text-stone-100'
+                  }`}
+                >
+                  <GraduationCap className="w-3 h-3" />
+                  <span>AI Tutor</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEngine('ai');
+                    setTranslationStyle('faithful');
+                  }}
+                  title={
+                    aiAvailable
+                      ? 'Smart AI Faithful: strict sentence-for-sentence translation with diagram notes'
+                      : 'Requires GEMINI_API_KEY in Settings > Secrets'
+                  }
+                  className={`inline-flex items-center gap-1 h-7 px-2 sm:px-2.5 rounded-sm text-[11px] sm:text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                    engine === 'ai' && translationStyle === 'faithful'
                       ? 'bg-amber-700 text-white'
                       : 'text-stone-600 dark:text-stone-300 hover:text-stone-900 dark:hover:text-stone-100'
                   }`}
                 >
                   <Sparkles className="w-3 h-3" />
-                  <span>Smart AI</span>
+                  <span className="hidden sm:inline">AI Literal</span>
                 </button>
               </div>
 
@@ -3347,6 +3459,89 @@ export default function App() {
                       <p className="text-[11px] leading-snug text-stone-500 dark:text-stone-400">
                         {getVoiceStylePreferenceOption(voiceStylePreference).description}
                       </p>
+                    </div>
+
+                    {/* AI Translator & Tutor Persona Settings */}
+                    <div className="pt-2 border-t border-stone-200 dark:border-stone-800 space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[11px] font-medium text-stone-500 dark:text-stone-400">
+                          AI Translation Style
+                        </span>
+                        <span className="text-[10px] text-amber-700 dark:text-amber-400 font-medium">
+                          {translationStyle === 'tutor' ? 'Tutor + Examples' : 'Strict Literal'}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-2 gap-1.5 text-xs font-medium">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEngine('ai');
+                            setTranslationStyle('tutor');
+                          }}
+                          className={`h-8 rounded border transition-colors cursor-pointer ${
+                            translationStyle === 'tutor'
+                              ? 'border-amber-700 bg-amber-700 text-white'
+                              : 'border-stone-300 dark:border-stone-700 text-stone-700 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800'
+                          }`}
+                        >
+                          Expert Tutor
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEngine('ai');
+                            setTranslationStyle('faithful');
+                          }}
+                          className={`h-8 rounded border transition-colors cursor-pointer ${
+                            translationStyle === 'faithful'
+                              ? 'border-amber-700 bg-amber-700 text-white'
+                              : 'border-stone-300 dark:border-stone-700 text-stone-700 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800'
+                          }`}
+                        >
+                          Faithful Literal
+                        </button>
+                      </div>
+                      {translationStyle === 'tutor' && (
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between">
+                            <label
+                              htmlFor="tutor-prompt-input"
+                              className="text-[11px] text-stone-500 dark:text-stone-400"
+                            >
+                              Tutor Instruction
+                            </label>
+                            {tutorPrompt.trim() !== DEFAULT_TUTOR_PROMPT && (
+                              <button
+                                type="button"
+                                onClick={() => setTutorPrompt(DEFAULT_TUTOR_PROMPT)}
+                                className="text-[10px] text-amber-700 dark:text-amber-400 hover:underline cursor-pointer"
+                              >
+                                Reset default
+                              </button>
+                            )}
+                          </div>
+                          <textarea
+                            id="tutor-prompt-input"
+                            rows={3}
+                            value={tutorPrompt}
+                            onChange={(e) => setTutorPrompt(e.target.value)}
+                            className="w-full p-2 text-[11px] leading-relaxed rounded border border-stone-300 dark:border-stone-700 bg-[#FAF9F5] dark:bg-[#141312] text-stone-900 dark:text-stone-100 focus:outline-none focus:border-amber-700"
+                          />
+                        </div>
+                      )}
+                      {activeBook && loadedPdf && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowGlossaryPopover(false);
+                            void handleTranslateCurrentPage(true);
+                          }}
+                          disabled={isTranslatingPage}
+                          className="w-full h-8 rounded bg-stone-900 dark:bg-stone-100 text-stone-50 dark:text-stone-950 text-xs font-medium hover:bg-stone-800 dark:hover:bg-stone-200 disabled:opacity-50 transition-colors cursor-pointer"
+                        >
+                          Apply &amp; Re-translate Page
+                        </button>
+                      )}
                     </div>
 
                     <div className="pt-2 border-t border-stone-200 dark:border-stone-800 space-y-2.5">

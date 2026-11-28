@@ -1402,7 +1402,12 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
           </span>
           {translatedPage && (
             <span className="hidden md:inline text-xs text-stone-500 dark:text-stone-400 whitespace-nowrap">
-              · {translatedPage.engine === 'ai' ? 'Smart AI' : 'Free Open'}
+              ·{' '}
+              {translatedPage.engine === 'ai'
+                ? translatedPage.translationStyle === 'faithful'
+                  ? 'Smart AI · Faithful'
+                  : 'Smart AI · Tutor'
+                : 'Free Open'}
             </span>
           )}
         </div>
