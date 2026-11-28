@@ -9,10 +9,12 @@ import {
   Copy,
   Download,
   Edit3,
+  ExternalLink,
   Eye,
   EyeOff,
   FileText,
   Gauge,
+  Globe,
   Highlighter,
   Image as ImageIcon,
   Languages,
@@ -110,6 +112,8 @@ interface TranslatedReaderPaneProps {
   chapters?: ChapterItem[];
   bookTranslations?: TranslatedPageRecord[];
   onSelectPage?: (page: number) => void;
+  autoPlayOnPageSwitch?: boolean;
+  onToggleAutoPlayOnPageSwitch?: () => void;
 }
 
 type StreamItem =
@@ -123,12 +127,36 @@ interface SelectionPopoverState {
   startOffset: number;
   endOffset: number;
   selectedText: string;
+  contextSnippet?: string;
   top: number;
   left: number;
   placeBelow: boolean;
   highlightId?: string;
   color: TextHighlightColor;
   mode: PopoverMode;
+}
+
+function isWordOrShortTermSelection(text: string): boolean {
+  const cleaned = text
+    .replace(/^[\s"'“”‘’()[\]{},.;:!?।۔؟\-–—]+|[\s"'“”‘’()[\]{},.;:!?।۔؟\-–—]+$/g, '')
+    .trim();
+  if (cleaned.length < 2 || cleaned.length > 45) return false;
+  if (/[.!?।۔\n]/.test(cleaned)) return false;
+  const words = cleaned.split(/\s+/).filter(Boolean);
+  return words.length >= 1 && words.length <= 3;
+}
+
+function safeGroundingHref(uri?: string): string | undefined {
+  if (!uri) return undefined;
+  try {
+    const parsed = new URL(uri);
+    if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+      return parsed.toString();
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
 }
 
 const HIGHLIGHT_COLORS: {
@@ -707,6 +735,8 @@ const TranslatedReaderPaneInner: React.FC<TranslatedReaderPaneProps> = ({
   chapters = EMPTY_CHAPTERS,
   bookTranslations = EMPTY_TRANSLATIONS,
   onSelectPage,
+  autoPlayOnPageSwitch = false,
+  onToggleAutoPlayOnPageSwitch,
 }) => {
   const [editingBlockId, setEditingBlockId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState('');
@@ -1328,7 +1358,42 @@ const TranslatedReaderPaneInner: React.FC<TranslatedReaderPaneProps> = ({
     };
   }, []);
 
-  // Capture text selection inside any translated text block
+  // Trigger real-time Google Search grounded dictionary lookup for a term inside the popover
+  const runDictionaryLookup = useCallback(
+    async (term: string, contextSnippet?: string) => {
+      dictAbortRef.current?.abort();
+      const controller = new AbortController();
+      dictAbortRef.current = controller;
+
+      setDictLoading(true);
+      setDictError(null);
+      setDictResult(null);
+
+      try {
+        const res = await lookupDictionaryTerm(
+          term,
+          targetLang,
+          controller.signal,
+          contextSnippet
+        );
+        if (!controller.signal.aborted) {
+          setDictResult(res);
+        }
+      } catch (err) {
+        if (controller.signal.aborted) return;
+        setDictError(
+          err instanceof Error ? err.message : 'Could not fetch dictionary entry right now.'
+        );
+      } finally {
+        if (!controller.signal.aborted) {
+          setDictLoading(false);
+        }
+      }
+    },
+    [targetLang]
+  );
+
+  // Capture text selection inside any translated text block (auto-defines selected words via Google Search grounding)
   const handleTextSelectionEnd = useCallback(
     (e: React.MouseEvent | React.TouchEvent) => {
       if (editingBlockId || !translatedPage) return;
@@ -1365,9 +1430,18 @@ const TranslatedReaderPaneInner: React.FC<TranslatedReaderPaneProps> = ({
             h.endOffset === computed.end
         );
 
+        const blockObj = translatedPage.blocks.find((b) => b.id === blockId);
+        const fullBlockText = (blockObj?.translatedText || blockObj?.text || '').trim();
+        const contextStart = Math.max(0, computed.start - 90);
+        const contextEnd = Math.min(fullBlockText.length, computed.end + 110);
+        const contextSnippet = fullBlockText
+          ? fullBlockText.slice(contextStart, contextEnd).replace(/\s+/g, ' ').trim()
+          : undefined;
+
+        const autoDefine = isWordOrShortTermSelection(computed.text);
         const pos = computeAnchorPosition(rect);
         dictAbortRef.current?.abort();
-        setDictLoading(false);
+        setDictLoading(autoDefine);
         setDictResult(null);
         setDictError(null);
         setCopiedSelection(false);
@@ -1377,46 +1451,21 @@ const TranslatedReaderPaneInner: React.FC<TranslatedReaderPaneProps> = ({
           startOffset: computed.start,
           endOffset: computed.end,
           selectedText: computed.text,
+          contextSnippet,
           top: pos.top,
           left: pos.left,
           placeBelow: pos.placeBelow,
           highlightId: existingMatch?.id,
           color: existingMatch?.color ?? 'amber',
-          mode: 'menu',
+          mode: autoDefine ? 'dictionary' : 'menu',
         });
+
+        if (autoDefine) {
+          void runDictionaryLookup(computed.text, contextSnippet);
+        }
       }, 15);
     },
-    [editingBlockId, translatedPage, pageHighlights, computeAnchorPosition]
-  );
-
-  // Trigger dictionary lookup for a term inside the popover
-  const runDictionaryLookup = useCallback(
-    async (term: string) => {
-      dictAbortRef.current?.abort();
-      const controller = new AbortController();
-      dictAbortRef.current = controller;
-
-      setDictLoading(true);
-      setDictError(null);
-      setDictResult(null);
-
-      try {
-        const res = await lookupDictionaryTerm(term, targetLang, controller.signal);
-        if (!controller.signal.aborted) {
-          setDictResult(res);
-        }
-      } catch (err) {
-        if (controller.signal.aborted) return;
-        setDictError(
-          err instanceof Error ? err.message : 'Could not fetch dictionary entry right now.'
-        );
-      } finally {
-        if (!controller.signal.aborted) {
-          setDictLoading(false);
-        }
-      }
-    },
-    [targetLang]
+    [editingBlockId, translatedPage, pageHighlights, computeAnchorPosition, runDictionaryLookup]
   );
 
   // Open popover on an existing highlight mark
@@ -1428,6 +1477,15 @@ const TranslatedReaderPaneInner: React.FC<TranslatedReaderPaneProps> = ({
     ) => {
       const rect = anchorEl.getBoundingClientRect();
       const pos = computeAnchorPosition(rect);
+      const blockObj = translatedPage?.blocks.find((b) => b.id === hl.blockId);
+      const fullBlockText = (blockObj?.translatedText || blockObj?.text || '').trim();
+      const contextSnippet = fullBlockText
+        ? fullBlockText
+            .slice(Math.max(0, hl.startOffset - 90), Math.min(fullBlockText.length, hl.endOffset + 110))
+            .replace(/\s+/g, ' ')
+            .trim()
+        : undefined;
+
       dictAbortRef.current?.abort();
       setDictLoading(false);
       setDictResult(null);
@@ -1439,6 +1497,7 @@ const TranslatedReaderPaneInner: React.FC<TranslatedReaderPaneProps> = ({
         startOffset: hl.startOffset,
         endOffset: hl.endOffset,
         selectedText: hl.selectedText,
+        contextSnippet,
         top: pos.top,
         left: pos.left,
         placeBelow: pos.placeBelow,
@@ -1448,10 +1507,10 @@ const TranslatedReaderPaneInner: React.FC<TranslatedReaderPaneProps> = ({
       });
 
       if (initialMode === 'dictionary') {
-        runDictionaryLookup(hl.selectedText);
+        void runDictionaryLookup(hl.selectedText, contextSnippet);
       }
     },
-    [computeAnchorPosition, runDictionaryLookup]
+    [computeAnchorPosition, runDictionaryLookup, translatedPage]
   );
 
   // Create or update a highlight with the chosen color
@@ -1569,6 +1628,10 @@ const TranslatedReaderPaneInner: React.FC<TranslatedReaderPaneProps> = ({
     if (dictResult.meanings[0]) {
       const m = dictResult.meanings[0];
       parts.push(`(${m.partOfSpeech}) ${m.definition}`);
+      const firstEx = m.examples?.[0] || m.example || dictResult.usageExamples?.[0];
+      if (firstEx) {
+        parts.push(`e.g. "${firstEx}"`);
+      }
     } else if (dictResult.summary) {
       parts.push(dictResult.summary);
     }
@@ -1732,7 +1795,7 @@ const TranslatedReaderPaneInner: React.FC<TranslatedReaderPaneProps> = ({
   return (
     <section className="flex flex-col h-full bg-[#FAF9F5] sepia:bg-[#F4ECD8] dark:bg-[#0D0D0C] min-w-0 max-w-full overflow-hidden">
       {/* Pane Sub-Header */}
-      <div className="px-3 sm:px-4 h-11 border-b border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#FAF9F5] sepia:bg-[#EFE5CE] dark:bg-[#141312] flex items-center justify-between gap-2 sm:gap-3 shrink-0 min-w-0">
+      <div className="relative z-20 px-3 sm:px-4 h-11 border-b border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#FAF9F5] sepia:bg-[#EFE5CE] dark:bg-[#141312] flex items-center justify-between gap-2 sm:gap-3 shrink-0 min-w-0">
         <div className="flex items-center gap-2 min-w-0">
           <span className="text-xs font-semibold uppercase tracking-wider text-stone-500 dark:text-stone-400 whitespace-nowrap">
             {langOption.name} Edition
@@ -1753,6 +1816,50 @@ const TranslatedReaderPaneInner: React.FC<TranslatedReaderPaneProps> = ({
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
+          {onToggleAutoPlayOnPageSwitch && (
+            <button
+              type="button"
+              role="switch"
+              aria-checked={autoPlayOnPageSwitch}
+              onClick={onToggleAutoPlayOnPageSwitch}
+              className={`inline-flex items-center gap-1.5 h-7 pl-2 pr-1.5 rounded-full text-xs font-semibold border transition-all duration-150 cursor-pointer whitespace-nowrap backdrop-blur-md ${
+                autoPlayOnPageSwitch
+                  ? 'bg-amber-700/95 dark:bg-amber-600/95 text-white border-amber-600 dark:border-amber-500 shadow-md shadow-amber-900/20 hover:bg-amber-800 dark:hover:bg-amber-500'
+                  : 'bg-white/95 sepia:bg-[#FBF6E9]/95 dark:bg-[#1E1D1B]/95 text-stone-700 sepia:text-[#3B2F23] dark:text-stone-200 border-stone-300/90 sepia:border-[#D4C4A2] dark:border-stone-700 shadow-sm hover:shadow hover:border-amber-600/50 dark:hover:border-amber-500/50'
+              }`}
+              title={
+                autoPlayOnPageSwitch
+                  ? 'Auto-Play ON — automatically plays audiobook narration when switching to a new translated page'
+                  : 'Auto-Play OFF — enable to automatically play audiobook narration when switching to a new translated page'
+              }
+            >
+              <Volume2
+                className={`w-3.5 h-3.5 shrink-0 ${
+                  autoPlayOnPageSwitch
+                    ? isSpeaking
+                      ? 'animate-pulse text-amber-100'
+                      : 'text-white'
+                    : 'text-amber-700 dark:text-amber-500'
+                }`}
+              />
+              <span>Auto-Play</span>
+              <span
+                aria-hidden="true"
+                className={`relative inline-flex h-3.5 w-6 shrink-0 items-center rounded-full transition-colors ${
+                  autoPlayOnPageSwitch
+                    ? 'bg-white/30'
+                    : 'bg-stone-300/90 sepia:bg-[#D5C6A5] dark:bg-stone-700'
+                }`}
+              >
+                <span
+                  className={`inline-block h-2.5 w-2.5 rounded-full bg-white shadow-xs transition-transform ${
+                    autoPlayOnPageSwitch ? 'translate-x-3' : 'translate-x-0.5'
+                  }`}
+                />
+              </span>
+            </button>
+          )}
+
           <button
             type="button"
             onClick={() => {
@@ -2232,7 +2339,11 @@ const TranslatedReaderPaneInner: React.FC<TranslatedReaderPaneProps> = ({
             className={`absolute z-30 -translate-x-1/2 ${
               popover.placeBelow ? '' : '-translate-y-full'
             } rounded-lg border border-stone-300 dark:border-stone-700 bg-white dark:bg-[#1C1B19] shadow-xl text-stone-900 dark:text-stone-100 ${
-              popover.mode === 'menu' ? 'w-max max-w-[92vw]' : 'w-[320px] sm:w-[360px] max-w-[92vw]'
+              popover.mode === 'menu'
+                ? 'w-max max-w-[92vw]'
+                : popover.mode === 'dictionary'
+                  ? 'w-[330px] sm:w-[390px] max-w-[92vw]'
+                  : 'w-[320px] sm:w-[360px] max-w-[92vw]'
             }`}
           >
             {/* Action Bar */}
@@ -2289,7 +2400,7 @@ const TranslatedReaderPaneInner: React.FC<TranslatedReaderPaneProps> = ({
                     } else {
                       setPopover((prev) => (prev ? { ...prev, mode: 'dictionary' } : null));
                       if (!dictResult || dictResult.term !== popover.selectedText) {
-                        runDictionaryLookup(popover.selectedText);
+                        void runDictionaryLookup(popover.selectedText, popover.contextSnippet);
                       }
                     }
                   }}
@@ -2298,7 +2409,7 @@ const TranslatedReaderPaneInner: React.FC<TranslatedReaderPaneProps> = ({
                       ? 'bg-amber-700 text-white'
                       : 'text-stone-700 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800'
                   }`}
-                  title="Look up definition & cross-language meaning"
+                  title="Real-time dictionary definition & usage examples"
                 >
                   <BookOpen className="w-3.5 h-3.5" />
                   <span>Define</span>
@@ -2406,20 +2517,24 @@ const TranslatedReaderPaneInner: React.FC<TranslatedReaderPaneProps> = ({
               </div>
             )}
 
-            {/* Dictionary Lookup Mode Panel */}
+            {/* Dictionary Lookup Mode Panel (Real-Time Google Search Grounded) */}
             {popover.mode === 'dictionary' && (
-              <div className="px-3 pb-3 pt-2.5 border-t border-stone-200 dark:border-stone-800 max-h-72 overflow-y-auto space-y-2.5">
+              <div className="px-3.5 pb-3.5 pt-2.5 border-t border-stone-200 dark:border-stone-800 max-h-80 overflow-y-auto space-y-2.5">
                 {dictLoading ? (
                   <div className="py-5 flex items-center justify-center gap-2 text-xs text-stone-500 dark:text-stone-400">
-                    <Loader2 className="w-4 h-4 animate-spin text-amber-700 dark:text-amber-500" />
-                    <span>Looking up “{popover.selectedText.slice(0, 36)}”…</span>
+                    <Loader2 className="w-4 h-4 animate-spin text-amber-700 dark:text-amber-500 shrink-0" />
+                    <span>
+                      Searching live definition &amp; examples for “{popover.selectedText.slice(0, 36)}”…
+                    </span>
                   </div>
                 ) : dictError ? (
                   <div className="p-2.5 rounded bg-red-50/80 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-xs text-red-700 dark:text-red-300 space-y-2">
                     <p>{dictError}</p>
                     <button
                       type="button"
-                      onClick={() => runDictionaryLookup(popover.selectedText)}
+                      onClick={() =>
+                        void runDictionaryLookup(popover.selectedText, popover.contextSnippet)
+                      }
                       className="text-amber-700 dark:text-amber-400 font-medium underline cursor-pointer"
                     >
                       Try again
@@ -2466,37 +2581,114 @@ const TranslatedReaderPaneInner: React.FC<TranslatedReaderPaneProps> = ({
                     </div>
 
                     {dictResult.meanings.length > 0 && (
-                      <div className="space-y-2 pt-1 border-t border-stone-200/80 dark:border-stone-800">
-                        {dictResult.meanings.map((m, idx) => (
-                          <div key={idx} className="text-xs leading-relaxed space-y-0.5">
-                            <span className="text-[10px] font-semibold uppercase tracking-wider text-amber-700 dark:text-amber-400">
-                              {m.partOfSpeech}
-                            </span>
-                            <p className="text-stone-800 dark:text-stone-200">{m.definition}</p>
-                            {m.example && (
-                              <p className="text-[11px] italic text-stone-500 dark:text-stone-400">
-                                “{m.example}”
-                              </p>
-                            )}
-                            {m.synonyms && m.synonyms.length > 0 && (
-                              <p className="text-[11px] text-stone-500 dark:text-stone-400">
-                                Similar: {m.synonyms.slice(0, 4).join(', ')}
-                              </p>
-                            )}
-                          </div>
-                        ))}
+                      <div className="space-y-2.5 pt-2 border-t border-stone-200/80 dark:border-stone-800">
+                        {dictResult.meanings.map((m, idx) => {
+                          const meaningExamples =
+                            m.examples && m.examples.length > 0
+                              ? m.examples
+                              : m.example
+                                ? [m.example]
+                                : [];
+                          return (
+                            <div key={idx} className="text-xs leading-relaxed space-y-1">
+                              <span className="text-[10px] font-semibold uppercase tracking-wider text-amber-700 dark:text-amber-400">
+                                {m.partOfSpeech}
+                              </span>
+                              <p className="text-stone-800 dark:text-stone-200">{m.definition}</p>
+                              {meaningExamples.length > 0 && (
+                                <ul className="space-y-0.5 pl-2.5 border-l-2 border-stone-200 dark:border-stone-700">
+                                  {meaningExamples.map((ex, exIdx) => (
+                                    <li
+                                      key={exIdx}
+                                      className="text-[11px] italic text-stone-600 dark:text-stone-400"
+                                    >
+                                      “{ex}”
+                                    </li>
+                                  ))}
+                                </ul>
+                              )}
+                              {m.synonyms && m.synonyms.length > 0 && (
+                                <p className="text-[11px] text-stone-500 dark:text-stone-400">
+                                  Similar: {m.synonyms.slice(0, 4).join(', ')}
+                                </p>
+                              )}
+                            </div>
+                          );
+                        })}
                       </div>
                     )}
 
+                    {/* Standalone Usage Examples Section (deduplicated from inline meaning examples) */}
+                    {(() => {
+                      const shownSet = new Set<string>();
+                      for (const m of dictResult.meanings) {
+                        if (m.example) shownSet.add(m.example.toLowerCase());
+                        for (const ex of m.examples ?? []) shownSet.add(ex.toLowerCase());
+                      }
+                      const extraExamples = (dictResult.usageExamples ?? []).filter(
+                        (ex) => !shownSet.has(ex.toLowerCase())
+                      );
+                      if (extraExamples.length === 0) return null;
+                      return (
+                        <div className="space-y-1.5 pt-2 border-t border-stone-200/80 dark:border-stone-800">
+                          <p className="text-[10px] font-semibold uppercase tracking-wider text-stone-500 dark:text-stone-400">
+                            Usage Examples
+                          </p>
+                          <ul className="space-y-1 pl-2.5 border-l-2 border-amber-600/50 dark:border-amber-500/40">
+                            {extraExamples.map((ex, idx) => (
+                              <li
+                                key={idx}
+                                className="text-[11px] leading-relaxed italic text-stone-700 dark:text-stone-300"
+                              >
+                                “{ex}”
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      );
+                    })()}
+
                     {dictResult.summary && (
-                      <p className="text-xs leading-relaxed text-stone-700 dark:text-stone-300 pt-1 border-t border-stone-200/80 dark:border-stone-800">
+                      <p className="text-xs leading-relaxed text-stone-700 dark:text-stone-300 pt-2 border-t border-stone-200/80 dark:border-stone-800">
                         {dictResult.summary}
                       </p>
                     )}
 
+                    {/* Google Search Grounding Sources */}
+                    {dictResult.groundingSources && dictResult.groundingSources.length > 0 && (
+                      <div className="space-y-1 pt-2 border-t border-stone-200/80 dark:border-stone-800">
+                        <p className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-stone-500 dark:text-stone-400">
+                          <Globe className="w-3 h-3 text-amber-700 dark:text-amber-500" />
+                          <span>Verified Web Sources</span>
+                        </p>
+                        <div className="flex flex-wrap gap-x-3 gap-y-1">
+                          {dictResult.groundingSources.map((src, idx) => {
+                            const href = safeGroundingHref(src.uri);
+                            if (!href) return null;
+                            return (
+                              <a
+                                key={idx}
+                                href={href}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center gap-1 text-[11px] text-amber-800 dark:text-amber-400 hover:underline max-w-[160px] truncate"
+                                title={src.title}
+                              >
+                                <span className="truncate">{src.title}</span>
+                                <ExternalLink className="w-2.5 h-2.5 shrink-0" />
+                              </a>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
                     <div className="pt-2 border-t border-stone-200/80 dark:border-stone-800 flex items-center justify-between gap-2">
-                      <span className="text-[10px] text-stone-400 dark:text-stone-500 truncate">
-                        Source: {dictResult.source}
+                      <span className="inline-flex items-center gap-1 text-[10px] text-stone-400 dark:text-stone-500 truncate">
+                        {dictResult.grounded && (
+                          <Globe className="w-3 h-3 text-amber-700 dark:text-amber-500 shrink-0" />
+                        )}
+                        <span className="truncate">{dictResult.source}</span>
                       </span>
                       <button
                         type="button"

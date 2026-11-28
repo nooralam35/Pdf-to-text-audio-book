@@ -149,12 +149,14 @@ export interface AudiobookControlHandle {
 }
 
 interface AudiobookBarProps {
+  bookId?: string;
   bookTitle: string;
   bookAuthor?: string;
   bookCoverUrl?: string;
   isOnline?: boolean;
   pageNumber: number;
   numPages: number;
+  autoPlayOnPageSwitch?: boolean;
   currentChapter?: ChapterItem | null;
   chapterPageWordCounts?: Record<number, number>;
   targetLang: LanguageCode;
@@ -182,12 +184,14 @@ interface AudiobookBarProps {
 const EMPTY_WORD_COUNTS: Record<number, number> = {};
 
 const AudiobookBarInner: React.FC<AudiobookBarProps> = ({
+  bookId = '',
   bookTitle,
   bookAuthor = '',
   bookCoverUrl,
   isOnline = true,
   pageNumber,
   numPages,
+  autoPlayOnPageSwitch = false,
   currentChapter = null,
   chapterPageWordCounts = EMPTY_WORD_COUNTS,
   targetLang,
@@ -334,6 +338,11 @@ const AudiobookBarInner: React.FC<AudiobookBarProps> = ({
   const playSessionRef = useRef(0);
   const pausedInPlaceRef = useRef(false);
   const pendingAutoContinueRef = useRef(false);
+  const prevPageForAutoPlayRef = useRef<{ bookId: string; pageNumber: number }>({
+    bookId,
+    pageNumber,
+  });
+  const pendingPageSwitchAutoPlayRef = useRef<string | null>(null);
   const pendingChapterPlayRef = useRef<{
     targetPage: number;
     endPage: number;
@@ -694,6 +703,7 @@ const AudiobookBarInner: React.FC<AudiobookBarProps> = ({
     }
     currentUtteranceRef.current = null;
 
+    isSpeakingRef.current = false;
     onSpeakingChange(false);
     if (clearHighlight) {
       onActiveSentenceChange(null);
@@ -801,6 +811,79 @@ const AudiobookBarInner: React.FC<AudiobookBarProps> = ({
     setScrubSec(null);
     scrubSecRef.current = null;
   }, [pageNumber, targetLang, narrationSource]);
+
+  // Arm automatic playback when the user switches to a new page while Auto-Play is enabled
+  useEffect(() => {
+    const prev = prevPageForAutoPlayRef.current;
+    if (prev.bookId !== bookId) {
+      prevPageForAutoPlayRef.current = { bookId, pageNumber };
+      pendingPageSwitchAutoPlayRef.current = null;
+      return;
+    }
+    if (prev.pageNumber !== pageNumber) {
+      prevPageForAutoPlayRef.current = { bookId, pageNumber };
+      pendingPageSwitchAutoPlayRef.current = autoPlayOnPageSwitch
+        ? `${bookId}::${pageNumber}::${targetLang}`
+        : null;
+    }
+  }, [bookId, pageNumber, targetLang, autoPlayOnPageSwitch]);
+
+  // Clear pending page-switch auto-play whenever Auto-Play is switched off
+  useEffect(() => {
+    if (!autoPlayOnPageSwitch) {
+      pendingPageSwitchAutoPlayRef.current = null;
+    }
+  }, [autoPlayOnPageSwitch]);
+
+  // Trigger audiobook playback once the newly switched translated page finishes loading
+  useEffect(() => {
+    if (!autoPlayOnPageSwitch) return;
+    const expectedKey = `${bookId}::${pageNumber}::${targetLang}`;
+    if (pendingPageSwitchAutoPlayRef.current !== expectedKey) return;
+    if (isTranslatingPage) return;
+
+    // Defer to explicit playback flows (auto-advance, timeline seek, sentence resume, chapter play)
+    if (
+      pendingAutoContinueRef.current ||
+      pendingSeekRef.current ||
+      pendingSentenceStartRef.current ||
+      pendingChapterPlayRef.current
+    ) {
+      pendingPageSwitchAutoPlayRef.current = null;
+      return;
+    }
+
+    if (isSpeakingRef.current) {
+      pendingPageSwitchAutoPlayRef.current = null;
+      return;
+    }
+
+    const isTranslatedReady =
+      Boolean(
+        translatedPage &&
+        translatedPage.pageNumber === pageNumber &&
+        translatedPage.lang === targetLang &&
+        (!bookId || translatedPage.bookId === bookId)
+      ) &&
+      (narrationSource === 'translated' ||
+        Boolean(parsedPage && parsedPage.pageNumber === pageNumber)) &&
+      sentences.length > 0;
+
+    if (isTranslatedReady) {
+      pendingPageSwitchAutoPlayRef.current = null;
+      speakFromIndex(0);
+    }
+  }, [
+    autoPlayOnPageSwitch,
+    bookId,
+    pageNumber,
+    targetLang,
+    narrationSource,
+    isTranslatingPage,
+    translatedPage,
+    parsedPage,
+    sentences.length,
+  ]);
 
   // Countdown Sleep Timer: pauses playback cleanly when countdown hits 0
   useEffect(() => {
@@ -1346,7 +1429,9 @@ const AudiobookBarInner: React.FC<AudiobookBarProps> = ({
       }
     }
 
+    pendingPageSwitchAutoPlayRef.current = null;
     setAudioMessage(null);
+    isSpeakingRef.current = true;
     onSpeakingChange(true);
 
     if (engineModeRef.current === 'device') {
@@ -1618,9 +1703,11 @@ const AudiobookBarInner: React.FC<AudiobookBarProps> = ({
     }
 
     if (isSpeaking) {
+      pendingPageSwitchAutoPlayRef.current = null;
       if (engineMode === 'hd' && audioRef.current && !isLoadingSentence) {
         pausedInPlaceRef.current = true;
         audioRef.current.pause();
+        isSpeakingRef.current = false;
         onSpeakingChange(false);
       } else {
         stopPlayback(false);
@@ -1669,10 +1756,12 @@ const AudiobookBarInner: React.FC<AudiobookBarProps> = ({
         pendingChapterPlayRef.current = null;
         pendingSentenceStartRef.current = null;
         pendingAutoContinueRef.current = false;
+        pendingPageSwitchAutoPlayRef.current = null;
         setWaitingForTranslation(false);
         if (engineModeRef.current === 'hd' && audioRef.current && !isLoadingSentence) {
           pausedInPlaceRef.current = true;
           audioRef.current.pause();
+          isSpeakingRef.current = false;
           onSpeakingChange(false);
         } else {
           stopPlayback(false);

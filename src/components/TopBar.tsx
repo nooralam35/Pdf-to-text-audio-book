@@ -12,7 +12,7 @@ interface TopBarProps {
 }
 
 const NAV_ITEMS: Array<{ id: ActiveTab; label: string }> = [
-  { id: 'discover', label: 'Discover' },
+  { id: 'discover', label: 'World Books' },
   { id: 'reader', label: 'Reader' },
   { id: 'library', label: 'Library' },
   { id: 'export', label: 'Export PDF' },

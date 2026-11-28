@@ -230,6 +230,12 @@ export default function App() {
     const saved = localStorage.getItem('bhashabook-auto-preload-next');
     return saved === null ? true : saved === 'true';
   });
+  const [autoPlayOnPageSwitch, setAutoPlayOnPageSwitch] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return localStorage.getItem('bhashabook-autoplay-on-page-switch') === 'true';
+  });
+  const autoPlayOnPageSwitchRef = useRef(autoPlayOnPageSwitch);
+  autoPlayOnPageSwitchRef.current = autoPlayOnPageSwitch;
   const [customTermsInput, setCustomTermsInput] = useState('');
   const [voiceStylePreference, setVoiceStylePreference] = useState<VoiceStylePreference>(() => {
     if (typeof window === 'undefined') return 'teacher';
@@ -486,6 +492,14 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('bhashabook-auto-preload-next', String(autoPreloadNext));
   }, [autoPreloadNext]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('bhashabook-autoplay-on-page-switch', String(autoPlayOnPageSwitch));
+    } catch {
+      // ignore storage errors
+    }
+  }, [autoPlayOnPageSwitch]);
 
   // Refresh Daily Reading Goal snapshot on midnight date rollover or when opening Library
   useEffect(() => {
@@ -3132,9 +3146,29 @@ export default function App() {
     void handleTranslateCurrentPage(false);
   }, [handleTranslateCurrentPage]);
 
+  const handleToggleAutoPlayOnPageSwitch = useCallback(() => {
+    setAutoPlayOnPageSwitch((prev) => {
+      const next = !prev;
+      if (next) {
+        audiobookControlRef.current?.unlockAudio();
+      }
+      return next;
+    });
+  }, []);
+
+  const handleSelectReaderPage = useCallback((page: number) => {
+    if (autoPlayOnPageSwitchRef.current) {
+      audiobookControlRef.current?.unlockAudio();
+    }
+    setCurrentPage(page);
+  }, []);
+
   const handleGoToNextPage = useCallback(() => {
     const targetBook = activeBookRef.current;
     if (!targetBook) return;
+    if (autoPlayOnPageSwitchRef.current) {
+      audiobookControlRef.current?.unlockAudio();
+    }
     setCurrentPage((p) =>
       p >= targetBook.numPages ? p : Math.min(targetBook.numPages, p + 1)
     );
@@ -3292,6 +3326,9 @@ export default function App() {
   const handleCloseMobileChapters = useCallback(() => setMobileChaptersOpen(false), []);
 
   const handleMobileDrawerSelectPage = useCallback((p: number) => {
+    if (autoPlayOnPageSwitchRef.current) {
+      audiobookControlRef.current?.unlockAudio();
+    }
     setCurrentPage(p);
     setMobileChaptersOpen(false);
   }, []);
@@ -3322,6 +3359,9 @@ export default function App() {
   );
 
   const handleMobileTabSelectPage = useCallback((p: number) => {
+    if (autoPlayOnPageSwitchRef.current) {
+      audiobookControlRef.current?.unlockAudio();
+    }
     setCurrentPage(p);
     setMobilePane('translated');
   }, []);
@@ -4060,7 +4100,7 @@ export default function App() {
                     bookmarks={activeBookBookmarks}
                     isSpeaking={isSpeaking}
                     isPreparingAudio={isPreparingAudio}
-                    onSelectPage={setCurrentPage}
+                    onSelectPage={handleSelectReaderPage}
                     onPlayChapterAudio={handlePlayChapterAudio}
                     onTranslateChapter={handleTranslateChapter}
                     onSummarizeChapter={handleSummarizeChapter}
@@ -4126,7 +4166,7 @@ export default function App() {
                     pageNumber={currentPage}
                     numPages={activeBook.numPages}
                     figureCount={parsedPage?.figures.length ?? 0}
-                    onChangePage={setCurrentPage}
+                    onChangePage={handleSelectReaderPage}
                     onRunOcr={handleRunOcrStandard}
                     onRerunOcr={handleRerunOcr}
                     onSaveOcrReview={handleSaveOcrReview}
@@ -4190,7 +4230,9 @@ export default function App() {
                     pdf={loadedPdf}
                     chapters={activeBook.chapters}
                     bookTranslations={bookTranslations}
-                    onSelectPage={setCurrentPage}
+                    onSelectPage={handleSelectReaderPage}
+                    autoPlayOnPageSwitch={autoPlayOnPageSwitch}
+                    onToggleAutoPlayOnPageSwitch={handleToggleAutoPlayOnPageSwitch}
                   />
                 </Profiler>
               </div>
@@ -4229,12 +4271,14 @@ export default function App() {
       {activeTab === 'reader' && activeBook && (
         <Profiler id="AudiobookBar" onRender={onAudiobookBarProfile}>
           <AudiobookBar
+            bookId={activeBook.id}
             bookTitle={activeBook.title}
             bookAuthor={activeBook.author}
             bookCoverUrl={activeBook.coverDataUrl}
             isOnline={isOnline}
             pageNumber={currentPage}
             numPages={activeBook.numPages}
+            autoPlayOnPageSwitch={autoPlayOnPageSwitch}
             currentChapter={currentChapter}
             chapterPageWordCounts={chapterPageWordCounts}
             targetLang={targetLang}

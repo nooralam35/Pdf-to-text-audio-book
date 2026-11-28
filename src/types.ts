@@ -122,7 +122,13 @@ export interface DictionaryMeaning {
   partOfSpeech: string;
   definition: string;
   example?: string;
+  examples?: string[];
   synonyms?: string[];
+}
+
+export interface DictionaryGroundingSource {
+  title: string;
+  uri: string;
 }
 
 export interface DictionaryLookupResult {
@@ -131,8 +137,11 @@ export interface DictionaryLookupResult {
   englishEquivalent?: string;
   targetEquivalent?: string;
   meanings: DictionaryMeaning[];
+  usageExamples?: string[];
   summary?: string;
   source: string;
+  grounded?: boolean;
+  groundingSources?: DictionaryGroundingSource[];
 }
 
 export interface TranslatedPageRecord {
@@ -192,12 +201,41 @@ export type BookSearchSource = 'internet_archive' | 'open_library' | 'gutenberg'
 
 export type BookCategory =
   | 'all'
-  | 'programming'
-  | 'business'
-  | 'science'
-  | 'history'
-  | 'fiction'
-  | 'self_help';
+  | 'adventure_thrillers'
+  | 'arts_cinema_photography'
+  | 'life_stories_memoirs'
+  | 'business_finance'
+  | 'kids_books'
+  | 'graphic_novels_manga'
+  | 'computers_digital_tech'
+  | 'hobbies_crafts_home'
+  | 'mystery_crime_suspense'
+  | 'engineering'
+  | 'exam_preparation'
+  | 'scifi_fantasy'
+  | 'health_wellness'
+  | 'family_personal_dev'
+  | 'historical_fiction'
+  | 'world_history'
+  | 'humor_satire'
+  | 'languages_writing'
+  | 'legal_studies'
+  | 'contemporary_literature'
+  | 'world_maps_atlases'
+  | 'medical_textbooks'
+  | 'political_studies'
+  | 'reference_research'
+  | 'spirituality_religion'
+  | 'romantic_fiction'
+  | 'school_textbooks'
+  | 'science_math_textbooks'
+  | 'science_tech_medicine'
+  | 'social_sciences'
+  | 'sports_fitness'
+  | 'college_university_textbooks'
+  | 'young_adult_reads'
+  | 'study_guides_textbooks'
+  | 'travel_guides';
 
 export type BookFormatFilter = 'all' | 'pdf' | 'text' | 'online';
 
@@ -217,6 +255,7 @@ export interface DiscoveredBook {
   subjects: string[];
   description?: string;
   coverUrl?: string;
+  fallbackCoverUrl?: string;
   pdfUrl?: string;
   textUrl?: string;
   epubUrl?: string;

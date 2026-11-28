@@ -1798,10 +1798,15 @@ Follow these strict fidelity rules:
     }
   });
 
-  // Free Dictionary, Technical Glossary & Cross-Language Lookup Endpoint
+  // Server-side LRU cache for instant repeat dictionary lookups
+  const DICT_CACHE_TTL_MS = 30 * 60 * 1000;
+  const DICT_CACHE_MAX = 300;
+  const dictionaryCache = new Map<string, { payload: unknown; expiresAt: number }>();
+
+  // Real-Time Dictionary & Usage Examples Endpoint (Google Search Grounding via @google/genai + Free Dictionary Fallback)
   app.post('/api/dictionary', async (req, res) => {
     try {
-      const { term, targetLang = 'hi' } = req.body ?? {};
+      const { term, targetLang = 'hi', context } = req.body ?? {};
       if (typeof term !== 'string' || !term.trim()) {
         return res.status(400).json({ error: 'Selected text is required for dictionary lookup.' });
       }
@@ -1816,9 +1821,216 @@ Follow these strict fidelity rules:
         return res.status(400).json({ error: 'Please select a word or phrase to look up.' });
       }
 
+      const cleanContext =
+        typeof context === 'string'
+          ? context.replace(/\s+/g, ' ').trim().slice(0, 240)
+          : '';
+
       const safeLang =
         typeof targetLang === 'string' && ALLOWED_LANGS[targetLang] ? targetLang : 'hi';
       const langMeta = ALLOWED_LANGS[safeLang];
+      const cacheKey = `${cleanTerm.toLowerCase()}|${safeLang}|${cleanContext.slice(0, 64).toLowerCase()}`;
+
+      const cached = dictionaryCache.get(cacheKey);
+      if (cached && cached.expiresAt > Date.now()) {
+        dictionaryCache.delete(cacheKey);
+        dictionaryCache.set(cacheKey, cached);
+        return res.json(cached.payload);
+      }
+
+      const storeInDictCache = (payload: unknown) => {
+        if (dictionaryCache.size >= DICT_CACHE_MAX) {
+          const oldest = dictionaryCache.keys().next().value;
+          if (oldest !== undefined) dictionaryCache.delete(oldest);
+        }
+        dictionaryCache.set(cacheKey, {
+          payload,
+          expiresAt: Date.now() + DICT_CACHE_TTL_MS,
+        });
+      };
+
+      // Primary: Real-Time Google Search Grounding via @google/genai (gemini-4-hydrogen)
+      const ai = getGeminiClient();
+      let geminiErrorMessage: string | null = null;
+      if (ai) {
+        try {
+          const readerLangLabel = safeLang === 'orig' ? 'English' : langMeta.name;
+          const prompt = [
+            `Use Google Search to fetch an accurate, up-to-date dictionary definition and real-world usage examples for the selected word or phrase: "${cleanTerm}".`,
+            `Reader language: ${readerLangLabel}.`,
+            cleanContext ? `Reading context sentence: "${cleanContext}"` : '',
+            'Return ONLY a valid JSON object (no markdown fences, no commentary outside JSON) with this exact shape:',
+            '{',
+            '  "phonetic": "IPA or simple pronunciation guide (empty string if none)",',
+            '  "englishEquivalent": "concise English meaning or translation if the term is non-English (empty string if already English)",',
+            `  "targetEquivalent": "concise ${readerLangLabel} equivalent if helpful (empty string if identical to term)",`,
+            '  "meanings": [',
+            '    {',
+            '      "partOfSpeech": "noun | verb | adjective | phrase | idiom | etc.",',
+            '      "definition": "clear, concise dictionary definition",',
+            '      "examples": ["natural example sentence 1", "natural example sentence 2"],',
+            '      "synonyms": ["synonym1", "synonym2"]',
+            '    }',
+            '  ],',
+            '  "usageExamples": ["practical usage example sentence 1", "practical usage example sentence 2"],',
+            '  "summary": "1 concise sentence explaining the nuance or contextual meaning if a reading context was given"',
+            '}',
+            'Include 1 to 3 meanings and at least 2 clear usage examples.',
+          ]
+            .filter(Boolean)
+            .join('\n');
+
+          const response = await ai.models.generateContent({
+            model: 'gemini-4-hydrogen',
+            contents: prompt,
+            config: {
+              tools: [{ googleSearch: {} }],
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            },
+          });
+
+          const rawText = (response.text ?? '').trim();
+          const rawChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
+          const groundingSources: Array<{ title: string; uri: string }> = [];
+          const seenUris = new Set<string>();
+          for (const chunk of rawChunks) {
+            const uri = chunk?.web?.uri?.trim();
+            const title = chunk?.web?.title?.trim();
+            if (!uri || seenUris.has(uri)) continue;
+            try {
+              const parsedUrl = new URL(uri);
+              if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') continue;
+              seenUris.add(uri);
+              groundingSources.push({
+                title: title || parsedUrl.hostname.replace(/^www\./, ''),
+                uri: parsedUrl.toString(),
+              });
+              if (groundingSources.length >= 4) break;
+            } catch {
+              // ignore malformed grounding URI
+            }
+          }
+
+          if (rawText) {
+            let parsedJson: {
+              phonetic?: unknown;
+              englishEquivalent?: unknown;
+              targetEquivalent?: unknown;
+              meanings?: unknown;
+              usageExamples?: unknown;
+              summary?: unknown;
+            } | null = null;
+
+            const stripped = rawText
+              .replace(/^```(?:json)?\s*/i, '')
+              .replace(/\s*```$/i, '')
+              .trim();
+            const firstBrace = stripped.indexOf('{');
+            const lastBrace = stripped.lastIndexOf('}');
+            if (firstBrace >= 0 && lastBrace > firstBrace) {
+              try {
+                parsedJson = JSON.parse(stripped.slice(firstBrace, lastBrace + 1));
+              } catch {
+                parsedJson = null;
+              }
+            }
+
+            if (parsedJson && typeof parsedJson === 'object') {
+              const cleanStr = (v: unknown, maxLen = 280): string | undefined =>
+                typeof v === 'string' && v.trim() ? v.trim().slice(0, maxLen) : undefined;
+
+              const rawMeanings = Array.isArray(parsedJson.meanings) ? parsedJson.meanings : [];
+              const parsedMeanings: Array<{
+                partOfSpeech: string;
+                definition: string;
+                example?: string;
+                examples?: string[];
+                synonyms?: string[];
+              }> = [];
+
+              for (const item of rawMeanings.slice(0, 3)) {
+                if (!item || typeof item !== 'object') continue;
+                const rec = item as Record<string, unknown>;
+                const def = cleanStr(rec.definition, 340);
+                if (!def) continue;
+                const pos = cleanStr(rec.partOfSpeech, 40) || 'term';
+                const exArr = Array.isArray(rec.examples)
+                  ? rec.examples
+                      .map((e) => cleanStr(e, 220))
+                      .filter((e): e is string => Boolean(e))
+                      .slice(0, 2)
+                  : [];
+                const singleEx = cleanStr(rec.example, 220);
+                if (singleEx && !exArr.includes(singleEx)) {
+                  exArr.unshift(singleEx);
+                }
+                const syns = Array.isArray(rec.synonyms)
+                  ? rec.synonyms
+                      .map((s) => cleanStr(s, 48))
+                      .filter((s): s is string => Boolean(s))
+                      .slice(0, 4)
+                  : undefined;
+
+                parsedMeanings.push({
+                  partOfSpeech: pos,
+                  definition: def,
+                  example: exArr[0],
+                  examples: exArr.length > 0 ? exArr : undefined,
+                  synonyms: syns && syns.length > 0 ? syns : undefined,
+                });
+              }
+
+              const usageExamples = Array.isArray(parsedJson.usageExamples)
+                ? parsedJson.usageExamples
+                    .map((e) => cleanStr(e, 240))
+                    .filter((e): e is string => Boolean(e))
+                    .slice(0, 3)
+                : [];
+
+              const summary = cleanStr(parsedJson.summary, 360);
+              const phonetic = cleanStr(parsedJson.phonetic, 80);
+              const englishEquivalent = cleanStr(parsedJson.englishEquivalent, 120);
+              const targetEquivalent = cleanStr(parsedJson.targetEquivalent, 120);
+
+              if (parsedMeanings.length > 0 || summary || usageExamples.length > 0) {
+                const payload = {
+                  term: cleanTerm,
+                  phonetic,
+                  englishEquivalent,
+                  targetEquivalent,
+                  meanings: parsedMeanings,
+                  usageExamples: usageExamples.length > 0 ? usageExamples : undefined,
+                  summary,
+                  source: 'Google Search Grounding',
+                  grounded: true,
+                  groundingSources: groundingSources.length > 0 ? groundingSources : undefined,
+                };
+                storeInDictCache(payload);
+                return res.json(payload);
+              }
+            } else {
+              // Model responded with grounded plain text/markdown instead of JSON
+              const plainSummary = stripped.replace(/\s+/g, ' ').slice(0, 420);
+              if (plainSummary.length >= 16) {
+                const payload = {
+                  term: cleanTerm,
+                  meanings: [],
+                  summary: plainSummary,
+                  source: 'Google Search Grounding',
+                  grounded: true,
+                  groundingSources: groundingSources.length > 0 ? groundingSources : undefined,
+                };
+                storeInDictCache(payload);
+                return res.json(payload);
+              }
+            }
+          }
+        } catch (err) {
+          geminiErrorMessage = err instanceof Error ? err.message : 'Google Search lookup failed';
+        }
+      }
+
+      // Fallback: Cross-language lookup + Free Dictionary API + Wikipedia REST Summary
       const isAsciiLatin = /^[A-Za-z0-9\s\-_./+&#']+$/u.test(cleanTerm);
 
       let englishEquivalent: string | undefined;
@@ -1829,7 +2041,6 @@ Follow these strict fidelity rules:
           ? { gtxCode: langMeta.gtxCode, myMemoryCode: langMeta.myMemoryCode }
           : { gtxCode: 'auto', myMemoryCode: 'hi' };
 
-      // Cross-language translation (non-ASCII -> English, or ASCII -> targetLang + English if reading in es/fr/de/hinglish)
       if (!isAsciiLatin) {
         try {
           const enText = await translateFreeSingle(cleanTerm, 'en', 'en', reverseSource);
@@ -1839,7 +2050,7 @@ Follow these strict fidelity rules:
         } catch {
           // continue without English equivalent
         }
-      } else if (safeLang !== 'en') {
+      } else if (safeLang !== 'en' && safeLang !== 'orig') {
         try {
           let trText = await translateFreeSingle(
             cleanTerm,
@@ -1877,12 +2088,13 @@ Follow these strict fidelity rules:
         partOfSpeech: string;
         definition: string;
         example?: string;
+        examples?: string[];
         synonyms?: string[];
       }> = [];
+      const usageExamples: string[] = [];
       let summary: string | undefined;
       let source = 'Cross-Language Lookup';
 
-      // 1. Free Dictionary API for English single-word definitions & phonetics
       if (isSingleEnglishWord || /^[A-Za-z][A-Za-z\-']{1,38}$/.test(firstWord)) {
         const candidateWord = isSingleEnglishWord ? lookupWord : firstWord;
         try {
@@ -1909,12 +2121,23 @@ Follow these strict fidelity rules:
                 entry.phonetics?.find((p) => typeof p.text === 'string' && p.text.trim())?.text;
               if (Array.isArray(entry.meanings)) {
                 for (const m of entry.meanings.slice(0, 3)) {
-                  const firstDef = m.definitions?.[0];
+                  const defs = Array.isArray(m.definitions) ? m.definitions : [];
+                  const firstDef = defs[0];
+                  const collectedExamples = defs
+                    .map((d) => (typeof d.example === 'string' ? d.example.trim() : ''))
+                    .filter(Boolean)
+                    .slice(0, 2);
+                  for (const ex of collectedExamples) {
+                    if (!usageExamples.includes(ex) && usageExamples.length < 3) {
+                      usageExamples.push(ex);
+                    }
+                  }
                   if (firstDef?.definition) {
                     meanings.push({
                       partOfSpeech: m.partOfSpeech || 'term',
                       definition: firstDef.definition,
-                      example: firstDef.example,
+                      example: collectedExamples[0],
+                      examples: collectedExamples.length > 0 ? collectedExamples : undefined,
                       synonyms: Array.isArray(m.synonyms) ? m.synonyms.slice(0, 4) : undefined,
                     });
                   }
@@ -1930,7 +2153,6 @@ Follow these strict fidelity rules:
         }
       }
 
-      // 2. Wikipedia REST Summary for technical terms / multi-word phrases if dictionary had no match
       if (meanings.length === 0 && lookupWord.length <= 64) {
         try {
           const wikiSlug = lookupWord.replace(/\s+/g, '_');
@@ -1956,19 +2178,35 @@ Follow these strict fidelity rules:
             }
           }
         } catch {
-          // proceed with translation-only result
+          // proceed
         }
       }
 
-      return res.json({
+      if (
+        meanings.length === 0 &&
+        !summary &&
+        !englishEquivalent &&
+        !targetEquivalent &&
+        geminiErrorMessage
+      ) {
+        return res.status(502).json({ error: geminiErrorMessage });
+      }
+
+      const fallbackPayload = {
         term: cleanTerm,
         phonetic,
         englishEquivalent,
         targetEquivalent,
         meanings,
+        usageExamples: usageExamples.length > 0 ? usageExamples : undefined,
         summary,
         source,
-      });
+        grounded: false,
+      };
+      if (meanings.length > 0 || summary) {
+        storeInDictCache(fallbackPayload);
+      }
+      return res.json(fallbackPayload);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Dictionary lookup failed.';
       return res.status(502).json({ error: message });
@@ -2065,44 +2303,284 @@ Follow these strict fidelity rules:
     throw new Error('Too many redirects while fetching external book resource.');
   };
 
-  const CATEGORY_KEYWORDS: Record<string, { iaSubject: string; olSubject: string; gutenTopic: string; queryHint: string }> = {
-    all: { iaSubject: '', olSubject: '', gutenTopic: '', queryHint: '' },
-    programming: {
-      iaSubject: 'programming OR computer OR software OR python',
-      olSubject: 'programming',
-      gutenTopic: 'computer',
-      queryHint: 'programming software',
+  interface CategoryQueryConfig {
+    iaSubject: string;
+    olQuery: string;
+    olSubject?: string;
+    gutenTopic: string;
+    queryHint: string;
+    includeArxiv?: boolean;
+  }
+
+  const CATEGORY_KEYWORDS: Record<string, CategoryQueryConfig> = {
+    all: {
+      iaSubject: '',
+      olQuery: 'classic literature science history',
+      gutenTopic: '',
+      queryHint: '',
+      includeArxiv: true,
     },
-    business: {
-      iaSubject: 'business OR economics OR management OR finance',
+    adventure_thrillers: {
+      iaSubject: 'adventure OR thriller OR suspense OR expedition OR survival',
+      olQuery: 'adventure thriller action novel',
+      olSubject: 'adventure',
+      gutenTopic: 'adventure',
+      queryHint: 'adventure thriller',
+    },
+    arts_cinema_photography: {
+      iaSubject: 'art OR painting OR cinema OR photography OR architecture OR sculpture',
+      olQuery: 'art cinema photography painting',
+      olSubject: 'art',
+      gutenTopic: 'art',
+      queryHint: 'art photography cinema',
+    },
+    life_stories_memoirs: {
+      iaSubject: 'biography OR autobiography OR memoir OR diaries OR letters',
+      olQuery: 'autobiography memoir biography',
+      olSubject: 'biography',
+      gutenTopic: 'biography',
+      queryHint: 'autobiography memoir biography',
+    },
+    business_finance: {
+      iaSubject: 'business OR finance OR economics OR management OR investing OR accounting',
+      olQuery: 'business finance economics management',
       olSubject: 'business',
       gutenTopic: 'economics',
-      queryHint: 'business economics',
+      queryHint: 'business finance economics',
+      includeArxiv: true,
     },
-    science: {
-      iaSubject: 'science OR physics OR biology OR mathematics',
-      olSubject: 'science',
-      gutenTopic: 'science',
-      queryHint: 'science physics',
+    kids_books: {
+      iaSubject: 'children OR juvenile OR "fairy tales" OR fables OR "children stories"',
+      olQuery: 'children stories fairy tales illustrated',
+      olSubject: 'children',
+      gutenTopic: 'children',
+      queryHint: 'children fairy tales stories',
     },
-    history: {
-      iaSubject: 'history OR biography OR civilization',
-      olSubject: 'history',
-      gutenTopic: 'history',
-      queryHint: 'history',
+    graphic_novels_manga: {
+      iaSubject: 'comics OR "graphic novels" OR manga OR caricature OR "comic books" OR cartoon',
+      olQuery: 'comics graphic novel manga cartoon illustrated',
+      gutenTopic: 'illustrated',
+      queryHint: 'comics graphic novel manga',
     },
-    fiction: {
-      iaSubject: 'fiction OR novel OR literature OR stories',
-      olSubject: 'fiction',
-      gutenTopic: 'fiction',
-      queryHint: 'classic fiction',
+    computers_digital_tech: {
+      iaSubject: 'computer OR programming OR software OR algorithms OR python OR computing OR digital',
+      olQuery: 'computer science programming software',
+      olSubject: 'programming',
+      gutenTopic: 'computer',
+      queryHint: 'computer programming software',
+      includeArxiv: true,
     },
-    self_help: {
-      iaSubject: 'self-help OR philosophy OR psychology OR productivity',
+    hobbies_crafts_home: {
+      iaSubject: 'crafts OR gardening OR cookery OR cooking OR woodworking OR sewing OR hobbies OR handicraft',
+      olQuery: 'crafts gardening cooking woodworking home',
+      gutenTopic: 'cookery',
+      queryHint: 'crafts cooking gardening hobbies',
+    },
+    mystery_crime_suspense: {
+      iaSubject: 'mystery OR detective OR crime OR suspense OR murder OR thriller',
+      olQuery: 'detective mystery crime suspense',
+      olSubject: 'mystery',
+      gutenTopic: 'detective',
+      queryHint: 'mystery detective crime',
+    },
+    engineering: {
+      iaSubject: 'engineering OR mechanical OR electrical OR civil OR electronics OR thermodynamics',
+      olQuery: 'engineering mechanical electrical civil textbook',
+      olSubject: 'engineering',
+      gutenTopic: 'engineering',
+      queryHint: 'engineering mechanics electrical',
+      includeArxiv: true,
+    },
+    exam_preparation: {
+      iaSubject: 'examination OR "study guide" OR "test preparation" OR aptitude OR competitive OR "entrance exam" OR workbook',
+      olQuery: 'exam preparation study guide practice test textbook',
+      gutenTopic: 'education',
+      queryHint: 'exam preparation study guide',
+      includeArxiv: true,
+    },
+    scifi_fantasy: {
+      iaSubject: '"science fiction" OR fantasy OR futuristic OR space OR mythology OR "speculative fiction"',
+      olQuery: 'science fiction fantasy space novel',
+      olSubject: 'science_fiction',
+      gutenTopic: 'science fiction',
+      queryHint: 'science fiction fantasy',
+    },
+    health_wellness: {
+      iaSubject: 'health OR nutrition OR hygiene OR wellness OR yoga OR diet OR "mental health"',
+      olQuery: 'health wellness nutrition yoga fitness',
+      olSubject: 'health',
+      gutenTopic: 'health',
+      queryHint: 'health wellness nutrition',
+    },
+    family_personal_dev: {
+      iaSubject: '"self-help" OR "personal development" OR philosophy OR psychology OR parenting OR family OR success OR ethics',
+      olQuery: 'self improvement personal development philosophy family',
       olSubject: 'psychology',
       gutenTopic: 'philosophy',
-      queryHint: 'philosophy psychology',
+      queryHint: 'personal development philosophy family',
     },
+    historical_fiction: {
+      iaSubject: '"historical fiction" OR "history fiction" OR war OR renaissance OR medieval',
+      olQuery: 'historical fiction novel classic',
+      olSubject: 'historical_fiction',
+      gutenTopic: 'historical fiction',
+      queryHint: 'historical fiction novel',
+    },
+    world_history: {
+      iaSubject: '"world history" OR history OR civilization OR ancient OR empire OR chronicles',
+      olQuery: 'world history civilization ancient modern',
+      olSubject: 'history',
+      gutenTopic: 'history',
+      queryHint: 'world history civilization',
+    },
+    humor_satire: {
+      iaSubject: 'humor OR humour OR satire OR comedy OR wit OR parody',
+      olQuery: 'humor satire comedy wit stories',
+      olSubject: 'humor',
+      gutenTopic: 'humor',
+      queryHint: 'humor satire comedy',
+    },
+    languages_writing: {
+      iaSubject: 'grammar OR linguistics OR writing OR rhetoric OR dictionary OR composition OR language',
+      olQuery: 'language grammar writing skills linguistics',
+      olSubject: 'language',
+      gutenTopic: 'language',
+      queryHint: 'grammar writing linguistics language',
+    },
+    legal_studies: {
+      iaSubject: 'law OR legal OR constitution OR jurisprudence OR statutes OR judiciary',
+      olQuery: 'law legal studies constitution jurisprudence',
+      olSubject: 'law',
+      gutenTopic: 'law',
+      queryHint: 'law constitution legal studies',
+    },
+    contemporary_literature: {
+      iaSubject: 'literature OR novel OR fiction OR "short stories" OR anthology OR essays',
+      olQuery: 'literature novel modern fiction stories',
+      olSubject: 'literature',
+      gutenTopic: 'fiction',
+      queryHint: 'literature novel fiction',
+    },
+    world_maps_atlases: {
+      iaSubject: 'atlas OR maps OR cartography OR geography OR gazetteer OR topography',
+      olQuery: 'world atlas maps geography cartography',
+      olSubject: 'geography',
+      gutenTopic: 'geography',
+      queryHint: 'world atlas maps geography',
+    },
+    medical_textbooks: {
+      iaSubject: 'medicine OR anatomy OR physiology OR pharmacology OR surgery OR pathology OR medical',
+      olQuery: 'medical textbook anatomy physiology medicine',
+      olSubject: 'medicine',
+      gutenTopic: 'medicine',
+      queryHint: 'medical textbook anatomy physiology',
+      includeArxiv: true,
+    },
+    political_studies: {
+      iaSubject: 'politics OR "political science" OR government OR democracy OR diplomacy OR statecraft',
+      olQuery: 'political science government democracy politics',
+      olSubject: 'politics',
+      gutenTopic: 'politics',
+      queryHint: 'political science government',
+    },
+    reference_research: {
+      iaSubject: 'encyclopedia OR handbook OR reference OR research OR compendium OR manual',
+      olQuery: 'encyclopedia handbook reference research guide',
+      olSubject: 'reference',
+      gutenTopic: 'reference',
+      queryHint: 'encyclopedia reference research handbook',
+      includeArxiv: true,
+    },
+    spirituality_religion: {
+      iaSubject: 'religion OR spirituality OR theology OR scripture OR meditation OR mysticism OR ethics',
+      olQuery: 'spirituality religion philosophy scripture',
+      olSubject: 'religion',
+      gutenTopic: 'religion',
+      queryHint: 'spirituality religion theology',
+    },
+    romantic_fiction: {
+      iaSubject: 'romance OR "love stories" OR romantic OR regency OR courtship',
+      olQuery: 'romance love story romantic novel',
+      olSubject: 'romance',
+      gutenTopic: 'romance',
+      queryHint: 'romance love novel',
+    },
+    school_textbooks: {
+      iaSubject: 'textbook OR "school books" OR reader OR elementary OR secondary OR arithmetic OR curriculum',
+      olQuery: 'school textbook elementary secondary reader',
+      olSubject: 'education',
+      gutenTopic: 'education',
+      queryHint: 'school textbook education',
+    },
+    science_math_textbooks: {
+      iaSubject: 'mathematics OR calculus OR algebra OR geometry OR physics OR chemistry OR textbook',
+      olQuery: 'mathematics calculus physics chemistry textbook',
+      olSubject: 'mathematics',
+      gutenTopic: 'mathematics',
+      queryHint: 'mathematics physics chemistry textbook',
+      includeArxiv: true,
+    },
+    science_tech_medicine: {
+      iaSubject: 'science OR astronomy OR biology OR technology OR medicine OR evolution OR nature',
+      olQuery: 'science technology medicine biology astronomy',
+      olSubject: 'science',
+      gutenTopic: 'science',
+      queryHint: 'science technology medicine',
+      includeArxiv: true,
+    },
+    social_sciences: {
+      iaSubject: 'sociology OR anthropology OR psychology OR "social science" OR culture OR education',
+      olQuery: 'sociology anthropology psychology social sciences',
+      olSubject: 'sociology',
+      gutenTopic: 'sociology',
+      queryHint: 'sociology anthropology psychology',
+      includeArxiv: true,
+    },
+    sports_fitness: {
+      iaSubject: 'sports OR athletics OR fitness OR exercise OR gymnastics OR chess OR boxing OR outdoor',
+      olQuery: 'sports fitness athletics exercise training',
+      olSubject: 'sports',
+      gutenTopic: 'sports',
+      queryHint: 'sports fitness athletics exercise',
+    },
+    college_university_textbooks: {
+      iaSubject: '"university textbook" OR college OR lectures OR monograph OR "higher education" OR course',
+      olQuery: 'university college textbook lectures course',
+      gutenTopic: 'science',
+      queryHint: 'university college textbook lectures',
+      includeArxiv: true,
+    },
+    young_adult_reads: {
+      iaSubject: '"young adult" OR youth OR teen OR "juvenile fiction" OR "coming of age"',
+      olQuery: 'young adult adventure coming of age novel',
+      olSubject: 'young_adult',
+      gutenTopic: 'juvenile',
+      queryHint: 'young adult fiction adventure',
+    },
+    study_guides_textbooks: {
+      iaSubject: '"study guide" OR textbook OR manual OR handbook OR outline OR primer OR tutorial',
+      olQuery: 'study guide textbook manual outline primer',
+      gutenTopic: 'education',
+      queryHint: 'study guide textbook manual',
+      includeArxiv: true,
+    },
+    travel_guides: {
+      iaSubject: 'travel OR voyage OR "guidebook" OR exploration OR description OR "travel guide"',
+      olQuery: 'travel guide voyage exploration guidebook',
+      olSubject: 'travel',
+      gutenTopic: 'travel',
+      queryHint: 'travel guide voyage exploration',
+    },
+  };
+
+  // Backwards-compatible aliases if any client passes older category keys
+  const LEGACY_CATEGORY_ALIASES: Record<string, string> = {
+    programming: 'computers_digital_tech',
+    business: 'business_finance',
+    science: 'science_tech_medicine',
+    history: 'world_history',
+    fiction: 'contemporary_literature',
+    self_help: 'family_personal_dev',
   };
 
   const LANG_TO_IA: Record<string, string> = {
@@ -2200,10 +2678,9 @@ Follow these strict fidelity rules:
   app.get('/api/books/search', async (req, res) => {
     try {
       const rawQuery = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 140) : '';
-      const category =
-        typeof req.query.category === 'string' && CATEGORY_KEYWORDS[req.query.category]
-          ? req.query.category
-          : 'all';
+      const rawCategoryParam = typeof req.query.category === 'string' ? req.query.category.trim() : 'all';
+      const normalizedCategory = LEGACY_CATEGORY_ALIASES[rawCategoryParam] ?? rawCategoryParam;
+      const category = CATEGORY_KEYWORDS[normalizedCategory] ? normalizedCategory : 'all';
       const lang =
         typeof req.query.lang === 'string' && /^[a-z]{2,3}$/i.test(req.query.lang)
           ? req.query.lang.toLowerCase()
@@ -2231,7 +2708,7 @@ Follow these strict fidelity rules:
       }
 
       const catCfg = CATEGORY_KEYWORDS[category];
-      const effectiveQuery = rawQuery || catCfg.queryHint || 'classic literature science programming';
+      const effectiveQuery = rawQuery || catCfg.queryHint || 'classic literature science history';
 
       type SearchBookItem = {
         id: string;
@@ -2247,6 +2724,7 @@ Follow these strict fidelity rules:
         subjects: string[];
         description?: string;
         coverUrl?: string;
+        fallbackCoverUrl?: string;
         pdfUrl?: string;
         textUrl?: string;
         epubUrl?: string;
@@ -2295,20 +2773,30 @@ Follow these strict fidelity rules:
         }
       };
 
-      // 1. Internet Archive Broad Open-Access Search (excludes borrow-only inlibrary/printdisabled so EVERY PDF is open & downloadable!)
+      // 1. Internet Archive Broad Open-Access Full-Book Search (excludes borrow-only inlibrary/printdisabled so EVERY PDF is open & downloadable!)
       const queryInternetArchive = async (): Promise<SearchBookItem[]> => {
-        const safeTerm = effectiveQuery.replace(/[()":\\]/g, ' ').trim();
+        const safeUserQuery = rawQuery.replace(/[()":\\]/g, ' ').trim();
+        const safeHint = (catCfg.queryHint || '').replace(/[()":\\]/g, ' ').trim();
         const clauses: string[] = [
           'mediatype:texts',
           '(format:"Text PDF" OR format:"PDF" OR format:"Additional Text PDF")',
           '-collection:inlibrary',
           '-collection:printdisabled',
         ];
-        if (safeTerm) {
-          clauses.push(`(title:(${safeTerm}) OR creator:(${safeTerm}) OR subject:(${safeTerm}))`);
-        }
-        if (catCfg.iaSubject) {
-          clauses.push(`subject:(${catCfg.iaSubject})`);
+        if (safeUserQuery) {
+          clauses.push(`(title:(${safeUserQuery}) OR creator:(${safeUserQuery}) OR subject:(${safeUserQuery}))`);
+          if (catCfg.iaSubject) {
+            clauses.push(`subject:(${catCfg.iaSubject})`);
+          }
+        } else if (catCfg.iaSubject) {
+          // Single rich disjunction so specialized categories (exam prep, manga, atlases, textbooks) always return abundant full books
+          clauses.push(
+            safeHint
+              ? `(subject:(${catCfg.iaSubject}) OR title:(${safeHint}))`
+              : `subject:(${catCfg.iaSubject})`
+          );
+        } else {
+          clauses.push('(subject:(literature OR science OR history OR philosophy OR biography))');
         }
         if (lang !== 'all' && LANG_TO_IA[lang]) {
           clauses.push(`language:${LANG_TO_IA[lang]}`);
@@ -2340,7 +2828,7 @@ Follow these strict fidelity rules:
         params.append('fl[]', 'subject');
         params.append('fl[]', 'description');
         params.append('sort[]', iaSort);
-        params.set('rows', '16');
+        params.set('rows', '22');
         params.set('page', String(pageNum));
         params.set('output', 'json');
 
@@ -2403,13 +2891,13 @@ Follow these strict fidelity rules:
         return items;
       };
 
-      // 2. Open Library Fast Single-Request Search (~750ms instead of 22s!)
+      // 2. Open Library Fast Single-Request Search with Real Covers + Archive Cover Fallback
       const queryOpenLibrary = async (): Promise<SearchBookItem[]> => {
-        const baseQuery = rawQuery || catCfg.queryHint || 'programming';
+        const baseQuery = rawQuery || catCfg.olQuery || catCfg.queryHint || 'classic literature';
         const params = new URLSearchParams();
         params.set('q', baseQuery);
         params.set('has_fulltext', 'true');
-        if (catCfg.olSubject) {
+        if (rawQuery && catCfg.olSubject) {
           params.set('subject', catCfg.olSubject);
         }
         if (lang !== 'all' && LANG_TO_IA[lang]) {
@@ -2418,7 +2906,7 @@ Follow these strict fidelity rules:
         if (sort === 'rating') params.set('sort', 'rating');
         else if (sort === 'latest') params.set('sort', 'new');
         else if (sort === 'oldest') params.set('sort', 'old');
-        params.set('limit', '28');
+        params.set('limit', '36');
         params.set('page', String(pageNum));
         params.set(
           'fields',
@@ -2453,9 +2941,11 @@ Follow these strict fidelity rules:
             d.ebook_access === 'public' && Array.isArray(d.ia) && d.ia.length > 0;
           if (!isPublicIa) continue;
           const iaId = d.ia![0];
+          const archiveCover = `https://archive.org/services/img/${encodeURIComponent(iaId)}`;
           const coverUrl = d.cover_i
-            ? `https://covers.openlibrary.org/b/id/${d.cover_i}-L.jpg`
-            : `https://archive.org/services/img/${encodeURIComponent(iaId)}`;
+            ? `https://covers.openlibrary.org/b/id/${d.cover_i}-L.jpg?default=false`
+            : archiveCover;
+          const fallbackCoverUrl = d.cover_i ? archiveCover : undefined;
 
           items.push({
             id: `ol:${d.key}`,
@@ -2477,12 +2967,13 @@ Follow these strict fidelity rules:
                 : undefined,
             subjects: Array.isArray(d.subject) ? d.subject.slice(0, 5) : [],
             coverUrl,
+            fallbackCoverUrl,
             pdfUrl: `https://archive.org/download/${encodeURIComponent(iaId)}/${encodeURIComponent(iaId)}.pdf`,
             readOnlineUrl: `https://archive.org/details/${encodeURIComponent(iaId)}`,
             format: 'PDF',
             isbn: Array.isArray(d.isbn) ? d.isbn[0] : undefined,
           });
-          if (items.length >= 12) break;
+          if (items.length >= 16) break;
         }
 
         return items;
@@ -2529,7 +3020,9 @@ Follow these strict fidelity rules:
               formats['text/html'] ||
               formats['text/html; charset=utf-8'] ||
               `https://www.gutenberg.org/ebooks/${b.id}`;
-            const coverUrl = formats['image/jpeg'] || undefined;
+            const coverUrl =
+              formats['image/jpeg'] ||
+              `https://www.gutenberg.org/cache/epub/${b.id}/pg${b.id}.cover.medium.jpg`;
 
             const authorName =
               Array.isArray(b.authors) && b.authors.length > 0
@@ -2648,11 +3141,11 @@ Follow these strict fidelity rules:
         return direct.length > 0 ? [...direct, ...mirror.slice(0, 4)] : mirror;
       };
 
-      // 4. arXiv Open-Access Monographs, Textbooks & Latest Research PDFs (2010-2026, ~900ms, guaranteed direct PDF!)
+      // 4. arXiv Open-Access Monographs, Textbooks & Latest Research PDFs (academic/STEM/textbook categories or direct query)
       const queryArxiv = async (): Promise<SearchBookItem[]> => {
         if (lang !== 'all' && lang !== 'en') return [];
         if (format === 'text') return [];
-        if (!rawQuery && !['all', 'programming', 'science', 'business'].includes(category)) {
+        if (!rawQuery && !catCfg.includeArxiv) {
           return [];
         }
         const arxivQuery = rawQuery || catCfg.queryHint || 'computer science physics textbook';
@@ -2802,10 +3295,10 @@ Follow these strict fidelity rules:
           if (Math.abs(diff) > 2) return diff;
           return (b.downloads ?? 0) - (a.downloads ?? 0);
         }
-        return (b.downloads ?? 0) - (a.downloads ?? 0);
+        return (b.downloads ?? 0) + (b.coverUrl ? 1200 : 0) - ((a.downloads ?? 0) + (a.coverUrl ? 1200 : 0));
       });
 
-      const slice = combined.slice(0, 32);
+      const slice = combined.slice(0, 36);
 
       const responsePayload = {
         query: rawQuery,

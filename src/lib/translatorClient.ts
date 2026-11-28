@@ -915,13 +915,14 @@ export function downloadBlob(blob: Blob, fileName: string): void {
 export async function lookupDictionaryTerm(
   term: string,
   targetLang: LanguageCode,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  context?: string
 ): Promise<DictionaryLookupResult> {
   return await postJsonWithAutoRetry<DictionaryLookupResult>(
     '/api/dictionary',
-    { term, targetLang },
+    { term, targetLang, context },
     {
-      timeoutMs: 14000,
+      timeoutMs: 18000,
       maxAttempts: 2,
       signal,
     }
