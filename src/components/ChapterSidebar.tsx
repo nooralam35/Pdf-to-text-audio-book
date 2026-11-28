@@ -46,7 +46,7 @@ interface ChapterSidebarProps {
   fallbackWordsPerPage?: number;
 }
 
-export const ChapterSidebar: React.FC<ChapterSidebarProps> = ({
+const ChapterSidebarInner: React.FC<ChapterSidebarProps> = ({
   bookTitle,
   numPages,
   chapters,
@@ -422,4 +422,6 @@ export const ChapterSidebar: React.FC<ChapterSidebarProps> = ({
     </aside>
   );
 };
+
+export const ChapterSidebar = React.memo(ChapterSidebarInner);
 

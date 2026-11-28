@@ -84,10 +84,12 @@ function safeExternalUrl(url?: string): string | undefined {
   return undefined;
 }
 
+const EMPTY_SAVED_BOOKS: StoredBook[] = [];
+
 const BookCoverFrame: React.FC<{
   book: DiscoveredBook;
   size?: 'card' | 'modal';
-}> = ({ book, size = 'card' }) => {
+}> = React.memo(({ book, size = 'card' }) => {
   const [imgFailed, setImgFailed] = useState(false);
 
   useEffect(() => {
@@ -129,11 +131,11 @@ const BookCoverFrame: React.FC<{
       </div>
     </div>
   );
-};
+});
 
-export const DiscoverView: React.FC<DiscoverViewProps> = ({
+const DiscoverViewInner: React.FC<DiscoverViewProps> = ({
   targetLang,
-  savedBooks = [],
+  savedBooks = EMPTY_SAVED_BOOKS,
   onActionBook,
   loadingBookAction,
   onUploadPdf,
@@ -1057,3 +1059,5 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
     </main>
   );
 };
+
+export const DiscoverView = React.memo(DiscoverViewInner);

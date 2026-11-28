@@ -47,6 +47,7 @@ import {
   type ChapterReadingEstimate,
   type ReadingSpeedSnapshot,
 } from '../lib/readingSpeed';
+import { startPerfSpan } from '../lib/perfMonitor';
 import { lookupDictionaryTerm } from '../lib/translatorClient';
 import type {
   ChapterItem,
@@ -236,7 +237,437 @@ function computeBlockSelectionOffsets(
   };
 }
 
-export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
+interface IndexedSearchRange {
+  start: number;
+  end: number;
+  pageMatchIdx: number;
+}
+
+const EMPTY_HIGHLIGHTS: TextHighlight[] = [];
+const EMPTY_SEARCH_RANGES: IndexedSearchRange[] = [];
+const EMPTY_SENTENCE_SPANS: SentenceSpan[] = [];
+const EMPTY_CHAPTERS: ChapterItem[] = [];
+const EMPTY_TRANSLATIONS: TranslatedPageRecord[] = [];
+
+function renderPlainSearchMarks(
+  text: string,
+  ranges: IndexedSearchRange[],
+  source: 'translated' | 'original',
+  focusedPageMatchIdx: number | null
+): React.ReactNode {
+  if (!ranges || ranges.length === 0 || !text) return text;
+  const nodes: React.ReactNode[] = [];
+  let cursor = 0;
+  for (const r of ranges) {
+    const start = Math.max(cursor, Math.min(r.start, text.length));
+    const end = Math.max(start, Math.min(r.end, text.length));
+    if (start > cursor) {
+      nodes.push(<React.Fragment key={`pt-${cursor}`}>{text.slice(cursor, start)}</React.Fragment>);
+    }
+    if (end > start) {
+      const isCurrentFocused =
+        focusedPageMatchIdx !== null && focusedPageMatchIdx === r.pageMatchIdx;
+      nodes.push(
+        <mark
+          key={`ps-${source}-${r.pageMatchIdx}-${start}`}
+          data-search-match="true"
+          data-search-source={source}
+          data-search-page-idx={r.pageMatchIdx}
+          className={
+            isCurrentFocused
+              ? 'bg-orange-400/95 dark:bg-orange-500/85 text-stone-950 dark:text-white ring-2 ring-orange-500/75 dark:ring-orange-300/80 rounded-[2px] px-[1px] font-medium'
+              : 'bg-yellow-300/90 dark:bg-yellow-500/45 text-stone-950 dark:text-yellow-50 rounded-[2px] px-[1px]'
+          }
+        >
+          {text.slice(start, end)}
+        </mark>
+      );
+    }
+    cursor = end;
+  }
+  if (cursor < text.length) {
+    nodes.push(<React.Fragment key={`pt-end-${cursor}`}>{text.slice(cursor)}</React.Fragment>);
+  }
+  return nodes;
+}
+
+function renderInterleavedHighlightSlice(
+  text: string,
+  baseOffset: number,
+  blockHighlights: TextHighlight[],
+  blockSearchRanges: IndexedSearchRange[],
+  focusedTranslatedMatchIdx: number | null,
+  onOpenHighlightPopover: (hl: TextHighlight, anchorEl: HTMLElement) => void
+): React.ReactNode {
+  if (text.length === 0) return text;
+
+  const sliceEnd = baseOffset + text.length;
+  const overlappingHighlights = blockHighlights.filter(
+    (h) => h.endOffset > baseOffset && h.startOffset < sliceEnd
+  );
+  const overlappingSearch = blockSearchRanges.filter(
+    (r) => r.end > baseOffset && r.start < sliceEnd
+  );
+
+  if (overlappingHighlights.length === 0 && overlappingSearch.length === 0) {
+    return text;
+  }
+
+  const cutPoints = new Set<number>([baseOffset, sliceEnd]);
+  for (const hl of overlappingHighlights) {
+    cutPoints.add(Math.max(baseOffset, hl.startOffset));
+    cutPoints.add(Math.min(sliceEnd, hl.endOffset));
+  }
+  for (const sr of overlappingSearch) {
+    cutPoints.add(Math.max(baseOffset, sr.start));
+    cutPoints.add(Math.min(sliceEnd, sr.end));
+  }
+  const sortedPoints = Array.from(cutPoints).sort((a, b) => a - b);
+
+  const nodes: React.ReactNode[] = [];
+  for (let i = 0; i < sortedPoints.length - 1; i++) {
+    const segStart = sortedPoints[i];
+    const segEnd = sortedPoints[i + 1];
+    if (segEnd <= segStart) continue;
+
+    const segmentText = text.slice(segStart - baseOffset, segEnd - baseOffset);
+
+    let covering: TextHighlight | null = null;
+    for (const hl of overlappingHighlights) {
+      if (hl.startOffset <= segStart && hl.endOffset >= segEnd) {
+        if (!covering || hl.updatedAt >= covering.updatedAt) {
+          covering = hl;
+        }
+      }
+    }
+
+    let coveringSearch: IndexedSearchRange | null = null;
+    for (const sr of overlappingSearch) {
+      if (sr.start <= segStart && sr.end >= segEnd) {
+        coveringSearch = sr;
+        break;
+      }
+    }
+
+    let innerNode: React.ReactNode = segmentText;
+    if (coveringSearch) {
+      const isCurrentFocused =
+        focusedTranslatedMatchIdx !== null &&
+        focusedTranslatedMatchIdx === coveringSearch.pageMatchIdx;
+      innerNode = (
+        <mark
+          key={`sm-${coveringSearch.pageMatchIdx}-${segStart}`}
+          data-search-match="true"
+          data-search-source="translated"
+          data-search-page-idx={coveringSearch.pageMatchIdx}
+          className={
+            isCurrentFocused
+              ? 'bg-orange-400/95 dark:bg-orange-500/85 text-stone-950 dark:text-white ring-2 ring-orange-500/75 dark:ring-orange-300/80 rounded-[2px] px-[0.5px] font-medium'
+              : 'bg-yellow-300/90 dark:bg-yellow-500/45 text-stone-950 dark:text-yellow-50 rounded-[2px] px-[0.5px]'
+          }
+        >
+          {segmentText}
+        </mark>
+      );
+    }
+
+    if (!covering) {
+      nodes.push(<React.Fragment key={`t-${segStart}`}>{innerNode}</React.Fragment>);
+    } else {
+      const hl = covering;
+      const style = HIGHLIGHT_STYLE_MAP[hl.color] ?? HIGHLIGHT_STYLE_MAP.amber;
+      const hasNote = Boolean(hl.note && hl.note.trim());
+      nodes.push(
+        <mark
+          key={`m-${hl.id}-${segStart}`}
+          data-highlight-id={hl.id}
+          onClick={(e) => {
+            const sel = window.getSelection();
+            if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) {
+              return;
+            }
+            e.stopPropagation();
+            onOpenHighlightPopover(hl, e.currentTarget);
+          }}
+          title={
+            hasNote
+              ? `Note: ${hl.note} (click to edit or look up)`
+              : 'Highlighted segment (click to add note, change color, or define)'
+          }
+          className={`${style.markClass} rounded-[2px] px-[1px] transition-colors cursor-pointer ${
+            hasNote
+              ? 'underline decoration-dotted decoration-amber-800/75 dark:decoration-amber-300/80 underline-offset-4'
+              : ''
+          }`}
+        >
+          {innerNode}
+        </mark>
+      );
+    }
+  }
+
+  return nodes;
+}
+
+const ReaderFigureItem = React.memo<{ figure: ExtractedFigure; pageNumber: number }>(
+  ({ figure, pageNumber }) => (
+    <figure className="my-6 rounded-md border border-stone-200 dark:border-stone-800 bg-white dark:bg-[#191816] p-3">
+      <img
+        src={figure.dataUrl}
+        alt={`Original book figure from page ${pageNumber}`}
+        className="w-full h-auto max-h-[420px] object-contain mx-auto rounded-sm bg-white"
+      />
+      <figcaption
+        dir="ltr"
+        className="mt-2 flex items-center justify-between text-[11px] text-stone-500 dark:text-stone-400"
+      >
+        <span className="inline-flex items-center gap-1">
+          <ImageIcon className="w-3 h-3" />
+          Original illustration preserved from Page {pageNumber}
+        </span>
+      </figcaption>
+    </figure>
+  )
+);
+
+interface ReaderBlockItemProps {
+  block: TranslatedBlock;
+  spans: SentenceSpan[];
+  blockHighlights: TextHighlight[];
+  blockSearchRanges: IndexedSearchRange[];
+  originalSearchRanges: IndexedSearchRange[];
+  activeSentenceIndexInBlock: number | null;
+  focusedTranslatedMatchIdx: number | null;
+  focusedOriginalMatchIdx: number | null;
+  isEditing: boolean;
+  editDraft: string;
+  readerFontSize: number;
+  readerLineHeight: number;
+  showOriginalRef: boolean;
+  langRtl: boolean;
+  sourceRtl: boolean;
+  sourceCssClass: string;
+  activeSentenceRef: React.MutableRefObject<HTMLSpanElement | null>;
+  onStartEdit: (block: TranslatedBlock) => void;
+  onCancelEdit: () => void;
+  onEditDraftChange: (val: string) => void;
+  onCommitEdit: () => void;
+  onSentenceClick: (sentenceIndex: number) => void;
+  onOpenHighlightPopover: (hl: TextHighlight, anchorEl: HTMLElement) => void;
+}
+
+const ReaderBlockItem = React.memo<ReaderBlockItemProps>(
+  ({
+    block,
+    spans,
+    blockHighlights,
+    blockSearchRanges,
+    originalSearchRanges,
+    activeSentenceIndexInBlock,
+    focusedTranslatedMatchIdx,
+    focusedOriginalMatchIdx,
+    isEditing,
+    editDraft,
+    readerFontSize,
+    readerLineHeight,
+    showOriginalRef,
+    langRtl,
+    sourceRtl,
+    sourceCssClass,
+    activeSentenceRef,
+    onStartEdit,
+    onCancelEdit,
+    onEditDraftChange,
+    onCommitEdit,
+    onSentenceClick,
+    onOpenHighlightPopover,
+  }) => {
+    const textVal = block.translatedText || block.text;
+
+    if (isEditing) {
+      return (
+        <div className="p-3.5 rounded-md border border-amber-700/50 dark:border-amber-500/50 bg-white dark:bg-[#191816] space-y-2.5">
+          <textarea
+            value={editDraft}
+            onChange={(e) => onEditDraftChange(e.target.value)}
+            rows={Math.max(3, Math.ceil(editDraft.length / 70))}
+            className="w-full text-[15px] leading-relaxed bg-transparent text-stone-900 dark:text-stone-100 focus:outline-none resize-y"
+          />
+          <div dir="ltr" className="flex items-center justify-end gap-2">
+            <button
+              type="button"
+              onClick={onCancelEdit}
+              className="inline-flex items-center gap-1 h-8 px-3 rounded text-xs font-medium text-stone-600 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer"
+            >
+              <X className="w-3.5 h-3.5" />
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={onCommitEdit}
+              className="inline-flex items-center gap-1 h-8 px-3 rounded text-xs font-medium bg-stone-900 text-white dark:bg-stone-100 dark:text-stone-950 cursor-pointer"
+            >
+              <Check className="w-3.5 h-3.5" />
+              Save Edit
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    const renderedSentences =
+      spans.length === 0 ? (
+        <span>
+          {renderInterleavedHighlightSlice(
+            textVal,
+            0,
+            blockHighlights,
+            blockSearchRanges,
+            focusedTranslatedMatchIdx,
+            onOpenHighlightPopover
+          )}
+        </span>
+      ) : (
+        (() => {
+          let cursor = 0;
+          return spans.map((span, idx) => {
+            const spanStart = cursor;
+            const spanEnd = spanStart + span.text.length;
+            cursor = spanEnd + (idx < spans.length - 1 ? 1 : 0);
+
+            const isActive = activeSentenceIndexInBlock === span.globalIndex;
+            const spaceSep =
+              idx < spans.length - 1
+                ? renderInterleavedHighlightSlice(
+                    ' ',
+                    spanEnd,
+                    blockHighlights,
+                    blockSearchRanges,
+                    focusedTranslatedMatchIdx,
+                    onOpenHighlightPopover
+                  )
+                : null;
+
+            return (
+              <React.Fragment key={span.id}>
+                <span
+                  ref={isActive ? activeSentenceRef : null}
+                  onClick={() => {
+                    const sel = window.getSelection();
+                    if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) {
+                      return;
+                    }
+                    onSentenceClick(span.globalIndex);
+                  }}
+                  title="Click to read aloud · Drag to highlight, take notes, or define"
+                  className={`cursor-pointer rounded-sm transition-colors ${
+                    isActive
+                      ? 'bg-amber-200/85 dark:bg-amber-800/55 text-stone-950 dark:text-amber-50 px-0.5'
+                      : 'hover:bg-stone-200/60 dark:hover:bg-stone-800/70'
+                  }`}
+                >
+                  {renderInterleavedHighlightSlice(
+                    span.text,
+                    spanStart,
+                    blockHighlights,
+                    blockSearchRanges,
+                    focusedTranslatedMatchIdx,
+                    onOpenHighlightPopover
+                  )}
+                </span>
+                {spaceSep}
+              </React.Fragment>
+            );
+          });
+        })()
+      );
+
+    return (
+      <div className="group relative">
+        <button
+          type="button"
+          onClick={() => onStartEdit(block)}
+          title="Edit translated text"
+          className={`opacity-0 group-hover:opacity-100 focus:opacity-100 absolute top-0 ${
+            langRtl ? '-left-8' : '-right-8'
+          } p-1.5 rounded text-stone-400 hover:text-stone-900 dark:hover:text-stone-100 hover:bg-stone-200/70 dark:hover:bg-stone-800 transition-opacity cursor-pointer`}
+        >
+          <Edit3 className="w-3.5 h-3.5" />
+        </button>
+
+        {block.kind === 'heading' ? (
+          <h2
+            data-block-id={block.id}
+            className="font-display text-2xl sm:text-[26px] font-semibold tracking-tight leading-snug text-stone-950 dark:text-stone-50 pt-1 select-text"
+          >
+            {renderedSentences}
+          </h2>
+        ) : block.kind === 'subheading' ? (
+          <h3
+            data-block-id={block.id}
+            className="text-lg font-semibold leading-snug text-stone-900 dark:text-stone-100 pt-2 select-text"
+          >
+            {renderedSentences}
+          </h3>
+        ) : block.kind === 'callout' ? (
+          <div
+            data-block-id={block.id}
+            style={{
+              fontSize: `${Math.max(13, readerFontSize - 1)}px`,
+              lineHeight: readerLineHeight,
+            }}
+            className="p-4 rounded-md border border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#F4F1EA] sepia:bg-[#ECE2CA] dark:bg-[#1B1917] text-stone-800 sepia:text-[#3B2F23] dark:text-stone-200 select-text"
+          >
+            {renderedSentences}
+          </div>
+        ) : block.kind === 'bullet' ? (
+          <div
+            style={{
+              fontSize: `${readerFontSize}px`,
+              lineHeight: readerLineHeight,
+            }}
+            className="flex items-start gap-2.5 text-stone-800 sepia:text-[#3B2F23] dark:text-stone-200"
+          >
+            <span
+              aria-hidden="true"
+              className="mt-2.5 w-1.5 h-1.5 rounded-full bg-amber-700 dark:bg-amber-500 shrink-0"
+            />
+            <p data-block-id={block.id} className="flex-1 select-text">
+              {renderedSentences}
+            </p>
+          </div>
+        ) : (
+          <p
+            data-block-id={block.id}
+            style={{
+              fontSize: `${readerFontSize}px`,
+              lineHeight: readerLineHeight,
+            }}
+            className="text-stone-800 sepia:text-[#3B2F23] dark:text-stone-200 select-text"
+          >
+            {renderedSentences}
+          </p>
+        )}
+
+        {showOriginalRef && block.text !== textVal && (
+          <p
+            dir={sourceRtl ? 'rtl' : 'ltr'}
+            className={`mt-1.5 text-xs leading-relaxed text-stone-500 dark:text-stone-400 ${sourceCssClass}`}
+          >
+            {renderPlainSearchMarks(
+              block.text,
+              originalSearchRanges,
+              'original',
+              focusedOriginalMatchIdx
+            )}
+          </p>
+        )}
+      </div>
+    );
+  }
+);
+
+const TranslatedReaderPaneInner: React.FC<TranslatedReaderPaneProps> = ({
   pageNumber,
   numPages,
   parsedPage,
@@ -273,8 +704,8 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
   onResetReadingSpeed,
   bookId,
   pdf = null,
-  chapters = [],
-  bookTranslations = [],
+  chapters = EMPTY_CHAPTERS,
+  bookTranslations = EMPTY_TRANSLATIONS,
   onSelectPage,
 }) => {
   const [editingBlockId, setEditingBlockId] = useState<string | null>(null);
@@ -432,6 +863,12 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
     setIsSearchingBook(true);
 
     const timer = window.setTimeout(async () => {
+      const searchSpan = startPerfSpan(
+        'TranslatedReaderPane:search',
+        'task',
+        `"${trimmed.slice(0, 24)}" (${numPages}p)`,
+        200
+      );
       try {
         const result = await searchEntireBook({
           bookId,
@@ -451,6 +888,7 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
           },
         });
         if (controller.signal.aborted) return;
+        searchSpan.end(`${result.matches.length} hits`);
         setSearchMatches(result.matches);
         setSearchTruncated(result.truncated);
         setSearchProgress({
@@ -1157,237 +1595,139 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
     [openHighlightPopover]
   );
 
-  const startEdit = (block: TranslatedBlock) => {
-    closePopover();
-    setEditingBlockId(block.id);
-    setEditDraft(block.translatedText || block.text);
-  };
+  const startEdit = useCallback(
+    (block: TranslatedBlock) => {
+      closePopover();
+      setEditingBlockId(block.id);
+      setEditDraft(block.translatedText || block.text);
+    },
+    [closePopover]
+  );
 
-  const commitEdit = () => {
+  const cancelEdit = useCallback(() => {
+    setEditingBlockId(null);
+  }, []);
+
+  const commitEdit = useCallback(() => {
     if (editingBlockId && editDraft.trim()) {
       onUpdateBlockText(editingBlockId, editDraft.trim());
     }
     setEditingBlockId(null);
     setEditDraft('');
-  };
+  }, [editingBlockId, editDraft, onUpdateBlockText]);
 
-  // Render plain text with inline global-search highlights (used for original reference & untranslated previews)
-  const renderPlainSearchHighlights = (
-    text: string,
-    ranges: Array<{ start: number; end: number; pageMatchIdx: number }>,
-    source: 'translated' | 'original'
-  ): React.ReactNode => {
-    if (!ranges || ranges.length === 0 || !text) return text;
-    const nodes: React.ReactNode[] = [];
-    let cursor = 0;
-    for (const r of ranges) {
-      const start = Math.max(cursor, Math.min(r.start, text.length));
-      const end = Math.max(start, Math.min(r.end, text.length));
-      if (start > cursor) {
-        nodes.push(<React.Fragment key={`pt-${cursor}`}>{text.slice(cursor, start)}</React.Fragment>);
-      }
-      if (end > start) {
-        const isCurrentFocused =
-          Boolean(activeSearchMatch) &&
-          activeSearchMatch!.pageNumber === pageNumber &&
-          activeSearchMatch!.source === source &&
-          activeSearchMatch!.matchIndexOnPage === r.pageMatchIdx;
-        nodes.push(
-          <mark
-            key={`ps-${source}-${r.pageMatchIdx}-${start}`}
-            data-search-match="true"
-            data-search-source={source}
-            data-search-page-idx={r.pageMatchIdx}
-            className={
-              isCurrentFocused
-                ? 'bg-orange-400/95 dark:bg-orange-500/85 text-stone-950 dark:text-white ring-2 ring-orange-500/75 dark:ring-orange-300/80 rounded-[2px] px-[1px] font-medium'
-                : 'bg-yellow-300/90 dark:bg-yellow-500/45 text-stone-950 dark:text-yellow-50 rounded-[2px] px-[1px]'
-            }
-          >
-            {text.slice(start, end)}
-          </mark>
-        );
-      }
-      cursor = end;
-    }
-    if (cursor < text.length) {
-      nodes.push(<React.Fragment key={`pt-end-${cursor}`}>{text.slice(cursor)}</React.Fragment>);
-    }
-    return nodes;
-  };
+  const handleSentenceClick = useCallback(
+    (sentenceIndex: number) => {
+      setAutoScrollPausedByUser(false);
+      onClickSentence(sentenceIndex);
+    },
+    [onClickSentence]
+  );
 
-  // Render a text slice interleaved with both saved TextHighlights and active book-search matches
-  const renderHighlightedSlice = (
-    text: string,
-    baseOffset: number,
-    blockHighlights: TextHighlight[],
-    blockSearchRanges: Array<{ start: number; end: number; pageMatchIdx: number }> = []
-  ): React.ReactNode => {
-    if (text.length === 0) return text;
+  const handleOpenBlockHighlightPopover = useCallback(
+    (hl: TextHighlight, anchorEl: HTMLElement) => {
+      openHighlightPopover(hl, anchorEl);
+    },
+    [openHighlightPopover]
+  );
 
-    const sliceEnd = baseOffset + text.length;
-    const overlappingHighlights = blockHighlights.filter(
-      (h) => h.endOffset > baseOffset && h.startOffset < sliceEnd
-    );
-    const overlappingSearch = blockSearchRanges.filter(
-      (r) => r.end > baseOffset && r.start < sliceEnd
-    );
+  const focusedTranslatedPageMatchIdx =
+    activeSearchMatch &&
+    activeSearchMatch.pageNumber === pageNumber &&
+    activeSearchMatch.source === 'translated'
+      ? activeSearchMatch.matchIndexOnPage
+      : null;
 
-    if (overlappingHighlights.length === 0 && overlappingSearch.length === 0) {
-      return text;
-    }
+  const focusedOriginalPageMatchIdx =
+    activeSearchMatch &&
+    activeSearchMatch.pageNumber === pageNumber &&
+    activeSearchMatch.source === 'original'
+      ? activeSearchMatch.matchIndexOnPage
+      : null;
 
-    const cutPoints = new Set<number>([baseOffset, sliceEnd]);
-    for (const hl of overlappingHighlights) {
-      cutPoints.add(Math.max(baseOffset, hl.startOffset));
-      cutPoints.add(Math.min(sliceEnd, hl.endOffset));
-    }
-    for (const sr of overlappingSearch) {
-      cutPoints.add(Math.max(baseOffset, sr.start));
-      cutPoints.add(Math.min(sliceEnd, sr.end));
-    }
-    const sortedPoints = Array.from(cutPoints).sort((a, b) => a - b);
+  const renderClickableSentences = useCallback(
+    (blockId: string, fallbackText: string) => {
+      const spans = sentencesByBlock.get(blockId);
+      const blockHighlights = highlightsByBlock.get(blockId) ?? EMPTY_HIGHLIGHTS;
+      const blockSearchRanges =
+        currentPageSearchRanges.translatedByBlock.get(blockId) ?? EMPTY_SEARCH_RANGES;
 
-    const nodes: React.ReactNode[] = [];
-    for (let i = 0; i < sortedPoints.length - 1; i++) {
-      const segStart = sortedPoints[i];
-      const segEnd = sortedPoints[i + 1];
-      if (segEnd <= segStart) continue;
-
-      const segmentText = text.slice(segStart - baseOffset, segEnd - baseOffset);
-
-      // Check overlapping saved user highlight (prefer most recently updated)
-      let covering: TextHighlight | null = null;
-      for (const hl of overlappingHighlights) {
-        if (hl.startOffset <= segStart && hl.endOffset >= segEnd) {
-          if (!covering || hl.updatedAt >= covering.updatedAt) {
-            covering = hl;
-          }
-        }
-      }
-
-      // Check overlapping global-search match
-      let coveringSearch: { start: number; end: number; pageMatchIdx: number } | null = null;
-      for (const sr of overlappingSearch) {
-        if (sr.start <= segStart && sr.end >= segEnd) {
-          coveringSearch = sr;
-          break;
-        }
-      }
-
-      let innerNode: React.ReactNode = segmentText;
-      if (coveringSearch) {
-        const isCurrentFocused =
-          Boolean(activeSearchMatch) &&
-          activeSearchMatch!.pageNumber === pageNumber &&
-          activeSearchMatch!.source === 'translated' &&
-          activeSearchMatch!.matchIndexOnPage === coveringSearch.pageMatchIdx;
-        innerNode = (
-          <mark
-            key={`sm-${coveringSearch.pageMatchIdx}-${segStart}`}
-            data-search-match="true"
-            data-search-source="translated"
-            data-search-page-idx={coveringSearch.pageMatchIdx}
-            className={
-              isCurrentFocused
-                ? 'bg-orange-400/95 dark:bg-orange-500/85 text-stone-950 dark:text-white ring-2 ring-orange-500/75 dark:ring-orange-300/80 rounded-[2px] px-[0.5px] font-medium'
-                : 'bg-yellow-300/90 dark:bg-yellow-500/45 text-stone-950 dark:text-yellow-50 rounded-[2px] px-[0.5px]'
-            }
-          >
-            {segmentText}
-          </mark>
-        );
-      }
-
-      if (!covering) {
-        nodes.push(<React.Fragment key={`t-${segStart}`}>{innerNode}</React.Fragment>);
-      } else {
-        const hl = covering;
-        const style = HIGHLIGHT_STYLE_MAP[hl.color] ?? HIGHLIGHT_STYLE_MAP.amber;
-        const hasNote = Boolean(hl.note && hl.note.trim());
-        nodes.push(
-          <mark
-            key={`m-${hl.id}-${segStart}`}
-            data-highlight-id={hl.id}
-            onClick={(e) => {
-              const sel = window.getSelection();
-              if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) {
-                return;
-              }
-              e.stopPropagation();
-              openHighlightPopover(hl, e.currentTarget);
-            }}
-            title={
-              hasNote
-                ? `Note: ${hl.note} (click to edit or look up)`
-                : 'Highlighted segment (click to add note, change color, or define)'
-            }
-            className={`${style.markClass} rounded-[2px] px-[1px] transition-colors cursor-pointer ${
-              hasNote
-                ? 'underline decoration-dotted decoration-amber-800/75 dark:decoration-amber-300/80 underline-offset-4'
-                : ''
-            }`}
-          >
-            {innerNode}
-          </mark>
-        );
-      }
-    }
-
-    return nodes;
-  };
-
-  const renderClickableSentences = (blockId: string, fallbackText: string) => {
-    const spans = sentencesByBlock.get(blockId);
-    const blockHighlights = highlightsByBlock.get(blockId) ?? [];
-    const blockSearchRanges = currentPageSearchRanges.translatedByBlock.get(blockId) ?? [];
-
-    if (!spans || spans.length === 0) {
-      return (
-        <span>
-          {renderHighlightedSlice(fallbackText, 0, blockHighlights, blockSearchRanges)}
-        </span>
-      );
-    }
-
-    let cursor = 0;
-    return spans.map((span, idx) => {
-      const spanStart = cursor;
-      const spanEnd = spanStart + span.text.length;
-      cursor = spanEnd + (idx < spans.length - 1 ? 1 : 0);
-
-      const isActive = activeSentenceIndex === span.globalIndex;
-      const spaceSep =
-        idx < spans.length - 1
-          ? renderHighlightedSlice(' ', spanEnd, blockHighlights, blockSearchRanges)
-          : null;
-
-      return (
-        <React.Fragment key={span.id}>
-          <span
-            ref={isActive ? activeSentenceRef : null}
-            onClick={() => {
-              const sel = window.getSelection();
-              if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) {
-                return;
-              }
-              setAutoScrollPausedByUser(false);
-              onClickSentence(span.globalIndex);
-            }}
-            title="Click to read aloud · Drag to highlight, take notes, or define"
-            className={`cursor-pointer rounded-sm transition-colors ${
-              isActive
-                ? 'bg-amber-200/85 dark:bg-amber-800/55 text-stone-950 dark:text-amber-50 px-0.5'
-                : 'hover:bg-stone-200/60 dark:hover:bg-stone-800/70'
-            }`}
-          >
-            {renderHighlightedSlice(span.text, spanStart, blockHighlights, blockSearchRanges)}
+      if (!spans || spans.length === 0) {
+        return (
+          <span>
+            {renderInterleavedHighlightSlice(
+              fallbackText,
+              0,
+              blockHighlights,
+              blockSearchRanges,
+              focusedTranslatedPageMatchIdx,
+              handleOpenBlockHighlightPopover
+            )}
           </span>
-          {spaceSep}
-        </React.Fragment>
-      );
-    });
-  };
+        );
+      }
+
+      let cursor = 0;
+      return spans.map((span, idx) => {
+        const spanStart = cursor;
+        const spanEnd = spanStart + span.text.length;
+        cursor = spanEnd + (idx < spans.length - 1 ? 1 : 0);
+
+        const isActive = activeSentenceIndex === span.globalIndex;
+        const spaceSep =
+          idx < spans.length - 1
+            ? renderInterleavedHighlightSlice(
+                ' ',
+                spanEnd,
+                blockHighlights,
+                blockSearchRanges,
+                focusedTranslatedPageMatchIdx,
+                handleOpenBlockHighlightPopover
+              )
+            : null;
+
+        return (
+          <React.Fragment key={span.id}>
+            <span
+              ref={isActive ? activeSentenceRef : null}
+              onClick={() => {
+                const sel = window.getSelection();
+                if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) {
+                  return;
+                }
+                handleSentenceClick(span.globalIndex);
+              }}
+              title="Click to read aloud · Drag to highlight, take notes, or define"
+              className={`cursor-pointer rounded-sm transition-colors ${
+                isActive
+                  ? 'bg-amber-200/85 dark:bg-amber-800/55 text-stone-950 dark:text-amber-50 px-0.5'
+                  : 'hover:bg-stone-200/60 dark:hover:bg-stone-800/70'
+              }`}
+            >
+              {renderInterleavedHighlightSlice(
+                span.text,
+                spanStart,
+                blockHighlights,
+                blockSearchRanges,
+                focusedTranslatedPageMatchIdx,
+                handleOpenBlockHighlightPopover
+              )}
+            </span>
+            {spaceSep}
+          </React.Fragment>
+        );
+      });
+    },
+    [
+      sentencesByBlock,
+      highlightsByBlock,
+      currentPageSearchRanges.translatedByBlock,
+      focusedTranslatedPageMatchIdx,
+      handleOpenBlockHighlightPopover,
+      activeSentenceIndex,
+      handleSentenceClick,
+    ]
+  );
 
   return (
     <section className="flex flex-col h-full bg-[#FAF9F5] sepia:bg-[#F4ECD8] dark:bg-[#0D0D0C] min-w-0 max-w-full overflow-hidden">
@@ -2338,10 +2678,16 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
                       >
                         {parsedPage.blocks.map((b) => {
                           const ranges =
-                            currentPageSearchRanges.untranslatedByBlock.get(b.id) ?? [];
+                            currentPageSearchRanges.untranslatedByBlock.get(b.id) ??
+                            EMPTY_SEARCH_RANGES;
                           return (
                             <p key={b.id}>
-                              {renderPlainSearchHighlights(b.text, ranges, 'original')}
+                              {renderPlainSearchMarks(
+                                b.text,
+                                ranges,
+                                'original',
+                                focusedOriginalPageMatchIdx
+                              )}
                             </p>
                           );
                         })}
@@ -2390,146 +2736,73 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
                 streamItems.map((item) => {
                   if (item.kind === 'figure') {
                     return (
-                      <figure
+                      <ReaderFigureItem
                         key={item.figure.id}
-                        className="my-6 rounded-md border border-stone-200 dark:border-stone-800 bg-white dark:bg-[#191816] p-3"
-                      >
-                        <img
-                          src={item.figure.dataUrl}
-                          alt={`Original book figure from page ${pageNumber}`}
-                          className="w-full h-auto max-h-[420px] object-contain mx-auto rounded-sm bg-white"
-                        />
-                        <figcaption
-                          dir="ltr"
-                          className="mt-2 flex items-center justify-between text-[11px] text-stone-500 dark:text-stone-400"
-                        >
-                          <span className="inline-flex items-center gap-1">
-                            <ImageIcon className="w-3 h-3" />
-                            Original illustration preserved from Page {pageNumber}
-                          </span>
-                        </figcaption>
-                      </figure>
+                        figure={item.figure}
+                        pageNumber={pageNumber}
+                      />
                     );
                   }
 
                   const blk = item.block;
-                  const isEditing = editingBlockId === blk.id;
-                  const textVal = blk.translatedText || blk.text;
+                  const spans = sentencesByBlock.get(blk.id) ?? EMPTY_SENTENCE_SPANS;
+                  const blockHighlights = highlightsByBlock.get(blk.id) ?? EMPTY_HIGHLIGHTS;
+                  const blockSearchRanges =
+                    currentPageSearchRanges.translatedByBlock.get(blk.id) ?? EMPTY_SEARCH_RANGES;
+                  const originalSearchRanges =
+                    currentPageSearchRanges.originalByBlock.get(blk.id) ?? EMPTY_SEARCH_RANGES;
 
-                  if (isEditing) {
-                    return (
-                      <div
-                        key={blk.id}
-                        className="p-3.5 rounded-md border border-amber-700/50 dark:border-amber-500/50 bg-white dark:bg-[#191816] space-y-2.5"
-                      >
-                        <textarea
-                          value={editDraft}
-                          onChange={(e) => setEditDraft(e.target.value)}
-                          rows={Math.max(3, Math.ceil(editDraft.length / 70))}
-                          className="w-full text-[15px] leading-relaxed bg-transparent text-stone-900 dark:text-stone-100 focus:outline-none resize-y"
-                        />
-                        <div dir="ltr" className="flex items-center justify-end gap-2">
-                          <button
-                            type="button"
-                            onClick={() => setEditingBlockId(null)}
-                            className="inline-flex items-center gap-1 h-8 px-3 rounded text-xs font-medium text-stone-600 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800 cursor-pointer"
-                          >
-                            <X className="w-3.5 h-3.5" />
-                            Cancel
-                          </button>
-                          <button
-                            type="button"
-                            onClick={commitEdit}
-                            className="inline-flex items-center gap-1 h-8 px-3 rounded text-xs font-medium bg-stone-900 text-white dark:bg-stone-100 dark:text-stone-950 cursor-pointer"
-                          >
-                            <Check className="w-3.5 h-3.5" />
-                            Save Edit
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  }
+                  // Scope active sentence & focused search indices to ONLY the matching block
+                  // so sibling React.memo blocks skip re-rendering on every sentence tick
+                  const activeSentenceIndexInBlock =
+                    activeSentenceIndex !== null &&
+                    spans.some((s) => s.globalIndex === activeSentenceIndex)
+                      ? activeSentenceIndex
+                      : null;
+                  const focusedTranslatedMatchIdx =
+                    focusedTranslatedPageMatchIdx !== null &&
+                    blockSearchRanges.some(
+                      (r) => r.pageMatchIdx === focusedTranslatedPageMatchIdx
+                    )
+                      ? focusedTranslatedPageMatchIdx
+                      : null;
+                  const focusedOriginalMatchIdx =
+                    focusedOriginalPageMatchIdx !== null &&
+                    originalSearchRanges.some(
+                      (r) => r.pageMatchIdx === focusedOriginalPageMatchIdx
+                    )
+                      ? focusedOriginalPageMatchIdx
+                      : null;
+
+                  const isEditing = editingBlockId === blk.id;
 
                   return (
-                    <div key={blk.id} className="group relative">
-                      <button
-                        type="button"
-                        onClick={() => startEdit(blk)}
-                        title="Edit translated text"
-                        className={`opacity-0 group-hover:opacity-100 focus:opacity-100 absolute top-0 ${
-                          langOption.rtl ? '-left-8' : '-right-8'
-                        } p-1.5 rounded text-stone-400 hover:text-stone-900 dark:hover:text-stone-100 hover:bg-stone-200/70 dark:hover:bg-stone-800 transition-opacity cursor-pointer`}
-                      >
-                        <Edit3 className="w-3.5 h-3.5" />
-                      </button>
-
-                      {blk.kind === 'heading' ? (
-                        <h2
-                          data-block-id={blk.id}
-                          className="font-display text-2xl sm:text-[26px] font-semibold tracking-tight leading-snug text-stone-950 dark:text-stone-50 pt-1 select-text"
-                        >
-                          {renderClickableSentences(blk.id, textVal)}
-                        </h2>
-                      ) : blk.kind === 'subheading' ? (
-                        <h3
-                          data-block-id={blk.id}
-                          className="text-lg font-semibold leading-snug text-stone-900 dark:text-stone-100 pt-2 select-text"
-                        >
-                          {renderClickableSentences(blk.id, textVal)}
-                        </h3>
-                      ) : blk.kind === 'callout' ? (
-                        <div
-                          data-block-id={blk.id}
-                          style={{
-                            fontSize: `${Math.max(13, readerFontSize - 1)}px`,
-                            lineHeight: readerLineHeight,
-                          }}
-                          className="p-4 rounded-md border border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#F4F1EA] sepia:bg-[#ECE2CA] dark:bg-[#1B1917] text-stone-800 sepia:text-[#3B2F23] dark:text-stone-200 select-text"
-                        >
-                          {renderClickableSentences(blk.id, textVal)}
-                        </div>
-                      ) : blk.kind === 'bullet' ? (
-                        <div
-                          style={{
-                            fontSize: `${readerFontSize}px`,
-                            lineHeight: readerLineHeight,
-                          }}
-                          className="flex items-start gap-2.5 text-stone-800 sepia:text-[#3B2F23] dark:text-stone-200"
-                        >
-                          <span
-                            aria-hidden="true"
-                            className="mt-2.5 w-1.5 h-1.5 rounded-full bg-amber-700 dark:bg-amber-500 shrink-0"
-                          />
-                          <p data-block-id={blk.id} className="flex-1 select-text">
-                            {renderClickableSentences(blk.id, textVal)}
-                          </p>
-                        </div>
-                      ) : (
-                        <p
-                          data-block-id={blk.id}
-                          style={{
-                            fontSize: `${readerFontSize}px`,
-                            lineHeight: readerLineHeight,
-                          }}
-                          className="text-stone-800 sepia:text-[#3B2F23] dark:text-stone-200 select-text"
-                        >
-                          {renderClickableSentences(blk.id, textVal)}
-                        </p>
-                      )}
-
-                      {showOriginalRef && blk.text !== textVal && (
-                        <p
-                          dir={sourceScriptInfo.rtl ? 'rtl' : 'ltr'}
-                          className={`mt-1.5 text-xs leading-relaxed text-stone-500 dark:text-stone-400 ${sourceScriptInfo.cssClass}`}
-                        >
-                          {renderPlainSearchHighlights(
-                            blk.text,
-                            currentPageSearchRanges.originalByBlock.get(blk.id) ?? [],
-                            'original'
-                          )}
-                        </p>
-                      )}
-                    </div>
+                    <ReaderBlockItem
+                      key={blk.id}
+                      block={blk}
+                      spans={spans}
+                      blockHighlights={blockHighlights}
+                      blockSearchRanges={blockSearchRanges}
+                      originalSearchRanges={originalSearchRanges}
+                      activeSentenceIndexInBlock={activeSentenceIndexInBlock}
+                      focusedTranslatedMatchIdx={focusedTranslatedMatchIdx}
+                      focusedOriginalMatchIdx={focusedOriginalMatchIdx}
+                      isEditing={isEditing}
+                      editDraft={isEditing ? editDraft : ''}
+                      readerFontSize={readerFontSize}
+                      readerLineHeight={readerLineHeight}
+                      showOriginalRef={showOriginalRef}
+                      langRtl={Boolean(langOption.rtl)}
+                      sourceRtl={sourceScriptInfo.rtl}
+                      sourceCssClass={sourceScriptInfo.cssClass}
+                      activeSentenceRef={activeSentenceRef}
+                      onStartEdit={startEdit}
+                      onCancelEdit={cancelEdit}
+                      onEditDraftChange={setEditDraft}
+                      onCommitEdit={commitEdit}
+                      onSentenceClick={handleSentenceClick}
+                      onOpenHighlightPopover={handleOpenBlockHighlightPopover}
+                    />
                   );
                 })
               )}
@@ -2739,3 +3012,5 @@ export const TranslatedReaderPane: React.FC<TranslatedReaderPaneProps> = ({
     </section>
   );
 };
+
+export const TranslatedReaderPane = React.memo(TranslatedReaderPaneInner);

@@ -179,7 +179,9 @@ interface AudiobookBarProps {
   onVoiceStylePreferenceChange?: (pref: VoiceStylePreference) => void;
 }
 
-export const AudiobookBar: React.FC<AudiobookBarProps> = ({
+const EMPTY_WORD_COUNTS: Record<number, number> = {};
+
+const AudiobookBarInner: React.FC<AudiobookBarProps> = ({
   bookTitle,
   bookAuthor = '',
   bookCoverUrl,
@@ -187,7 +189,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
   pageNumber,
   numPages,
   currentChapter = null,
-  chapterPageWordCounts = {},
+  chapterPageWordCounts = EMPTY_WORD_COUNTS,
   targetLang,
   parsedPage,
   translatedPage,
@@ -829,7 +831,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     const timer = window.setInterval(() => {
       const elapsed = Date.now() - sentenceStartedAtRef.current;
       setSentenceProgress(Math.min(0.96, elapsed / Math.max(600, estDurationMs)));
-    }, 250);
+    }, 750);
 
     return () => window.clearInterval(timer);
   }, [isSpeaking, engineMode, activeSentenceIndex, sentences, rate]);
@@ -1114,7 +1116,22 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
 
     const promise = fetchClip()
       .then((entry) => {
-        objectUrlCacheRef.current.set(cacheKey, { url: entry.url, source: entry.source });
+        const cache = objectUrlCacheRef.current;
+        if (cache.size >= 16) {
+          const oldestKey = cache.keys().next().value;
+          if (oldestKey !== undefined) {
+            const oldest = cache.get(oldestKey);
+            if (oldest?.url) {
+              try {
+                URL.revokeObjectURL(oldest.url);
+              } catch {
+                // ignore
+              }
+            }
+            cache.delete(oldestKey);
+          }
+        }
+        cache.set(cacheKey, { url: entry.url, source: entry.source });
         inFlightFetchRef.current.delete(cacheKey);
         return entry;
       })
@@ -2557,7 +2574,7 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
   const isNeuralEngineActive = aiAvailable || Boolean(liveNeuralModel);
 
   return (
-    <div className="no-print sticky bottom-0 z-20 border-t border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#FAF9F5]/95 sepia:bg-[#F4ECD8]/95 dark:bg-[#141312]/95 backdrop-blur-sm">
+    <div className="no-print sticky bottom-0 z-20 border-t border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#FAF9F5] sepia:bg-[#F4ECD8] dark:bg-[#141312]">
       <audio ref={audioRef} playsInline preload="auto" className="hidden" />
       <audio ref={previewAudioRef} playsInline preload="auto" className="hidden" />
 
@@ -3560,3 +3577,5 @@ export const AudiobookBar: React.FC<AudiobookBarProps> = ({
     </div>
   );
 };
+
+export const AudiobookBar = React.memo(AudiobookBarInner);

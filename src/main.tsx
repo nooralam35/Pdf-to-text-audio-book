@@ -8,9 +8,11 @@ import {
   logDevError,
   openDevDebugPanel,
 } from './lib/devErrorLog';
+import { installPerfMonitorGlobal } from './lib/perfMonitor';
 import { DevDebugLogPanel } from './components/DevDebugLogPanel';
 
 installDevErrorCapture();
+installPerfMonitorGlobal();
 initOfflineServiceWorker();
 
 class AppErrorBoundary extends React.Component<

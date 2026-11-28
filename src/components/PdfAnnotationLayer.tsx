@@ -1,5 +1,6 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { GripVertical, Trash2, X } from 'lucide-react';
+import { startPerfSpan } from '../lib/perfMonitor';
 import type {
   AnnotationPoint,
   AnnotationStroke,
@@ -127,13 +128,18 @@ export function renderStrokesToDataUrl(
   const off = document.createElement('canvas');
   off.width = targetW;
   off.height = targetH;
-  const ctx = off.getContext('2d');
-  if (!ctx) return undefined;
+  try {
+    const ctx = off.getContext('2d');
+    if (!ctx) return undefined;
 
-  for (const s of strokes) {
-    drawStrokeOnCanvas(ctx, s, targetW, targetH, scaleFactor);
+    for (const s of strokes) {
+      drawStrokeOnCanvas(ctx, s, targetW, targetH, scaleFactor);
+    }
+    return off.toDataURL('image/png');
+  } finally {
+    off.width = 0;
+    off.height = 0;
   }
-  return off.toDataURL('image/png');
 }
 
 function distToSegmentSq(
@@ -156,7 +162,7 @@ function distToSegmentSq(
   return (px - projX) ** 2 + (py - projY) ** 2;
 }
 
-export const PdfAnnotationLayer: React.FC<PdfAnnotationLayerProps> = ({
+const PdfAnnotationLayerInner: React.FC<PdfAnnotationLayerProps> = ({
   width,
   height,
   tool,
@@ -198,17 +204,42 @@ export const PdfAnnotationLayer: React.FC<PdfAnnotationLayerProps> = ({
     [strokes, draftStroke]
   );
 
-  // Paint strokes onto dedicated HiDPI HTML5 <canvas> layers (multiply highlighter + freehand brush)
+  // Paint strokes onto dedicated HiDPI HTML5 <canvas> layers lazily (0x0 GPU memory when no strokes exist)
   useEffect(() => {
-    if (!visible || width <= 0 || height <= 0) return;
+    const releaseLayer = (canvas: HTMLCanvasElement | null) => {
+      if (canvas && (canvas.width !== 0 || canvas.height !== 0)) {
+        canvas.width = 0;
+        canvas.height = 0;
+      }
+    };
 
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    if (!visible || width <= 0 || height <= 0) {
+      releaseLayer(highlightCanvasRef.current);
+      releaseLayer(penCanvasRef.current);
+      return;
+    }
+
+    const rawDpr = window.devicePixelRatio || 1;
+    const dpr = Math.min(rawDpr, window.innerWidth < 768 ? 1.5 : 2);
 
     const paintCanvas = (
       canvas: HTMLCanvasElement | null,
       mode: 'highlight' | 'pen'
     ) => {
       if (!canvas) return;
+      const modeStrokes = allStrokes.filter((s) => s.mode === mode);
+      if (modeStrokes.length === 0) {
+        releaseLayer(canvas);
+        return;
+      }
+
+      const paintSpan = startPerfSpan(
+        'PdfAnnotationLayer:paint',
+        'canvas',
+        `${mode} (${modeStrokes.length} strokes)`,
+        16.67
+      );
+
       const targetPixelW = Math.max(1, Math.round(safeW * dpr));
       const targetPixelH = Math.max(1, Math.round(safeH * dpr));
       if (canvas.width !== targetPixelW || canvas.height !== targetPixelH) {
@@ -221,18 +252,17 @@ export const PdfAnnotationLayer: React.FC<PdfAnnotationLayerProps> = ({
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, safeW, safeH);
 
-      for (const stroke of allStrokes) {
-        if (stroke.mode === mode) {
-          drawStrokeOnCanvas(ctx, stroke, safeW, safeH, scaleFactor);
-        }
+      for (const stroke of modeStrokes) {
+        drawStrokeOnCanvas(ctx, stroke, safeW, safeH, scaleFactor);
       }
+      paintSpan.end();
     };
 
     paintCanvas(highlightCanvasRef.current, 'highlight');
     paintCanvas(penCanvasRef.current, 'pen');
   }, [allStrokes, safeW, safeH, scaleFactor, visible, width, height]);
 
-  const getNormalizedPoint = (e: React.PointerEvent): AnnotationPoint => {
+  const getNormalizedPoint = useCallback((e: React.PointerEvent): AnnotationPoint => {
     const rect = overlayRef.current?.getBoundingClientRect();
     if (!rect || rect.width === 0 || rect.height === 0) {
       return { x: 0.5, y: 0.5 };
@@ -241,132 +271,156 @@ export const PdfAnnotationLayer: React.FC<PdfAnnotationLayerProps> = ({
       x: Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)),
       y: Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height)),
     };
-  };
+  }, []);
 
-  const tryEraseAtPoint = (pt: AnnotationPoint) => {
-    const px = pt.x * safeW;
-    const py = pt.y * safeH;
-    const hitRadius = Math.max(12, 14 * scaleFactor);
+  const tryEraseAtPoint = useCallback(
+    (pt: AnnotationPoint) => {
+      const px = pt.x * safeW;
+      const py = pt.y * safeH;
+      const hitRadius = Math.max(12, 14 * scaleFactor);
 
-    for (let i = strokes.length - 1; i >= 0; i--) {
-      const s = strokes[i];
-      const thresholdSq = (hitRadius + (s.width * scaleFactor) / 2) ** 2;
-      const pts = s.points;
-      if (pts.length === 1) {
-        const dSq = (px - pts[0].x * safeW) ** 2 + (py - pts[0].y * safeH) ** 2;
-        if (dSq <= thresholdSq) {
-          const remaining = strokes.filter((st) => st.id !== s.id);
-          onEraseStroke(s.id, renderStrokesToDataUrl(remaining, safeW, safeH));
-          return;
+      for (let i = strokes.length - 1; i >= 0; i--) {
+        const s = strokes[i];
+        const thresholdSq = (hitRadius + (s.width * scaleFactor) / 2) ** 2;
+        const pts = s.points;
+        if (pts.length === 1) {
+          const dSq = (px - pts[0].x * safeW) ** 2 + (py - pts[0].y * safeH) ** 2;
+          if (dSq <= thresholdSq) {
+            const remaining = strokes.filter((st) => st.id !== s.id);
+            onEraseStroke(s.id, renderStrokesToDataUrl(remaining, safeW, safeH));
+            return;
+          }
+        }
+        for (let j = 0; j < pts.length - 1; j++) {
+          const dSq = distToSegmentSq(
+            px,
+            py,
+            pts[j].x * safeW,
+            pts[j].y * safeH,
+            pts[j + 1].x * safeW,
+            pts[j + 1].y * safeH
+          );
+          if (dSq <= thresholdSq) {
+            const remaining = strokes.filter((st) => st.id !== s.id);
+            onEraseStroke(s.id, renderStrokesToDataUrl(remaining, safeW, safeH));
+            return;
+          }
         }
       }
-      for (let j = 0; j < pts.length - 1; j++) {
-        const dSq = distToSegmentSq(
-          px,
-          py,
-          pts[j].x * safeW,
-          pts[j].y * safeH,
-          pts[j + 1].x * safeW,
-          pts[j + 1].y * safeH
-        );
-        if (dSq <= thresholdSq) {
-          const remaining = strokes.filter((st) => st.id !== s.id);
-          onEraseStroke(s.id, renderStrokesToDataUrl(remaining, safeW, safeH));
-          return;
-        }
+    },
+    [safeW, safeH, scaleFactor, strokes, onEraseStroke]
+  );
+
+  const handleSurfacePointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (!visible) return;
+      if (e.button !== 0 && e.pointerType === 'mouse') return;
+
+      if ((e.target as HTMLElement).closest('[data-sticky-ui="true"]')) {
+        return;
       }
-    }
-  };
 
-  const handleSurfacePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!visible) return;
-    if (e.button !== 0 && e.pointerType === 'mouse') return;
+      if (tool === 'cursor') {
+        if (activeNoteId) onSelectNote(null);
+        return;
+      }
 
-    if ((e.target as HTMLElement).closest('[data-sticky-ui="true"]')) {
-      return;
-    }
-
-    if (tool === 'cursor') {
-      if (activeNoteId) onSelectNote(null);
-      return;
-    }
-
-    const pt = getNormalizedPoint(e);
-
-    if (tool === 'note') {
-      e.preventDefault();
-      onAddNote(pt.x, pt.y, noteColor);
-      return;
-    }
-
-    if (tool === 'eraser') {
-      e.preventDefault();
-      isErasingRef.current = true;
-      e.currentTarget.setPointerCapture(e.pointerId);
-      tryEraseAtPoint(pt);
-      return;
-    }
-
-    if (tool === 'highlight' || tool === 'pen') {
-      e.preventDefault();
-      e.currentTarget.setPointerCapture(e.pointerId);
-      if (activeNoteId) onSelectNote(null);
-      const newStroke: AnnotationStroke = {
-        id: `str-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        mode: tool,
-        color: strokeColor,
-        width: strokeWidth,
-        opacity: strokeOpacity,
-        points: [pt],
-      };
-      setDraftStroke(newStroke);
-    }
-  };
-
-  const handleSurfacePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (isErasingRef.current && tool === 'eraser') {
-      tryEraseAtPoint(getNormalizedPoint(e));
-      return;
-    }
-
-    if (draftStroke) {
       const pt = getNormalizedPoint(e);
-      setDraftStroke((prev) => {
-        if (!prev) return null;
-        const last = prev.points[prev.points.length - 1];
-        if (last && Math.hypot((pt.x - last.x) * safeW, (pt.y - last.y) * safeH) < 2.0) {
-          return prev;
+
+      if (tool === 'note') {
+        e.preventDefault();
+        onAddNote(pt.x, pt.y, noteColor);
+        return;
+      }
+
+      if (tool === 'eraser') {
+        e.preventDefault();
+        isErasingRef.current = true;
+        e.currentTarget.setPointerCapture(e.pointerId);
+        tryEraseAtPoint(pt);
+        return;
+      }
+
+      if (tool === 'highlight' || tool === 'pen') {
+        e.preventDefault();
+        e.currentTarget.setPointerCapture(e.pointerId);
+        if (activeNoteId) onSelectNote(null);
+        const newStroke: AnnotationStroke = {
+          id: `str-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          mode: tool,
+          color: strokeColor,
+          width: strokeWidth,
+          opacity: strokeOpacity,
+          points: [pt],
+        };
+        setDraftStroke(newStroke);
+      }
+    },
+    [
+      visible,
+      tool,
+      activeNoteId,
+      onSelectNote,
+      getNormalizedPoint,
+      onAddNote,
+      noteColor,
+      tryEraseAtPoint,
+      strokeColor,
+      strokeWidth,
+      strokeOpacity,
+    ]
+  );
+
+  const handleSurfacePointerMove = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (isErasingRef.current && tool === 'eraser') {
+        tryEraseAtPoint(getNormalizedPoint(e));
+        return;
+      }
+
+      if (draftStroke) {
+        const pt = getNormalizedPoint(e);
+        setDraftStroke((prev) => {
+          if (!prev) return null;
+          const last = prev.points[prev.points.length - 1];
+          if (last && Math.hypot((pt.x - last.x) * safeW, (pt.y - last.y) * safeH) < 2.0) {
+            return prev;
+          }
+          return { ...prev, points: [...prev.points, pt] };
+        });
+      }
+    },
+    [tool, tryEraseAtPoint, getNormalizedPoint, draftStroke, safeW, safeH]
+  );
+
+  const handleSurfacePointerUp = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (isErasingRef.current) {
+        isErasingRef.current = false;
+        try {
+          e.currentTarget.releasePointerCapture(e.pointerId);
+        } catch {
+          // ignore
         }
-        return { ...prev, points: [...prev.points, pt] };
-      });
-    }
-  };
+        return;
+      }
 
-  const handleSurfacePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (isErasingRef.current) {
-      isErasingRef.current = false;
-      try {
-        e.currentTarget.releasePointerCapture(e.pointerId);
-      } catch {
-        // ignore
+      if (draftStroke) {
+        const finished = draftStroke;
+        setDraftStroke(null);
+        try {
+          e.currentTarget.releasePointerCapture(e.pointerId);
+        } catch {
+          // ignore
+        }
+        if (finished.points.length > 0) {
+          const snapshot = renderStrokesToDataUrl([...strokes, finished], safeW, safeH);
+          onAddStroke(finished, snapshot);
+        }
       }
-      return;
-    }
-
-    if (draftStroke) {
-      const finished = draftStroke;
-      setDraftStroke(null);
-      try {
-        e.currentTarget.releasePointerCapture(e.pointerId);
-      } catch {
-        // ignore
-      }
-      if (finished.points.length > 0) {
-        const snapshot = renderStrokesToDataUrl([...strokes, finished], safeW, safeH);
-        onAddStroke(finished, snapshot);
-      }
-    }
-  };
+    },
+    [draftStroke, strokes, safeW, safeH, onAddStroke]
+  );
 
   if (!visible || width <= 0 || height <= 0) return null;
 
@@ -548,3 +602,5 @@ export const PdfAnnotationLayer: React.FC<PdfAnnotationLayerProps> = ({
     </div>
   );
 };
+
+export const PdfAnnotationLayer = React.memo(PdfAnnotationLayerInner);

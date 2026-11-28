@@ -86,6 +86,23 @@ export async function loadPdfFromBuffer(buffer: ArrayBuffer): Promise<PDFDocumen
   return loadingTask.promise;
 }
 
+function releaseCanvas(canvas: HTMLCanvasElement | null | undefined): void {
+  if (!canvas) return;
+  try {
+    canvas.width = 0;
+    canvas.height = 0;
+  } catch {
+    // ignore cleanup errors
+  }
+}
+
+function getSafeCanvasDpr(): number {
+  if (typeof window === 'undefined') return 1;
+  const raw = window.devicePixelRatio || 1;
+  const isMobile = window.innerWidth < 768;
+  return Math.min(raw, isMobile ? 1.5 : 2);
+}
+
 export function renderPdfPageToCanvas(
   pdf: PDFDocumentProxy,
   pageNumber: number,
@@ -104,16 +121,22 @@ export function renderPdfPageToCanvas(
       const page = await pdf.getPage(pageNumber);
       if (cancelled) return { width: 0, height: 0 };
 
-      const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const viewport = page.getViewport({ scale });
+      let dpr = getSafeCanvasDpr();
+      const maxPixels =
+        typeof window !== 'undefined' && window.innerWidth < 768 ? 2_200_000 : 4_200_000;
+      const estimatedPixels = viewport.width * viewport.height * dpr * dpr;
+      if (estimatedPixels > maxPixels && viewport.width > 0 && viewport.height > 0) {
+        dpr = Math.max(1, Math.sqrt(maxPixels / (viewport.width * viewport.height)));
+      }
       const renderViewport = page.getViewport({ scale: scale * dpr });
 
-      canvas.width = Math.floor(renderViewport.width);
-      canvas.height = Math.floor(renderViewport.height);
+      canvas.width = Math.max(1, Math.floor(renderViewport.width));
+      canvas.height = Math.max(1, Math.floor(renderViewport.height));
       canvas.style.width = `${Math.floor(viewport.width)}px`;
       canvas.style.height = `${Math.floor(viewport.height)}px`;
 
-      const ctx = canvas.getContext('2d');
+      const ctx = canvas.getContext('2d', { alpha: false });
       if (!ctx) throw new Error('Canvas 2D context unavailable');
 
       ctx.fillStyle = '#ffffff';
@@ -125,6 +148,11 @@ export function renderPdfPageToCanvas(
         canvas,
       });
       await renderTask.promise;
+      try {
+        page.cleanup();
+      } catch {
+        // ignore cleanup race
+      }
       return { width: viewport.width, height: viewport.height };
     });
   })();
@@ -145,35 +173,52 @@ export function renderPdfPageToCanvas(
 export async function renderPageToDataUrl(
   pdf: PDFDocumentProxy,
   pageNumber: number,
-  scale = 2.0,
+  scale = 1.6,
   mimeType: 'image/png' | 'image/jpeg' = 'image/jpeg',
-  quality = 0.92
+  quality = 0.85
 ): Promise<{ dataUrl: string; width: number; height: number }> {
   return withPageRenderLock(pdf, pageNumber, async () => {
     const page = await pdf.getPage(pageNumber);
-    const viewport = page.getViewport({ scale });
+    const baseViewport = page.getViewport({ scale });
+    const maxDim = typeof window !== 'undefined' && window.innerWidth < 768 ? 1400 : 1800;
+    const clampRatio = Math.min(1, maxDim / Math.max(1, baseViewport.width, baseViewport.height));
+    const viewport = clampRatio < 1 ? page.getViewport({ scale: scale * clampRatio }) : baseViewport;
+
     const canvas = document.createElement('canvas');
-    canvas.width = Math.floor(viewport.width);
-    canvas.height = Math.floor(viewport.height);
-    const ctx = canvas.getContext('2d');
-    if (!ctx) throw new Error('Could not initialize offscreen canvas');
+    const targetW = Math.max(1, Math.floor(viewport.width));
+    const targetH = Math.max(1, Math.floor(viewport.height));
+    canvas.width = targetW;
+    canvas.height = targetH;
+    try {
+      const ctx = canvas.getContext('2d', { alpha: false });
+      if (!ctx) throw new Error('Could not initialize offscreen canvas');
 
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, targetW, targetH);
 
-    await page.render({
-      canvasContext: ctx,
-      viewport,
-      canvas,
-    }).promise;
+      await page.render({
+        canvasContext: ctx,
+        viewport,
+        canvas,
+      }).promise;
 
-    const dataUrl =
-      mimeType === 'image/png' ? canvas.toDataURL('image/png') : canvas.toDataURL('image/jpeg', quality);
-    return {
-      dataUrl,
-      width: canvas.width,
-      height: canvas.height,
-    };
+      const dataUrl =
+        mimeType === 'image/png'
+          ? canvas.toDataURL('image/png')
+          : canvas.toDataURL('image/jpeg', quality);
+      return {
+        dataUrl,
+        width: targetW,
+        height: targetH,
+      };
+    } finally {
+      releaseCanvas(canvas);
+      try {
+        page.cleanup();
+      } catch {
+        // ignore cleanup race
+      }
+    }
   });
 }
 
@@ -515,22 +560,23 @@ export async function extractPageContent(
     }
   }
 
-  // 3. Crop high-resolution extracted screenshots/diagrams from rendered page canvas
+  // 3. Crop compact, crisp extracted screenshots/diagrams from rendered page canvas (JPEG + immediate GPU cleanup)
   const figures: ExtractedFigure[] = [];
   if (mergedImgBoxes.length > 0 && pageNumber > 1) {
+    let offCanvas: HTMLCanvasElement | null = null;
     try {
-      const renderScale = 2.0;
+      const renderScale = typeof window !== 'undefined' && window.innerWidth < 768 ? 1.25 : 1.45;
       const hiViewport = page.getViewport({ scale: renderScale });
-      const offCanvas = document.createElement('canvas');
-      offCanvas.width = Math.floor(hiViewport.width);
-      offCanvas.height = Math.floor(hiViewport.height);
-      const offCtx = offCanvas.getContext('2d');
+      offCanvas = document.createElement('canvas');
+      offCanvas.width = Math.max(1, Math.floor(hiViewport.width));
+      offCanvas.height = Math.max(1, Math.floor(hiViewport.height));
+      const offCtx = offCanvas.getContext('2d', { alpha: false });
 
       if (offCtx) {
         offCtx.fillStyle = '#ffffff';
         offCtx.fillRect(0, 0, offCanvas.width, offCanvas.height);
         await withPageRenderLock(pdf, pageNumber, async () => {
-          await page.render({ canvasContext: offCtx, viewport: hiViewport, canvas: offCanvas }).promise;
+          await page.render({ canvasContext: offCtx, viewport: hiViewport, canvas: offCanvas! }).promise;
         });
 
         mergedImgBoxes.forEach((box, idx) => {
@@ -540,36 +586,50 @@ export async function extractPageContent(
           const sx = Math.max(0, Math.floor((box.x0 - padX) * renderScale));
           const sy = Math.max(0, Math.floor((box.y0 - padY) * renderScale));
           const sw = Math.min(
-            offCanvas.width - sx,
+            offCanvas!.width - sx,
             Math.ceil((box.x1 - box.x0 + padX * 2) * renderScale)
           );
           const sh = Math.min(
-            offCanvas.height - sy,
+            offCanvas!.height - sy,
             Math.ceil((box.y1 - box.y0 + padY * 2) * renderScale)
           );
 
-          if (sw > 60 && sh > 40) {
+          if (sw > 45 && sh > 30) {
             const cropCanvas = document.createElement('canvas');
-            cropCanvas.width = sw;
-            cropCanvas.height = sh;
-            const cropCtx = cropCanvas.getContext('2d');
-            if (cropCtx) {
-              cropCtx.drawImage(offCanvas, sx, sy, sw, sh, 0, 0, sw, sh);
-              figures.push({
-                id: `p${pageNumber}-fig${idx + 1}`,
-                dataUrl: cropCanvas.toDataURL('image/png'),
-                yPercent: Math.max(0, Math.min(100, (box.y0 / pageHeight) * 100)),
-                widthRatio: (box.x1 - box.x0) / pageWidth,
-                heightRatio: (box.y1 - box.y0) / pageHeight,
-                aspectRatio: sw / sh,
-              });
+            try {
+              cropCanvas.width = sw;
+              cropCanvas.height = sh;
+              const cropCtx = cropCanvas.getContext('2d', { alpha: false });
+              if (cropCtx) {
+                cropCtx.fillStyle = '#ffffff';
+                cropCtx.fillRect(0, 0, sw, sh);
+                cropCtx.drawImage(offCanvas!, sx, sy, sw, sh, 0, 0, sw, sh);
+                figures.push({
+                  id: `p${pageNumber}-fig${idx + 1}`,
+                  dataUrl: cropCanvas.toDataURL('image/jpeg', 0.78),
+                  yPercent: Math.max(0, Math.min(100, (box.y0 / pageHeight) * 100)),
+                  widthRatio: (box.x1 - box.x0) / pageWidth,
+                  heightRatio: (box.y1 - box.y0) / pageHeight,
+                  aspectRatio: sw / sh,
+                });
+              }
+            } finally {
+              releaseCanvas(cropCanvas);
             }
           }
         });
       }
     } catch {
       // Ignore figure cropping failures on exotic PDFs
+    } finally {
+      releaseCanvas(offCanvas);
     }
+  }
+
+  try {
+    page.cleanup();
+  } catch {
+    // ignore cleanup race
   }
 
   const combinedText = blocks.map((b) => b.text).join(' ');

@@ -306,6 +306,14 @@ export async function getTranslation(
   return db.get('translations', makeTranslationKey(bookId, lang, pageNumber));
 }
 
+export function stripRecordFigures(record: TranslatedPageRecord): TranslatedPageRecord {
+  if (!record.figures || record.figures.length === 0) return record;
+  return {
+    ...record,
+    figures: [],
+  };
+}
+
 export async function listTranslationsForBookLang(
   bookId: string,
   lang: LanguageCode
@@ -315,14 +323,50 @@ export async function listTranslationsForBookLang(
   return rows.sort((a, b) => a.pageNumber - b.pageNumber);
 }
 
+/**
+ * Lightweight list of translated pages for a book/language with heavy base64 figures stripped
+ * so React state never retains tens/hundreds of megabytes of image strings in RAM.
+ */
+export async function listLightTranslationsForBookLang(
+  bookId: string,
+  lang: LanguageCode
+): Promise<TranslatedPageRecord[]> {
+  const db = await getDb();
+  const tx = db.transaction('translations', 'readonly');
+  const index = tx.store.index('by-book-lang');
+  const rows: TranslatedPageRecord[] = [];
+  let cursor = await index.openCursor([bookId, lang]);
+  while (cursor) {
+    rows.push(stripRecordFigures(cursor.value));
+    cursor = await cursor.continue();
+  }
+  await tx.done;
+  return rows.sort((a, b) => a.pageNumber - b.pageNumber);
+}
+
+/**
+ * O(1) IndexedDB index count — deserializes ZERO page records or base64 figures.
+ */
+export async function countTranslationsForBookLang(
+  bookId: string,
+  lang: LanguageCode
+): Promise<number> {
+  const db = await getDb();
+  return db.countFromIndex('translations', 'by-book-lang', [bookId, lang]);
+}
+
 export async function listAllTranslationCountsByBook(): Promise<Record<string, number>> {
   const db = await getDb();
   const counts: Record<string, number> = {};
   const tx = db.transaction('translations', 'readonly');
-  let cursor = await tx.store.openCursor();
+  let cursor = await tx.store.openKeyCursor();
   while (cursor) {
-    const id = cursor.value.bookId;
-    counts[id] = (counts[id] ?? 0) + 1;
+    const key = String(cursor.primaryKey ?? '');
+    const sep = key.indexOf('::');
+    if (sep > 0) {
+      const id = key.slice(0, sep);
+      counts[id] = (counts[id] ?? 0) + 1;
+    }
     cursor = await cursor.continue();
   }
   await tx.done;

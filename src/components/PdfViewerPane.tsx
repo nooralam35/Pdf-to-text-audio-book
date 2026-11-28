@@ -51,6 +51,7 @@ import type {
   StickyNote,
   StoredBook,
 } from '../types';
+import { startPerfSpan } from '../lib/perfMonitor';
 import {
   NOTE_PALETTE,
   PdfAnnotationLayer,
@@ -96,6 +97,7 @@ interface PdfViewerPaneProps {
   pendingOcrReview?: PendingOcrReview | null;
   onBookMetadataUpdated?: (updatedBook: StoredBook) => void;
   onReachPageEnd?: () => void;
+  isVisible?: boolean;
 }
 
 const HIGHLIGHT_SWATCHES = [
@@ -112,7 +114,7 @@ const PEN_SWATCHES = [
   { color: '#18181B', label: 'Black ink' },
 ];
 
-export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
+const PdfViewerPaneInner: React.FC<PdfViewerPaneProps> = ({
   bookId,
   bookTitle = 'Annotated Book',
   pdf,
@@ -132,6 +134,7 @@ export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
   pendingOcrReview = null,
   onBookMetadataUpdated,
   onReachPageEnd,
+  isVisible = true,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -197,6 +200,10 @@ export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
   const pendingSaveRef = useRef<(() => void) | null>(null);
   const onBookUpdatedRef = useRef(onBookMetadataUpdated);
   onBookUpdatedRef.current = onBookMetadataUpdated;
+  const strokesRef = useRef(strokes);
+  strokesRef.current = strokes;
+  const notesRef = useRef(notes);
+  notesRef.current = notes;
 
   const flushPendingSave = useCallback(() => {
     if (saveTimerRef.current) {
@@ -294,36 +301,57 @@ export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
     [bookId, pageNumber, canvasSize.width, canvasSize.height]
   );
 
-  // Track displayed canvas dimensions accurately even when responsive max-w-full scales it
+  // Track displayed canvas dimensions accurately only when pane is actually visible
   useEffect(() => {
+    if (!isVisible) return;
     const el = canvasRef.current;
     if (!el) return;
     const syncRect = () => {
       const rect = el.getBoundingClientRect();
       if (rect.width > 0 && rect.height > 0) {
-        setCanvasSize({ width: rect.width, height: rect.height });
+        setCanvasSize((prev) =>
+          Math.abs(prev.width - rect.width) < 1 && Math.abs(prev.height - rect.height) < 1
+            ? prev
+            : { width: rect.width, height: rect.height }
+        );
       }
     };
     syncRect();
     const ro = new ResizeObserver(syncRect);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [pdf, pageNumber, zoom]);
+  }, [pdf, pageNumber, zoom, isVisible]);
 
   useEffect(() => {
-    if (!pdf || !canvasRef.current) return;
+    const canvasEl = canvasRef.current;
+    if (!isVisible) {
+      // Release GPU bitmap immediately when hidden on mobile tabs to save RAM & battery
+      if (canvasEl && (canvasEl.width !== 0 || canvasEl.height !== 0)) {
+        canvasEl.width = 0;
+        canvasEl.height = 0;
+      }
+      setIsRendering(false);
+      return;
+    }
+    if (!pdf || !canvasEl) return;
     let active = true;
     setIsRendering(true);
     setRenderError(null);
 
-    const containerWidth = containerRef.current?.clientWidth ?? 540;
+    const containerWidth = containerRef.current?.clientWidth || 540;
     const baseFitScale = Math.min(1.4, Math.max(0.75, (containerWidth - 40) / 460));
-    const effectiveScale = Math.max(0.6, Math.min(2.4, baseFitScale * zoom));
+    const effectiveScale = Math.max(0.6, Math.min(2.2, baseFitScale * zoom));
+    const renderSpan = startPerfSpan(
+      'PdfViewerPane:canvas',
+      'canvas',
+      `p.${pageNumber} @ ${Math.round(zoom * 100)}%`
+    );
 
-    const task = renderPdfPageToCanvas(pdf, pageNumber, canvasRef.current, effectiveScale);
+    const task = renderPdfPageToCanvas(pdf, pageNumber, canvasEl, effectiveScale);
     task.promise
       .then((dims) => {
         if (!active) return;
+        renderSpan.end(`${Math.round(dims.width)}×${Math.round(dims.height)}px`);
         setIsRendering(false);
         const rect = canvasRef.current?.getBoundingClientRect();
         setCanvasSize({
@@ -335,6 +363,7 @@ export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
         if (!active) return;
         const msg = err instanceof Error ? err.message : '';
         if (msg.toLowerCase().includes('cancel')) return;
+        renderSpan.end('error');
         setRenderError('Unable to render this PDF page.');
         setIsRendering(false);
       });
@@ -343,168 +372,217 @@ export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
       active = false;
       task.cancel();
     };
-  }, [pdf, pageNumber, zoom]);
+  }, [pdf, pageNumber, zoom, isVisible]);
 
-  const handlePageSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    const parsed = parseInt(pageInput, 10);
-    if (!Number.isNaN(parsed)) {
-      const clamped = Math.max(1, Math.min(numPages, parsed));
-      onChangePage(clamped);
-      setPageInput(String(clamped));
-    } else {
-      setPageInput(String(pageNumber));
-    }
-  };
-
-  // Annotation mutations
-  const handleAddStroke = (stroke: AnnotationStroke, canvasSnapshot?: string) => {
-    setRedoStack([]);
-    setStrokes((prev) => {
-      const next = [...prev, stroke];
-      persistAnnotation(next, notes, true, canvasSnapshot);
-      return next;
-    });
-  };
-
-  const handleEraseStroke = (strokeId: string, canvasSnapshot?: string) => {
-    setStrokes((prev) => {
-      const next = prev.filter((s) => s.id !== strokeId);
-      if (next.length !== prev.length) {
-        persistAnnotation(next, notes, true, canvasSnapshot);
+  const handlePageSubmit = useCallback(
+    (e: React.FormEvent) => {
+      e.preventDefault();
+      const parsed = parseInt(pageInput, 10);
+      if (!Number.isNaN(parsed)) {
+        const clamped = Math.max(1, Math.min(numPages, parsed));
+        onChangePage(clamped);
+        setPageInput(String(clamped));
+      } else {
+        setPageInput(String(pageNumber));
       }
-      return next;
-    });
-  };
+    },
+    [pageInput, numPages, onChangePage, pageNumber]
+  );
 
-  const handleUndoStroke = () => {
+  const handlePrevPage = useCallback(() => {
+    onChangePage(Math.max(1, pageNumber - 1));
+  }, [onChangePage, pageNumber]);
+
+  const handleNextPage = useCallback(() => {
+    onChangePage(Math.min(numPages, pageNumber + 1));
+  }, [onChangePage, numPages, pageNumber]);
+
+  const handleZoomOut = useCallback(() => {
+    setZoom((z) => Math.max(0.7, Number((z - 0.15).toFixed(2))));
+  }, []);
+
+  const handleZoomIn = useCallback(() => {
+    setZoom((z) => Math.min(2.0, Number((z + 0.15).toFixed(2))));
+  }, []);
+
+  const handleViewportScroll = useCallback(
+    (e: React.UIEvent<HTMLDivElement>) => {
+      if (!onReachPageEnd || pageNumber >= numPages) return;
+      if (pdfEndTriggeredPageRef.current === pageNumber) return;
+      const el = e.currentTarget;
+      const distanceFromBottom = el.scrollHeight - (el.scrollTop + el.clientHeight);
+      if (el.scrollTop > 20 && distanceFromBottom <= 120) {
+        pdfEndTriggeredPageRef.current = pageNumber;
+        onReachPageEnd();
+      }
+    },
+    [onReachPageEnd, pageNumber, numPages]
+  );
+
+  // Referentially stable annotation mutations (preserve React.memo on PdfAnnotationLayer)
+  const handleAddStroke = useCallback(
+    (stroke: AnnotationStroke, canvasSnapshot?: string) => {
+      setRedoStack([]);
+      setStrokes((prev) => {
+        const next = [...prev, stroke];
+        persistAnnotation(next, notesRef.current, true, canvasSnapshot);
+        return next;
+      });
+    },
+    [persistAnnotation]
+  );
+
+  const handleEraseStroke = useCallback(
+    (strokeId: string, canvasSnapshot?: string) => {
+      setStrokes((prev) => {
+        const next = prev.filter((s) => s.id !== strokeId);
+        if (next.length !== prev.length) {
+          persistAnnotation(next, notesRef.current, true, canvasSnapshot);
+        }
+        return next;
+      });
+    },
+    [persistAnnotation]
+  );
+
+  const handleUndoStroke = useCallback(() => {
     setStrokes((prev) => {
       if (prev.length === 0) return prev;
       const popped = prev[prev.length - 1];
       const next = prev.slice(0, -1);
       setRedoStack((r) => [...r, popped]);
-      persistAnnotation(next, notes, true);
+      persistAnnotation(next, notesRef.current, true);
       return next;
     });
-  };
+  }, [persistAnnotation]);
 
-  const handleRedoStroke = () => {
+  const handleRedoStroke = useCallback(() => {
     setRedoStack((prevRedo) => {
       if (prevRedo.length === 0) return prevRedo;
       const restored = prevRedo[prevRedo.length - 1];
       const nextRedo = prevRedo.slice(0, -1);
       setStrokes((prevStrokes) => {
         const nextStrokes = [...prevStrokes, restored];
-        persistAnnotation(nextStrokes, notes, true);
+        persistAnnotation(nextStrokes, notesRef.current, true);
         return nextStrokes;
       });
       return nextRedo;
     });
-  };
+  }, [persistAnnotation]);
 
-  const handleAddNote = (x: number, y: number, color: StickyNote['color']) => {
-    const now = Date.now();
-    const newNote: StickyNote = {
-      id: `note-${now}-${Math.random().toString(36).slice(2, 6)}`,
-      x: Math.max(0.04, Math.min(0.96, x)),
-      y: Math.max(0.04, Math.min(0.96, y)),
-      text: '',
-      color,
-      createdAt: now,
-      updatedAt: now,
-    };
-    setNotes((prev) => {
-      const next = [...prev, newNote];
-      persistAnnotation(strokes, next, true);
-      return next;
-    });
-    setActiveNoteId(newNote.id);
-    setTool('cursor');
-  };
+  const handleAddNote = useCallback(
+    (x: number, y: number, color: StickyNote['color']) => {
+      const now = Date.now();
+      const newNote: StickyNote = {
+        id: `note-${now}-${Math.random().toString(36).slice(2, 6)}`,
+        x: Math.max(0.04, Math.min(0.96, x)),
+        y: Math.max(0.04, Math.min(0.96, y)),
+        text: '',
+        color,
+        createdAt: now,
+        updatedAt: now,
+      };
+      setNotes((prev) => {
+        const next = [...prev, newNote];
+        persistAnnotation(strokesRef.current, next, true);
+        return next;
+      });
+      setActiveNoteId(newNote.id);
+      setTool('cursor');
+    },
+    [persistAnnotation]
+  );
 
-  const handleUpdateNote = (
-    noteId: string,
-    patch: Partial<Pick<StickyNote, 'text' | 'x' | 'y' | 'color'>>
-  ) => {
-    setNotes((prev) => {
-      const next = prev.map((n) =>
-        n.id === noteId ? { ...n, ...patch, updatedAt: Date.now() } : n
-      );
-      persistAnnotation(strokes, next, false);
-      return next;
-    });
-  };
+  const handleUpdateNote = useCallback(
+    (
+      noteId: string,
+      patch: Partial<Pick<StickyNote, 'text' | 'x' | 'y' | 'color'>>
+    ) => {
+      setNotes((prev) => {
+        const next = prev.map((n) =>
+          n.id === noteId ? { ...n, ...patch, updatedAt: Date.now() } : n
+        );
+        persistAnnotation(strokesRef.current, next, false);
+        return next;
+      });
+    },
+    [persistAnnotation]
+  );
 
-  const handleDeleteNote = (noteId: string) => {
-    setNotes((prev) => {
-      const next = prev.filter((n) => n.id !== noteId);
-      persistAnnotation(strokes, next, true);
-      return next;
-    });
-    if (activeNoteId === noteId) {
-      setActiveNoteId(null);
-    }
-  };
+  const handleDeleteNote = useCallback(
+    (noteId: string) => {
+      setNotes((prev) => {
+        const next = prev.filter((n) => n.id !== noteId);
+        persistAnnotation(strokesRef.current, next, true);
+        return next;
+      });
+      setActiveNoteId((curr) => (curr === noteId ? null : curr));
+    },
+    [persistAnnotation]
+  );
 
-  const handleClearPageMarkup = () => {
+  const handleClearPageMarkup = useCallback(() => {
     setStrokes([]);
     setRedoStack([]);
     setNotes([]);
     setActiveNoteId(null);
     setConfirmClear(false);
     persistAnnotation([], [], true, undefined);
-  };
+  }, [persistAnnotation]);
 
-  const handleQuickExport = async (kind: 'png' | 'jpeg' | 'pdf') => {
-    if (!pdf || isQuickExporting) return;
-    setShowQuickExport(false);
-    setIsQuickExporting(true);
-    try {
-      const currentLayer: PageAnnotationLayer = {
-        strokes,
-        notes,
-        updatedAt: Date.now(),
-      };
-      if (kind === 'png' || kind === 'jpeg') {
-        const { blob, fileName } = await exportAnnotatedPageImage({
-          pdf,
-          bookTitle,
-          pageNumber,
-          layer: currentLayer,
-          format: kind,
-          includeNotes: true,
-          includeNoteText: true,
-        });
-        downloadBlob(blob, fileName);
-      } else {
-        const stubBook: StoredBook = {
-          id: bookId,
-          title: bookTitle,
-          author: '',
-          fileName: `${bookTitle}.pdf`,
-          numPages,
-          coverDataUrl: '',
-          chapters: [],
-          addedAt: Date.now(),
-          lastPage: pageNumber,
+  const handleQuickExport = useCallback(
+    async (kind: 'png' | 'jpeg' | 'pdf') => {
+      if (!pdf || isQuickExporting) return;
+      setShowQuickExport(false);
+      setIsQuickExporting(true);
+      try {
+        const currentLayer: PageAnnotationLayer = {
+          strokes: strokesRef.current,
+          notes: notesRef.current,
+          updatedAt: Date.now(),
         };
-        const { blob, fileName } = await exportAnnotatedPdf({
-          pdf,
-          book: stubBook,
-          pageNumbers: [pageNumber],
-          annotationsMap: { [pageNumber]: currentLayer },
-          includeCover: false,
-          includeNotes: true,
-          includeNoteText: true,
-        });
-        downloadBlob(blob, fileName);
+        if (kind === 'png' || kind === 'jpeg') {
+          const { blob, fileName } = await exportAnnotatedPageImage({
+            pdf,
+            bookTitle,
+            pageNumber,
+            layer: currentLayer,
+            format: kind,
+            includeNotes: true,
+            includeNoteText: true,
+          });
+          downloadBlob(blob, fileName);
+        } else {
+          const stubBook: StoredBook = {
+            id: bookId,
+            title: bookTitle,
+            author: '',
+            fileName: `${bookTitle}.pdf`,
+            numPages,
+            coverDataUrl: '',
+            chapters: [],
+            addedAt: Date.now(),
+            lastPage: pageNumber,
+          };
+          const { blob, fileName } = await exportAnnotatedPdf({
+            pdf,
+            book: stubBook,
+            pageNumbers: [pageNumber],
+            annotationsMap: { [pageNumber]: currentLayer },
+            includeCover: false,
+            includeNotes: true,
+            includeNoteText: true,
+          });
+          downloadBlob(blob, fileName);
+        }
+      } catch {
+        // keep UI clean if export fails on unloaded page
+      } finally {
+        setIsQuickExporting(false);
       }
-    } catch {
-      // keep UI clean if export fails on unloaded page
-    } finally {
-      setIsQuickExporting(false);
-    }
-  };
+    },
+    [pdf, isQuickExporting, bookTitle, pageNumber, bookId, numPages]
+  );
 
   const isBrushTool = tool === 'highlight' || tool === 'pen';
   const activeStrokeColor = tool === 'highlight' ? highlightColor : penColor;
@@ -533,7 +611,7 @@ export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
         <div className="flex items-center gap-1">
           <button
             type="button"
-            onClick={() => onChangePage(Math.max(1, pageNumber - 1))}
+            onClick={handlePrevPage}
             disabled={pageNumber <= 1}
             aria-label="Previous page"
             className="h-8 w-8 inline-flex items-center justify-center rounded text-stone-600 dark:text-stone-300 hover:bg-stone-200/70 dark:hover:bg-stone-800 disabled:opacity-35 cursor-pointer"
@@ -557,7 +635,7 @@ export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
 
           <button
             type="button"
-            onClick={() => onChangePage(Math.min(numPages, pageNumber + 1))}
+            onClick={handleNextPage}
             disabled={pageNumber >= numPages}
             aria-label="Next page"
             className="h-8 w-8 inline-flex items-center justify-center rounded text-stone-600 dark:text-stone-300 hover:bg-stone-200/70 dark:hover:bg-stone-800 disabled:opacity-35 cursor-pointer"
@@ -570,7 +648,7 @@ export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
         <div className="flex items-center gap-1 shrink-0">
           <button
             type="button"
-            onClick={() => setZoom((z) => Math.max(0.7, Number((z - 0.15).toFixed(2))))}
+            onClick={handleZoomOut}
             aria-label="Zoom out"
             className="hidden sm:inline-flex h-7 w-7 items-center justify-center rounded text-stone-600 dark:text-stone-300 hover:bg-stone-200/70 dark:hover:bg-stone-800 cursor-pointer"
           >
@@ -581,7 +659,7 @@ export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
           </span>
           <button
             type="button"
-            onClick={() => setZoom((z) => Math.min(2.0, Number((z + 0.15).toFixed(2))))}
+            onClick={handleZoomIn}
             aria-label="Zoom in"
             className="hidden sm:inline-flex h-7 w-7 items-center justify-center rounded text-stone-600 dark:text-stone-300 hover:bg-stone-200/70 dark:hover:bg-stone-800 cursor-pointer"
           >
@@ -1234,16 +1312,7 @@ export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
       {/* Canvas Viewport with Overlaid HTML5 Canvas & Sticky Notes Layer */}
       <div
         ref={containerRef}
-        onScroll={(e) => {
-          if (!onReachPageEnd || pageNumber >= numPages) return;
-          if (pdfEndTriggeredPageRef.current === pageNumber) return;
-          const el = e.currentTarget;
-          const distanceFromBottom = el.scrollHeight - (el.scrollTop + el.clientHeight);
-          if (el.scrollTop > 20 && distanceFromBottom <= 120) {
-            pdfEndTriggeredPageRef.current = pageNumber;
-            onReachPageEnd();
-          }
-        }}
+        onScroll={handleViewportScroll}
         className="flex-1 overflow-auto p-4 sm:p-6 flex justify-center items-start"
       >
         {!pdf ? (
@@ -1342,3 +1411,5 @@ export const PdfViewerPane: React.FC<PdfViewerPaneProps> = ({
     </section>
   );
 };
+
+export const PdfViewerPane = React.memo(PdfViewerPaneInner);

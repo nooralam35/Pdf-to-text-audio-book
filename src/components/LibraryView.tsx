@@ -161,7 +161,7 @@ interface LibraryViewProps {
   isUploading: boolean;
 }
 
-export const LibraryView: React.FC<LibraryViewProps> = ({
+const LibraryViewInner: React.FC<LibraryViewProps> = ({
   books,
   activeBookId,
   translatedCountsByBook,
@@ -904,3 +904,5 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     </main>
   );
 };
+
+export const LibraryView = React.memo(LibraryViewInner);

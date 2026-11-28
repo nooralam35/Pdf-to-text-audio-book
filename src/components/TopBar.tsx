@@ -1,4 +1,4 @@
-import React, { useRef } from 'react';
+import React, { useCallback, useRef } from 'react';
 import { BookOpen, Upload } from 'lucide-react';
 import { openDevDebugPanel } from '../lib/devErrorLog';
 
@@ -11,7 +11,14 @@ interface TopBarProps {
   isUploading?: boolean;
 }
 
-export const TopBar: React.FC<TopBarProps> = ({
+const NAV_ITEMS: Array<{ id: ActiveTab; label: string }> = [
+  { id: 'discover', label: 'Discover' },
+  { id: 'reader', label: 'Reader' },
+  { id: 'library', label: 'Library' },
+  { id: 'export', label: 'Export PDF' },
+];
+
+const TopBarInner: React.FC<TopBarProps> = ({
   activeTab,
   onSelectTab,
   onUploadPdf,
@@ -24,15 +31,18 @@ export const TopBar: React.FC<TopBarProps> = ({
   });
   const devHoldTimerRef = useRef<number | null>(null);
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      onUploadPdf(file);
-    }
-    e.target.value = '';
-  };
+  const handleFileChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (file) {
+        onUploadPdf(file);
+      }
+      e.target.value = '';
+    },
+    [onUploadPdf]
+  );
 
-  const handleBrandClick = () => {
+  const handleBrandClick = useCallback(() => {
     if (import.meta.env.DEV) {
       const now = Date.now();
       const prev = devTapStateRef.current;
@@ -45,9 +55,9 @@ export const TopBar: React.FC<TopBarProps> = ({
       }
     }
     onSelectTab('discover');
-  };
+  }, [onSelectTab]);
 
-  const handleBrandPointerDown = () => {
+  const handleBrandPointerDown = useCallback(() => {
     if (!import.meta.env.DEV) return;
     if (devHoldTimerRef.current !== null) {
       window.clearTimeout(devHoldTimerRef.current);
@@ -56,24 +66,21 @@ export const TopBar: React.FC<TopBarProps> = ({
       devHoldTimerRef.current = null;
       openDevDebugPanel();
     }, 700);
-  };
+  }, []);
 
-  const clearBrandHold = () => {
+  const clearBrandHold = useCallback(() => {
     if (devHoldTimerRef.current !== null) {
       window.clearTimeout(devHoldTimerRef.current);
       devHoldTimerRef.current = null;
     }
-  };
+  }, []);
 
-  const navItems: Array<{ id: ActiveTab; label: string }> = [
-    { id: 'discover', label: 'Discover' },
-    { id: 'reader', label: 'Reader' },
-    { id: 'library', label: 'Library' },
-    { id: 'export', label: 'Export PDF' },
-  ];
+  const handleUploadClick = useCallback(() => {
+    fileInputRef.current?.click();
+  }, []);
 
   return (
-    <header className="no-print sticky top-0 z-30 w-full border-b border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#FAF9F5]/95 sepia:bg-[#F4ECD8]/95 dark:bg-[#0D0D0C]/95 backdrop-blur-sm">
+    <header className="no-print sticky top-0 z-30 w-full border-b border-stone-200 sepia:border-[#DFD4BC] dark:border-stone-800 bg-[#FAF9F5] sepia:bg-[#F4ECD8] dark:bg-[#0D0D0C]">
       <div className="max-w-[1680px] mx-auto px-3 sm:px-6 h-12 md:h-14 flex items-center justify-between gap-2 sm:gap-4">
         {/* Zone 1: Brand Wordmark */}
         <button
@@ -93,7 +100,7 @@ export const TopBar: React.FC<TopBarProps> = ({
 
         {/* Zone 2: Primary Navigation (Desktop inline) */}
         <nav aria-label="Main navigation" className="hidden md:flex items-center gap-6">
-          {navItems.map((item) => {
+          {NAV_ITEMS.map((item) => {
             const isActive = activeTab === item.id;
             return (
               <button
@@ -127,7 +134,7 @@ export const TopBar: React.FC<TopBarProps> = ({
           <button
             type="button"
             disabled={isUploading}
-            onClick={() => fileInputRef.current?.click()}
+            onClick={handleUploadClick}
             className="inline-flex items-center gap-1.5 sm:gap-2 h-8 md:h-9 px-2.5 sm:px-3.5 rounded-md text-xs sm:text-sm font-medium whitespace-nowrap shrink-0 bg-stone-900 text-stone-50 hover:bg-stone-800 dark:bg-stone-100 dark:text-stone-950 dark:hover:bg-stone-200 transition-colors disabled:opacity-50 cursor-pointer"
           >
             <Upload className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
@@ -142,7 +149,7 @@ export const TopBar: React.FC<TopBarProps> = ({
         aria-label="Mobile navigation"
         className="md:hidden grid grid-cols-4 border-t border-stone-200/80 sepia:border-[#DFD4BC] dark:border-stone-800"
       >
-        {navItems.map((item) => {
+        {NAV_ITEMS.map((item) => {
           const isActive = activeTab === item.id;
           return (
             <button
@@ -166,3 +173,5 @@ export const TopBar: React.FC<TopBarProps> = ({
     </header>
   );
 };
+
+export const TopBar = React.memo(TopBarInner);

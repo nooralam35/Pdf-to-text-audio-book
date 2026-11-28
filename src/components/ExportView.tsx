@@ -33,6 +33,7 @@ import {
   downloadBlob,
   synthesizePageAudio,
 } from '../lib/translatorClient';
+import { getTranslation } from '../lib/storage';
 import type {
   BatchTranslationProgress,
   ChapterItem,
@@ -101,7 +102,7 @@ interface ExportViewProps {
   onGoToReader: () => void;
 }
 
-export const ExportView: React.FC<ExportViewProps> = ({
+const ExportViewInner: React.FC<ExportViewProps> = ({
   pdf,
   book,
   currentPage,
@@ -265,10 +266,19 @@ export const ExportView: React.FC<ExportViewProps> = ({
     setExportError(null);
     setExportNotice(null);
     try {
+      const hydratedPages = includeFigures
+        ? await Promise.all(
+            pagesToExport.map(async (pg) => {
+              if (pg.figures && pg.figures.length > 0) return pg;
+              const full = await getTranslation(book.id, targetLang, pg.pageNumber).catch(() => undefined);
+              return full ?? pg;
+            })
+          )
+        : pagesToExport;
       const result = await exportTranslatedPdf({
         pdf,
         book,
-        pages: pagesToExport,
+        pages: hydratedPages,
         lang: targetLang,
         includeCover,
         includeFigures,
@@ -1606,3 +1616,5 @@ export const ExportView: React.FC<ExportViewProps> = ({
     </main>
   );
 };
+
+export const ExportView = React.memo(ExportViewInner);

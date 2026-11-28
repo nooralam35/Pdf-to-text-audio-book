@@ -27,7 +27,7 @@ interface ShareHighlightModalProps {
   onClose: () => void;
 }
 
-export const ShareHighlightModal: React.FC<ShareHighlightModalProps> = ({
+const ShareHighlightModalInner: React.FC<ShareHighlightModalProps> = ({
   initialPayload,
   savedHighlights,
   onClose,
@@ -607,3 +607,5 @@ export const ShareHighlightModal: React.FC<ShareHighlightModalProps> = ({
     </div>
   );
 };
+
+export const ShareHighlightModal = React.memo(ShareHighlightModalInner);

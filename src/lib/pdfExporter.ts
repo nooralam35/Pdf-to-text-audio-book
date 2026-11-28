@@ -515,7 +515,13 @@ export async function exportTranslatedPdf(
     await flushCanvasToPdf();
     stepDone++;
     onProgress?.(stepDone, totalSteps, `Completed Page ${record.pageNumber}`);
+    if (stepDone % 4 === 0) {
+      await new Promise((r) => window.setTimeout(r, 0));
+    }
   }
+
+  canvas.width = 0;
+  canvas.height = 0;
 
   onProgress?.(totalSteps, totalSteps, 'Packaging PDF document...');
   const pdfBytes = await outPdf.save();
@@ -695,11 +701,13 @@ async function renderAnnotatedPageCanvas(
     }
     extraFooterH = footerPadY * 2 + bodyH;
   }
+  measureCanvas.width = 0;
+  measureCanvas.height = 0;
 
   const canvas = document.createElement('canvas');
   canvas.width = pagePxW;
   canvas.height = pagePxH + extraFooterH;
-  const ctx = canvas.getContext('2d');
+  const ctx = canvas.getContext('2d', { alpha: false });
   if (!ctx) throw new Error('Canvas 2D context unavailable for annotated export.');
 
   // 1. Render original PDF page cleanly
@@ -711,6 +719,11 @@ async function renderAnnotatedPageCanvas(
     viewport: renderVp,
     canvas,
   }).promise;
+  try {
+    page.cleanup();
+  } catch {
+    // ignore cleanup race
+  }
 
   // 2. Composite HTML5 Canvas highlight strokes (multiply blend preserves diagram labels)
   const scaleFactor = pagePxW / 540;
@@ -945,7 +958,9 @@ export async function exportAnnotatedPdf(
       }
     );
 
-    const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.93);
+    const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.9);
+    canvas.width = 0;
+    canvas.height = 0;
     const embeddedImg = await outPdf.embedJpg(dataUrlToUint8Array(jpegDataUrl));
     const pdfPage = outPdf.addPage([pointWidth, pointHeight]);
     pdfPage.drawImage(embeddedImg, {
@@ -957,6 +972,9 @@ export async function exportAnnotatedPdf(
 
     stepDone++;
     onProgress?.(stepDone, totalSteps, `Added annotated Page ${pageNum}.`);
+    if (stepDone % 3 === 0) {
+      await new Promise((r) => window.setTimeout(r, 0));
+    }
   }
 
   onProgress?.(totalSteps, totalSteps, 'Packaging annotated PDF...');
